@@ -1,0 +1,15 @@
+[Unit]
+Description=Captain’s Log enrolled storage and measured host security gate
+After=local-fs.target auditd.service firewalld.service
+Requires=auditd.service firewalld.service
+Before=nebulalog-api.service nebulalog-ingest.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/nebulalog/nebulalog-firstboot
+RemainAfterExit=yes
+UMask=0077
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

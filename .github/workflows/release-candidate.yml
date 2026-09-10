@@ -1,0 +1,116 @@
+name: Publish reviewed appliance prerelease
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact locally assembled version in protected publisher staging
+        required: true
+        type: string
+      manifest_sha256:
+        description: Independently reviewed manifest SHA256
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: captains-log-prerelease-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # Disabled until the dedicated runner, protected environment and native
+    # qualification process are configured. This workflow never makes a stable
+    # release, and no push/tag/PR event can start it.
+    if: github.repository == 'stellaraf/captains-log' && github.ref == 'refs/heads/main' && vars.CAPTAINS_LOG_ENABLE_PRERELEASE_PUBLICATION == 'true'
+    runs-on: [self-hosted, Linux, X64, captains-log-publisher]
+    environment: captains-log-prerelease
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      APPROVED_MANIFEST: ${{ inputs.manifest_sha256 }}
+      GH_REPO: stellaraf/captains-log
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # verified actions/checkout v4 ref
+        with:
+          persist-credentials: false
+      - name: Verify exact source, release assets and reviewed native evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9][A-Za-z0-9.-]{0,100})?$ ]]
+          [[ "$APPROVED_MANIFEST" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          candidate_root="/srv/captains-log/releases/$RELEASE_VERSION"
+          python3 appliance/packer/assemble_release.py verify-native \
+            --package "$candidate_root/package" \
+            --report "$candidate_root/native-qualification.json" \
+            --evidence-directory "$candidate_root/private-evidence" \
+            --ova "$candidate_root/captains-log-$RELEASE_VERSION-rocky9-x86_64.ova" \
+            --source-tree "$GITHUB_WORKSPACE" \
+            --expected-manifest "$APPROVED_MANIFEST" --expected-commit "$GITHUB_SHA" \
+            > "$RUNNER_TEMP/captains-log-publication-gate.json"
+      - name: Upload draft, check remote asset hashes, then publish prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, sys
+          sys.path.insert(0, str(pathlib.Path('appliance/packer').resolve()))
+          import assemble_release as release
+          version = os.environ['RELEASE_VERSION']
+          root = pathlib.Path('/srv/captains-log/releases') / version
+          package = root / 'package'
+          ova = root / ('captains-log-' + version + '-rocky9-x86_64.ova')
+          args = dict(expected_manifest=os.environ['APPROVED_MANIFEST'], expected_commit=os.environ['GITHUB_SHA'], source_tree=pathlib.Path.cwd())
+          gate = release.verify_native(package, root / 'native-qualification.json', root / 'private-evidence', ova, **args)
+          if gate['version'] != version:
+              raise SystemExit('Staging version does not match reviewed package')
+          assets = [package / name for name in gate['assets']] + [ova]
+          expected = {path.name: release.file_info(path) for path in assets}
+          if len(expected) != len(assets):
+              raise SystemExit('Public asset names collide')
+          tag = 'v' + version
+          notes = pathlib.Path(os.environ['RUNNER_TEMP']) / 'captains-log-prerelease-notes.md'
+          notes.write_text('Captain\'s Log Rocky Linux 9 x86_64 appliance prerelease.\n\n'
+              'Native acceptance evidence was reviewed for these exact assets. '
+              'This prerelease is excluded from the appliance stable release poller.\n\n'
+              'Manifest SHA256: ' + os.environ['APPROVED_MANIFEST'] + '\n')
+          # No clobber/reuse flags: an existing release or partial prior draft
+          # refuses. An operator must inspect an interrupted draft explicitly.
+          subprocess.run(['gh', 'release', 'create', tag, '--draft', '--prerelease', '--latest=false',
+              '--target', os.environ['GITHUB_SHA'], '--title', "Captain's Log " + version + ' (prerelease)',
+              '--notes-file', str(notes), *map(str, assets)], check=True)
+          remote = json.loads(subprocess.check_output(['gh', 'api', 'repos/stellaraf/captains-log/releases/tags/' + tag]))
+          if remote.get('draft') is not True or remote.get('prerelease') is not True or remote.get('tag_name') != tag:
+              raise SystemExit('Remote draft/prerelease identity check failed')
+          ref = json.loads(subprocess.check_output(['gh', 'api', 'repos/stellaraf/captains-log/git/ref/tags/' + tag]))['object']
+          for _ in range(4):
+              if ref.get('type') == 'commit':
+                  break
+              if ref.get('type') != 'tag':
+                  raise SystemExit('Unsupported remote tag identity; draft retained')
+              ref = json.loads(subprocess.check_output(['gh', 'api', 'repos/stellaraf/captains-log/git/tags/' + ref['sha']]))['object']
+          if ref.get('type') != 'commit' or ref.get('sha') != os.environ['GITHUB_SHA']:
+              raise SystemExit('Remote tag differs from reviewed source commit; draft retained')
+          observed = {item['name']: item for item in remote.get('assets', [])}
+          if len(observed) != len(remote.get('assets', [])) or set(observed) != set(expected):
+              raise SystemExit('Remote asset inventory differs; draft retained')
+          for name, item in expected.items():
+              actual = observed[name]
+              if actual.get('state') != 'uploaded' or actual.get('size') != item['bytes'] or actual.get('digest') != 'sha256:' + item['sha256']:
+                  raise SystemExit('Remote asset digest differs or is unavailable; draft retained')
+          release.verify_native(package, root / 'native-qualification.json', root / 'private-evidence', ova, **args)
+          subprocess.run(['gh', 'release', 'edit', tag, '--draft=false', '--prerelease', '--latest=false'], check=True)
+          final = json.loads(subprocess.check_output(['gh', 'api', 'repos/stellaraf/captains-log/releases/tags/' + tag]))
+          if final.get('draft') is not False or final.get('prerelease') is not True:
+              raise SystemExit('Final prerelease state could not be verified')
+          print('Published verified prerelease: ' + final['html_url'])
+          PY

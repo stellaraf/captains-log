@@ -1,0 +1,407 @@
+/* Stellar identity on the unmodified Keycloak 26.3.3 authentication structure. */
+:root {
+  --nl-canvas: #fcfbfd;
+  --nl-surface: #ffffff;
+  --nl-raised: #f7f5f9;
+  --nl-text: #18131f;
+  --nl-muted: #716a7c;
+  --nl-border: #e4e0e9;
+  --nl-strong-border: #958ca0;
+  --nl-accent: #2915d6;
+  --nl-accent-hover: #421eb4;
+  --nl-error: #b4233b;
+  --nl-sans: "Open Sans Variable", "Open Sans", system-ui, sans-serif;
+  --keycloak-bg-logo-url: none;
+  --keycloak-logo-url: url("../img/stellar-logo-gradient.png");
+  --pf-v5-global--FontFamily--text: var(--nl-sans);
+  --pf-v5-global--FontFamily--heading: var(--nl-sans);
+  --pf-v5-global--FontSize--md: 0.875rem;
+  --pf-v5-global--Color--100: var(--nl-text);
+  --pf-v5-global--Color--200: var(--nl-muted);
+  --pf-v5-global--primary-color--100: var(--nl-accent);
+  --pf-v5-global--primary-color--200: var(--nl-accent-hover);
+  --pf-v5-global--active-color--100: var(--nl-accent);
+  --pf-v5-global--link--Color: var(--nl-accent);
+  --pf-v5-global--link--Color--hover: var(--nl-accent-hover);
+  --pf-v5-global--danger-color--100: var(--nl-error);
+  --pf-v5-global--BackgroundColor--100: var(--nl-surface);
+  --pf-v5-global--BorderColor--100: var(--nl-border);
+  color-scheme: light;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+html.login-pf,
+.login-pf body {
+  min-height: 100%;
+  margin: 0;
+  background: var(--nl-canvas);
+  color: var(--nl-text);
+  font-family: var(--nl-sans);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.pf-v5-c-login {
+  min-height: 100vh;
+  min-height: 100dvh;
+  padding: 48px 24px;
+  background: transparent;
+  border-block-start: 4px solid #18132c;
+}
+
+.pf-v5-c-login__container {
+  --pf-v5-c-login__container--GridTemplateColumns: minmax(0, 1fr);
+  --pf-v5-c-login__container--xl--GridTemplateColumns: minmax(0, 1fr);
+  width: min(100%, 460px);
+  max-width: 460px;
+  min-width: 0;
+  display: grid;
+  padding: 0;
+  margin: auto;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "header" "main";
+  row-gap: 30px;
+  column-gap: 0;
+}
+
+.pf-v5-c-login__header {
+  padding: 0;
+  margin: 0;
+}
+
+#kc-header-wrapper {
+  margin: 0;
+  color: var(--nl-text) !important;
+  font-family: var(--nl-sans);
+  font-size: 18px;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: -0.35px;
+  text-align: center;
+  line-height: 1.4;
+}
+
+/* Decorative unchanged wordmark; the realm name remains real accessible text. */
+#kc-header-wrapper::before {
+  content: "";
+  display: block;
+  width: 148px;
+  height: 47px;
+  margin: 0 auto 20px;
+  background: url("../img/stellar-logo-gradient.png") center / contain no-repeat;
+}
+
+.pf-v5-c-login__main {
+  width: 100%;
+  grid-column: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  background: var(--nl-surface);
+  border: 1px solid var(--nl-border);
+  border-radius: 10px;
+  box-shadow: 0 8px 28px rgb(24 19 31 / 4%);
+}
+
+.pf-v5-c-login__main-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 32px 32px 20px;
+  border: 0;
+}
+
+#kc-page-title {
+  color: var(--nl-text);
+  font-family: var(--nl-sans);
+  font-size: 24px;
+  line-height: 1.35;
+  font-weight: 600;
+  letter-spacing: -0.6px;
+}
+
+.pf-v5-c-login__main-body {
+  padding: 0 32px 32px;
+}
+
+.pf-v5-c-form {
+  --pf-v5-c-form--GridGap: 20px;
+}
+
+.pf-v5-c-form__label,
+.pf-v5-c-check__label {
+  color: var(--nl-text);
+  font-family: var(--nl-sans);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.pf-v5-c-form__label-text {
+  font-weight: 600;
+}
+
+.pf-v5-c-form-control {
+  --pf-v5-c-form-control--BackgroundColor: var(--nl-surface);
+  --pf-v5-c-form-control--BorderColor: var(--nl-strong-border);
+  --pf-v5-c-form-control--BorderBottomColor: var(--nl-strong-border);
+  --pf-v5-c-form-control--hover--BorderBottomColor: var(--nl-accent);
+  --pf-v5-c-form-control--focus--BorderBottomColor: var(--nl-accent);
+  --pf-v5-c-form-control--invalid--BorderBottomColor: var(--nl-error);
+  border-radius: 5px;
+  font-family: var(--nl-sans);
+  background: var(--nl-surface);
+}
+
+.pf-v5-c-form-control::before,
+.pf-v5-c-form-control::after {
+  border-radius: 5px;
+}
+
+.pf-v5-c-form-control > :is(input, select, textarea) {
+  min-height: 44px;
+  color: var(--nl-text);
+  font: inherit;
+  padding-block: 10px;
+  padding-inline: 12px;
+}
+
+.pf-v5-c-form-control > input::placeholder {
+  color: var(--nl-muted);
+}
+
+.pf-v5-c-form-control.pf-m-readonly,
+.pf-v5-c-form-control:has(input[readonly]) {
+  background: var(--nl-raised);
+}
+
+.pf-v5-c-button {
+  --pf-v5-c-button--BorderRadius: 5px;
+  --pf-v5-c-button--m-primary--BackgroundColor: var(--nl-accent);
+  --pf-v5-c-button--m-primary--hover--BackgroundColor: var(--nl-accent-hover);
+  --pf-v5-c-button--m-primary--focus--BackgroundColor: var(--nl-accent-hover);
+  --pf-v5-c-button--m-secondary--Color: var(--nl-accent);
+  --pf-v5-c-button--m-secondary--BorderColor: var(--nl-strong-border);
+  --pf-v5-c-button--m-control--BorderColor: var(--nl-strong-border);
+  min-height: 44px;
+  padding: 10px 16px;
+  font-family: var(--nl-sans);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.pf-v5-c-button.pf-m-primary {
+  color: #fff;
+  background: var(--nl-accent);
+}
+
+.pf-v5-c-button.pf-m-primary:is(:hover, :focus-visible) {
+  background: var(--nl-accent-hover);
+}
+
+.pf-v5-c-button.pf-m-control {
+  min-width: 44px;
+  color: var(--nl-muted);
+  background: var(--nl-surface);
+}
+
+/* The parent's reset-login tooltip sits 160% to the right of its button.
+   Anchor it inside the card so even a hidden tooltip cannot widen the page. */
+.kc-login-tooltip .kc-tooltip-text {
+  top: calc(100% + 8px);
+  inset-inline-start: auto;
+  inset-inline-end: 0;
+  left: auto;
+  right: 0;
+  width: max-content;
+  min-width: 0;
+  max-width: min(240px, calc(100vw - 88px));
+  padding: 8px 12px;
+  color: #fff;
+  background: #18131f;
+  font-size: 12px;
+  font-weight: 400;
+  white-space: normal;
+  z-index: 10;
+}
+
+.kc-login-tooltip .kc-tooltip-text::after {
+  top: -10px;
+  right: 16px;
+  margin: 0;
+  border-color: transparent transparent #18131f;
+}
+
+.kc-login-tooltip:is(:hover, :focus-visible) .kc-tooltip-text {
+  visibility: visible;
+  opacity: 1;
+}
+
+.pf-v5-c-button:is(:disabled, .pf-m-disabled, .pf-m-aria-disabled) {
+  color: #6a6375;
+  background: #e9e5ed;
+  cursor: not-allowed;
+}
+
+:is(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--nl-accent);
+  outline-offset: 3px;
+}
+
+.pf-v5-c-form-control:focus-within {
+  outline: 2px solid var(--nl-accent);
+  outline-offset: 2px;
+}
+
+.pf-v5-c-form-control > :is(input, select, textarea):focus-visible {
+  outline: none;
+}
+
+a {
+  color: var(--nl-accent);
+  text-underline-offset: 3px;
+}
+
+.pf-v5-c-helper-text,
+.pf-v5-c-helper-text__item-text,
+.pf-v5-c-login__main-footer-band {
+  font-size: 12px;
+  color: var(--nl-muted);
+}
+
+.pf-m-error .pf-v5-c-helper-text__item-text,
+.pf-v5-c-helper-text__item-text.pf-m-error,
+.kc-feedback-text.pf-m-error {
+  color: var(--nl-error);
+}
+
+.pf-v5-c-alert {
+  border-radius: 5px;
+  box-shadow: none;
+  font-size: 13px;
+}
+
+.pf-v5-c-alert.pf-m-danger {
+  --pf-v5-c-alert--BackgroundColor: #fff0f3;
+  --pf-v5-c-alert--BorderTopColor: var(--nl-error);
+  --pf-v5-c-alert__title--Color: var(--nl-error);
+}
+
+.pf-v5-c-login__main-footer:empty {
+  display: none;
+}
+
+.pf-v5-c-login__main-footer-band {
+  background: var(--nl-raised);
+  border-radius: 5px;
+}
+
+#kc-social-providers {
+  margin-top: 24px;
+}
+
+#kc-social-providers hr {
+  border-color: var(--nl-border);
+}
+
+#kc-social-providers svg:not(.google) {
+  filter: none;
+}
+
+#kc-totp-settings {
+  padding-inline-start: 20px;
+  font-size: 13px;
+}
+
+#kc-totp-settings > li {
+  padding-inline-start: 4px;
+  margin-block-end: 20px;
+}
+
+#kc-totp-supported-apps {
+  margin-block: 10px;
+}
+
+#kc-totp-secret-qr-code {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  padding: 12px;
+  margin-block: 16px 8px;
+  background: white;
+  border: 1px solid var(--nl-border);
+  border-radius: 6px;
+}
+
+#kc-totp-secret-key {
+  display: block;
+  padding: 12px;
+  margin-block: 12px;
+  color: var(--nl-text);
+  background: var(--nl-raised);
+  font-family: ui-monospace, monospace;
+  overflow-wrap: anywhere;
+}
+
+#otp,
+#totp {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.2em;
+}
+
+.pf-v5-c-tile {
+  margin-block-end: 8px;
+  border-radius: 5px;
+}
+
+#kc-recovery-codes-list {
+  padding-inline-start: 24px;
+  overflow-wrap: normal;
+}
+
+@media (max-width: 540px) {
+  .pf-v5-c-login {
+    padding: 28px 16px;
+  }
+  .pf-v5-c-login__container {
+    row-gap: 22px;
+  }
+  #kc-header-wrapper::before {
+    width: 128px;
+    height: 41px;
+    margin-bottom: 16px;
+  }
+  .pf-v5-c-login__main-header {
+    padding: 24px 22px 18px;
+  }
+  .pf-v5-c-login__main-body {
+    padding: 0 22px 24px;
+  }
+  #kc-page-title {
+    font-size: 22px;
+  }
+  #kc-recovery-codes-list {
+    columns: 1;
+  }
+}
+
+@media (forced-colors: active) {
+  .pf-v5-c-login__main,
+  .pf-v5-c-form-control,
+  .pf-v5-c-button {
+    border: 1px solid CanvasText;
+    box-shadow: none;
+  }
+  :is(a, button, input, select, textarea, [tabindex]):focus-visible,
+  .pf-v5-c-form-control:focus-within {
+    outline-color: Highlight;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition-duration: 0s !important;
+    animation-duration: 0s !important;
+  }
+}

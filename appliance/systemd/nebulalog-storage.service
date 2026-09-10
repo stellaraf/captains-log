@@ -1,0 +1,14 @@
+[Unit]
+Description=Inspect Captain’s Log encrypted storage capacity
+RequiresMountsFor=/var/lib/nebulalog
+After=nebulalog-firstboot.service
+ConditionPathExists=/etc/nebulalog/storage.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/nebulalog storage plan
+UMask=0077
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=strict

@@ -1,0 +1,47 @@
+{
+  "schema_revision": 1,
+  "name": "NebulaLog ClickHouse FIPS candidate",
+  "version": "25.3.8.30001-nebulalog.1",
+  "platform": "linux/amd64",
+  "base": {
+    "image": "docker.io/altinity/clickhouse-server@sha256:6254bc404966150468130d2b5b02ebdf7238f21d2d85fbde77bc76c7181447df",
+    "upstream_tag": "25.3.8.30001.altinityfips",
+    "multi_platform_index": "sha256:db25d4c333914380f2e43943098651886ed85cf335e3e91059ec0f3dc23ce06a",
+    "config_digest": "sha256:a63ede1c2cf79e76ab28cbf82566142f91cc06dc5f0bd8cad28222638fd50f2c",
+    "distribution": "Ubuntu 22.04.5 LTS",
+    "signature_verification": "not established; registry content digest observed, release source commit verified by GitHub"
+  },
+  "components": [
+    {
+      "name": "Altinity ClickHouse",
+      "version": "25.3.8.30001.altinityfips",
+      "source_commit": "0ec342e4405683c138a412d0191897013d6867cd",
+      "source": "https://github.com/Altinity/ClickHouse/tree/v25.3.8.30001.altinityfips",
+      "binary": "/usr/bin/clickhouse",
+      "binary_sha256": "080dce0336607e1d38e4deb9c9b95bfca34f587bdfd0613d8584fdce6bf8ee21",
+      "license": "Apache-2.0; bundled third-party component licenses also apply",
+      "license_file": "licenses/CLICKHOUSE-LICENSE"
+    },
+    {
+      "name": "AWS-LC static cryptographic module",
+      "reported_version": "AWS-LC-FIPS-2.0.0",
+      "source": "https://github.com/aws/aws-lc/tree/AWS-LC-FIPS-2.0.0",
+      "source_archive_sha256_from_security_policy": "6241ec2f13a5f80224ee9cd8592ed66a97d426481066feaa4efc6f24e60bbc96",
+      "cmvp_certificate": "4816",
+      "security_policy": "https://csrc.nist.gov/CSRC/media/projects/cryptographic-module-validation-program/documents/security-policies/140sp4816.pdf",
+      "license": "LicenseRef-AWS-LC-Composite",
+      "license_file": "licenses/AWS-LC-LICENSE",
+      "qualification": "module identity observed; exact binary build provenance, approved-service use, entropy and Rocky guest operating environment pending"
+    },
+    {
+      "name": "NebulaLog wrapper and fixed configuration",
+      "license": "AGPL-3.0-only",
+      "license_file_in_image": "/opt/nebulalog/LICENSE-NEBULALOG"
+    }
+  ],
+  "package_inventory_in_image": "/opt/nebulalog/debian-package-bom.tsv",
+  "package_licenses_in_image": "/usr/share/doc/*/copyright",
+  "full_transitive_binary_sbom": "pending; package inventory is not a complete statically linked dependency SBOM",
+  "certificate_scope": "AWS-LC module only; not ClickHouse, this container, or NebulaLog",
+  "guest_qualification": "pending"
+}

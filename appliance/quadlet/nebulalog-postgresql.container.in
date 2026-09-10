@@ -1,0 +1,27 @@
+[Unit]
+Description=Captain’s Log metadata PostgreSQL
+After=nebulalog-firstboot.service
+Requires=nebulalog-firstboot.service
+RequiresMountsFor=/var/lib/nebulalog
+
+[Container]
+Image=@POSTGRESQL_IMAGE@
+ContainerName=nebulalog-postgresql
+Network=nebulalog.network
+NetworkAlias=postgresql
+User=999:999
+NoNewPrivileges=true
+DropCapability=all
+EnvironmentFile=/etc/nebulalog/postgresql.env
+Environment=POSTGRES_PASSWORD_FILE=/run/secrets/nebulalog-pg-password
+Secret=nebulalog-pg-password,type=mount,uid=999,gid=999,mode=0400
+Volume=/var/lib/nebulalog/postgresql:/var/lib/postgresql/data:Z
+Tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m
+Tmpfs=/var/run/postgresql:rw,noexec,nosuid,nodev,mode=0700,size=16m,U
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=900
+TimeoutStopSec=120
+[Install]
+WantedBy=multi-user.target

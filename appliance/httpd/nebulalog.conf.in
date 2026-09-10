@@ -1,0 +1,51 @@
+# Rendered from validated first-boot inputs. Private services are loopback-only.
+Listen 443 https
+ServerTokens Prod
+ServerSignature Off
+TraceEnable Off
+
+<VirtualHost *:443>
+    ServerName @SERVER_NAME@
+    SSLEngine on
+    SSLProtocol -all +TLSv1.2 +TLSv1.3
+    SSLCipherSuite PROFILE=SYSTEM
+    SSLHonorCipherOrder on
+    SSLCertificateFile @TLS_DIRECTORY@/server.crt
+    SSLCertificateKeyFile @TLS_DIRECTORY@/server.key
+    SSLSessionTickets off
+    Header always set Strict-Transport-Security "max-age=31536000"
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set Referrer-Policy "same-origin"
+
+    ProxyRequests Off
+    ProxyPreserveHost On
+    ProxyTimeout 120
+    SSLProxyEngine On
+    SSLProxyVerify require
+    SSLProxyCheckPeerName On
+    SSLProxyCACertificateFile @TLS_DIRECTORY@/ca.crt
+    RequestHeader unset X-Forwarded-For
+    RequestHeader set X-Forwarded-Proto "https"
+    RequestHeader set X-Forwarded-Port "443"
+
+    # The real connection peer controls the maintenance exception. Never trust
+    # a client-supplied forwarded address to bypass the transaction gate.
+    RewriteEngine On
+    RewriteCond @MAINTENANCE_MARKER@ -f
+    RewriteCond %{REMOTE_ADDR} !^(127\.0\.0\.1|::1)$
+    RewriteRule ^/(api|realms)(/|$) - [R=503,L]
+    ErrorDocument 503 "Captain’s Log maintenance is in progress. Please retry shortly."
+    RewriteRule ^/admin(/|$) - [R=404,L]
+
+    ProxyPass /realms/ https://127.0.0.1:8443/realms/
+    ProxyPassReverse /realms/ https://127.0.0.1:8443/realms/
+    ProxyPass /resources/ https://127.0.0.1:8443/resources/
+    ProxyPassReverse /resources/ https://127.0.0.1:8443/resources/
+    ProxyPass / http://127.0.0.1:8080/
+    ProxyPassReverse / http://127.0.0.1:8080/
+
+    ErrorLog /var/log/httpd/nebulalog-error.log
+    # Exclude query strings: OIDC codes and download capabilities are secrets.
+    LogFormat "%a %t %m %U %>s %b" nebulalog
+    CustomLog /var/log/httpd/nebulalog-access.log nebulalog
+</VirtualHost>

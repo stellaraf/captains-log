@@ -1,0 +1,8 @@
+[Unit]
+Description=Detect newly presented Captain’s Log storage capacity
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "rocky_key_sha256": "3a66e521e7a4abac9768d889c7cd60a8250f59512b275cf576c8a10ff34624c1",
+  "rocky_key_fingerprint": "21CB256AE16FC54C6E652949702D426D350D275D",
+  "source": "https://rockylinux.org/resources/gpg-key-info",
+  "key_source": "https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9"
+}

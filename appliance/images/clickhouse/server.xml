@@ -1,0 +1,70 @@
+<clickhouse>
+  <logger>
+    <level>information</level><console>false</console>
+    <log>/var/lib/clickhouse/logs/server.log</log>
+    <errorlog>/var/lib/clickhouse/logs/error.log</errorlog>
+    <size>20M</size><count>5</count>
+  </logger>
+  <listen_host>0.0.0.0</listen_host>
+  <https_port>8443</https_port>
+  <tcp_port_secure>9440</tcp_port_secure>
+  <path>/var/lib/clickhouse/</path>
+  <tmp_path>/var/lib/clickhouse/tmp/</tmp_path>
+  <user_files_path>/var/lib/clickhouse/user_files/</user_files_path>
+  <format_schema_path>/var/lib/clickhouse/format_schemas/</format_schema_path>
+  <!-- Part metadata supports measured write-rate sizing; SQL query logging remains disabled. -->
+  <part_log>
+    <database>system</database><table>part_log</table>
+    <partition_by>event_date</partition_by>
+    <ttl>event_date + INTERVAL 14 DAY DELETE</ttl>
+    <settings>ttl_only_drop_parts = 1, merge_with_ttl_timeout = 3600</settings>
+    <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+    <max_size_rows>65536</max_size_rows>
+    <reserved_size_rows>1024</reserved_size_rows>
+    <buffer_size_rows_flush_threshold>32768</buffer_size_rows_flush_threshold>
+    <flush_on_crash>false</flush_on_crash>
+  </part_log>
+  <user_directories><users_xml><path>/run/nebulalog-clickhouse/users.xml</path></users_xml></user_directories>
+  <allow_plaintext_password>false</allow_plaintext_password>
+  <allow_no_password>false</allow_no_password>
+  <allow_implicit_no_password>false</allow_implicit_no_password>
+  <default_password_type>sha256_password</default_password_type>
+  <max_server_memory_usage_to_ram_ratio>0.65</max_server_memory_usage_to_ram_ratio>
+  <background_pool_size>4</background_pool_size>
+  <background_schedule_pool_size>8</background_schedule_pool_size>
+  <background_buffer_flush_schedule_pool_size>2</background_buffer_flush_schedule_pool_size>
+  <background_message_broker_schedule_pool_size>2</background_message_broker_schedule_pool_size>
+  <background_distributed_schedule_pool_size>2</background_distributed_schedule_pool_size>
+  <merge_tree>
+    <number_of_free_entries_in_pool_to_lower_max_size_of_merge>2</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
+    <number_of_free_entries_in_pool_to_execute_mutation>2</number_of_free_entries_in_pool_to_execute_mutation>
+    <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>2</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>
+  </merge_tree>
+  <openSSL>
+    <server>
+      <certificateFile>/etc/nebulalog/tls/server.crt</certificateFile>
+      <privateKeyFile>/etc/nebulalog/tls/server.key</privateKeyFile>
+      <caConfig>/etc/nebulalog/tls/ca.crt</caConfig>
+      <loadDefaultCAFile>false</loadDefaultCAFile>
+      <!-- Password authentication over server-authenticated TLS; no client certificate required. -->
+      <verificationMode>none</verificationMode>
+      <disableProtocols>sslv2,sslv3,tlsv1,tlsv1_1</disableProtocols>
+      <cipherList>ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384</cipherList>
+      <cipherSuites>TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384</cipherSuites>
+      <ecdhCurve>prime256v1</ecdhCurve>
+      <preferServerCiphers>true</preferServerCiphers>
+      <invalidCertificateHandler><name>RejectCertificateHandler</name></invalidCertificateHandler>
+    </server>
+    <client>
+      <caConfig>/etc/nebulalog/tls/ca.crt</caConfig>
+      <loadDefaultCAFile>false</loadDefaultCAFile>
+      <verificationMode>strict</verificationMode>
+      <disableProtocols>sslv2,sslv3,tlsv1,tlsv1_1</disableProtocols>
+      <cipherList>ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384</cipherList>
+      <cipherSuites>TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384</cipherSuites>
+      <extendedVerification>true</extendedVerification>
+      <invalidCertificateHandler><name>RejectCertificateHandler</name></invalidCertificateHandler>
+    </client>
+  </openSSL>
+  <send_crash_reports><enabled>false</enabled></send_crash_reports>
+</clickhouse>

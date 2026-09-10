@@ -1,0 +1,12 @@
+<clickhouse>
+  <profiles><default><max_memory_usage>536870912</max_memory_usage><max_threads>4</max_threads><log_queries>false</log_queries></default></profiles>
+  <quotas><default><interval><duration>3600</duration><queries>0</queries><errors>0</errors><result_rows>0</result_rows><read_rows>0</read_rows><execution_time>0</execution_time></interval></default></quotas>
+  <users>
+    <nebulalog>
+      <password_sha256_hex>@PASSWORD_SHA256@</password_sha256_hex>
+      <networks><ip>0.0.0.0/0</ip><ip>::/0</ip></networks>
+      <profile>default</profile><quota>default</quota>
+      <grants><query>GRANT ALL ON nebulalog.*</query><query>GRANT SELECT ON system.*</query></grants>
+    </nebulalog>
+  </users>
+</clickhouse>

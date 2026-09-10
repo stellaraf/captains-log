@@ -1,0 +1,31 @@
+[Unit]
+Description=Captain’s Log identity provider in strict FIPS mode
+After=nebulalog-firstboot.service nebulalog-postgresql.service
+Requires=nebulalog-firstboot.service nebulalog-postgresql.service
+RequiresMountsFor=/var/lib/nebulalog
+
+[Container]
+Image=@KEYCLOAK_FIPS_IMAGE@
+ContainerName=nebulalog-keycloak
+Network=nebulalog.network
+NetworkAlias=keycloak
+User=1000:1000
+GroupAdd=20001
+ReadOnly=true
+NoNewPrivileges=true
+DropCapability=all
+EnvironmentFile=/etc/nebulalog/keycloak.env
+Environment=KC_FIPS_MODE=strict
+Environment=KC_HEALTH_ENABLED=true
+Volume=/var/lib/nebulalog/keycloak:/opt/keycloak/data:Z
+Volume=/var/lib/nebulalog/configuration/keycloak/import:/opt/keycloak/data/import:ro,z
+Volume=/var/lib/nebulalog/configuration/tls:/etc/nebulalog/tls:ro,z
+Tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m
+Exec=start --optimized --import-realm
+PublishPort=127.0.0.1:8443:8443
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=900
+[Install]
+WantedBy=multi-user.target

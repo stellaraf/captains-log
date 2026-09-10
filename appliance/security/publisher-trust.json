@@ -1,0 +1,8 @@
+{
+  "algorithm": "RSA-PSS-SHA256",
+  "key_id": "captains-log-2026-01",
+  "publisher": "Stellar Technologies",
+  "repository": "stellaraf/captains-log",
+  "schema": 1,
+  "spki_sha256": "cf342e7a27f5355abd1f5f07ef750922ab4a55e513b332fec334f1fa090e7371"
+}

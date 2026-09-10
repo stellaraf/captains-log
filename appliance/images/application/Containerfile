@@ -1,0 +1,44 @@
+# Build from the repository root. All base references are Linux/amd64 manifests.
+FROM docker.io/library/node:24-bookworm-slim@sha256:6642ef280aebc09c4541bee0b15c9f89f0f3f3c247ddee79ae1d37eddfdcbbaa AS web
+WORKDIR /build/web
+COPY web/package*.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
+FROM docker.io/library/golang:1.27.1-bookworm@sha256:6860a573025fcd35aba4f1b23e858b1c1dcd425d53fa73562e169a6ab1c2339a AS go
+ARG VERSION=0.2.0-appliance-candidate
+ENV GOFIPS140=v1.0.0 CGO_ENABLED=0
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/ cmd/
+COPY internal/ internal/
+RUN go build -trimpath -ldflags="-X main.version=${VERSION}" -o /nebulalog ./cmd/nebulalog && \
+    REQUIRE_FIPS=true /nebulalog version && go version -m /nebulalog > /go-build-info.txt
+
+FROM docker.io/rockylinux/rockylinux:9.8@sha256:ed654c694190a670bb5c33f68995b862214fc96ffbdca95e07a8935ba0a3717d
+ARG APPLICATION_SOURCE_SHA256
+RUN test "${#APPLICATION_SOURCE_SHA256}" -eq 64 && \
+    case "$APPLICATION_SOURCE_SHA256" in *[!0-9a-f]*) exit 1 ;; esac && \
+    rpm -q ca-certificates tzdata && \
+    groupadd --gid 10001 nebulalog && \
+    useradd --system --uid 10001 --gid 10001 --no-create-home --shell /sbin/nologin nebulalog && \
+    install -d -m 0755 /opt/nebulalog && \
+    rpm -qa --qf '%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\t%{LICENSE}\n' | sort > /opt/nebulalog/rpm-bom.tsv
+WORKDIR /app
+COPY --from=go /nebulalog /usr/local/bin/nebulalog
+COPY --from=go /go-build-info.txt /opt/nebulalog/go-build-info.txt
+COPY --from=web /build/web/dist /app/web
+COPY migrations /app/migrations
+COPY LICENSE /opt/nebulalog/LICENSE
+RUN find /app/web -type d -exec chmod 0755 {} + && find /app/web -type f -exec chmod 0644 {} +
+USER 10001:10001
+ENV REQUIRE_FIPS=true WEB_DIR=/app/web API_LISTEN=:8080 SPOOL_DIR=/var/lib/nebulalog/spool EXPORT_DIR=/var/lib/nebulalog/exports
+LABEL org.opencontainers.image.title="Captain’s Log application appliance candidate" \
+      io.nebulalog.application-source-sha256="${APPLICATION_SOURCE_SHA256}" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.version="0.2.0-appliance-candidate"
+EXPOSE 8080 5514/tcp 5514/udp 6514/tcp
+ENTRYPOINT ["nebulalog"]
+CMD ["all"]

@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Captain’s Log host observations
+
+[Timer]
+OnBootSec=30
+OnUnitInactiveSec=30
+AccuracySec=1
+Unit=nebulalog-status.service
+
+[Install]
+WantedBy=timers.target

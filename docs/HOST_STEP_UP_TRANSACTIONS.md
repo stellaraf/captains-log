@@ -1,0 +1,40 @@
+# Administrator step-up transactions
+
+Source and local integration checks: **2026-09-08**, after frozen candidate v6. [`internal/auth/stepup.go`](../internal/auth/stepup.go), its [HTTPS client](../internal/auth/stepup_oidc.go) and [PostgreSQL store](../internal/auth/stepup_postgres.go) implement the server-side transaction. They are not wired into application routes or the host controller. The running development stack and frozen v6 source, image and bundle do not contain this change. The separate [Keycloak flow candidate](HOST_STEP_UP.md) remains disabled and unqualified.
+
+Subsequent **post-v7 source** adds [read-only host plan creation and owner-bound lookup](HOST_READ_ONLY_PLANS.md). Those routes use the existing verified Administrator application session and expose no step-up route, human-verifiable host grant or execution. The new lookup is not yet connected to `Begin`/`Complete`; its protected service installation and Linux cross-language qualification also remain open. This addition records no new running-stack deployment or guest result.
+
+## Begin and completion
+
+`Begin` requires the existing authenticated Administrator context and private verified application session. It checks exact issuer, subject, authorized application client, application audience, token kind, session identifier and current token validity. Its `StepUpBinding` must come from a freshly authenticated host-issued plan: installation UUID, registered operation, plan UUID/digest, resource revision and plan expiry. This Go type does not authenticate a plan by itself; accepting a browser's purported binding would violate the interface contract.
+
+The server independently generates 32 random bytes each for state, nonce and the PKCE verifier. It sends the exact code/S256/openid/PAR request, including fresh-login parameters and essential ACR, through the confidential client. The browser receives the fixed authorization URL containing only the client ID and opaque request URI. The URL remains sensitive and must not be logged or sent as a referrer. PAR protects the authorization parameters in transit through the browser; nonce, state, PKCE and signed issuer checks remain necessary. [RFC 9126](https://www.rfc-editor.org/rfc/rfc9126.html), [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636.html).
+
+The durable record stores the state **hash**, nonce, verifier, reviewed configuration digest, original actor and session **hash**, and every plan binding. No raw OAuth state, session ID or bearer token is stored in that table. Its deadline is the earliest of begin plus 120 seconds, PAR lifetime, original token expiry, plan expiry and policy-review expiry. UTC microsecond normalization matches PostgreSQL without silently changing a stored comparison.
+
+`Complete` requires the same authenticated original Administrator subject/client/session and a freshly checked identical host plan. It atomically matches and deletes the pending record before exchanging the code. Wrong bindings leave another transaction untouched; a failed, cancelled, timed-out or ambiguously completed exchange requires a new transaction. There is no exchange retry. Concurrent callbacks can obtain the pending record only once.
+
+Both returned tokens require the configured issuer's verified signature and host-control audience. Strict secondary claim parsing rejects duplicate or malformed claims. The ID token must carry its signed transaction nonce, `typ=ID` and a valid `at_hash` over the returned access token; the access token must have `typ=Bearer`. Both must satisfy the exact reviewed ACR policy and match subject, new session, authentication time and ACR. Authentication and issuance must be at or after transaction start, allowing only the issuer's whole-second timestamp precision. The access token must also carry the actual application `ADMINISTRATOR` role. A new step-up session may differ from the original application session; the two identities are retained separately. [OpenID Connect token validation](https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation).
+
+The opaque result stays in server memory and refuses JSON serialization; formatting redacts tokens and session information. Its expiry is bounded by the transaction, token expiry, token-age and authentication-age limits. **It is not a host authorization grant.** No executor accepts it. Future host integration must independently verify signed evidence, current roles and both active sessions, exact plan/resource state, one-use grant binding and issuer availability at acceptance and before effects.
+
+## Transport and storage boundaries
+
+The client uses only the pinned Keycloak issuer-relative authorization, PAR, token and JWK endpoints. TLS certificate verification is mandatory; it refuses insecure configuration, alternate TLS server names, HTTP issuers and ambiguous realm paths. It follows no redirects, uses no browser-controlled endpoint or refresh grant, limits response headers/bodies and has a ten-second request timeout. Token/PAR responses require bounded, duplicate-free JSON. Refresh-token issuance, unexpected scope/type/lifetime and malformed request URIs fail closed. Errors contain no upstream body, code, token or client secret.
+
+The standalone [`migrations/host_stepup.sql`](../migrations/host_stepup.sql) is intentionally **not applied by normal startup**. Its constraints bound every stored field and the 120-second lifetime. PostgreSQL consumption is one conditional `DELETE ... RETURNING`; database errors provide no fallback or evidence. Each insertion removes at most 128 expired rows, skipping locked rows. Lifecycle integration still needs an idle expiry sweeper, transaction rate/concurrency limits, a private database pool with parameter tracing disabled, encrypted storage and backup exclusion/invalidation for short-lived secrets. Expired rows cannot complete even when cleanup has not run.
+
+## Verification and open integration work
+
+Local checks exercise signed synthetic tokens with the real OIDC verifier, nonce/token-pair substitution, old authentication, role/session/action changes, expiry and clock boundaries, code-exchange failures, redaction and 32 simultaneous callbacks. HTTPS tests check actual PAR/code form construction, TLS trust, cancellation, redirects, response bounds and invalid protocol responses. Isolated PostgreSQL tests cover exact round trips, every mismatch, non-overwrite, replay, SQL constraints, bounded cleanup, outage and 24 concurrent consumers.
+
+`TestStepUpTLSPostgresIntegration` combines the public constructor, signed original middleware, actual TLS/PAR/code/JWK client, coordinator and isolated PostgreSQL. It verifies successful completion, separate original/new sessions, stored-record consumption and replay refusal. Its authorization server signs **synthetic** tokens; it does not run a browser, validate a password/factor, or establish Keycloak behavior. No live user or realm is modified. Test schemas are randomly named, removed, and removal is verified.
+
+```sh
+go test -race ./internal/auth ./internal/api
+go vet ./internal/auth
+# Explicitly uses only temporary schemas in the existing loopback development PG:
+NEBULALOG_STEPUP_POSTGRES_TEST=1 go test -race ./internal/auth -run 'StepUp' -count=1
+```
+
+Before enabling step-up routes, qualify and connect the new trusted plan lookup to both `Begin` and `Complete`; implement qualified issuer/client read-back and revocation checks, bounded transaction admission/cleanup, secrets lifecycle, and the separate host-verifiable action grant. The HTTP callback must enforce parameter uniqueness, original authenticated context, Origin/CSRF protections, no-store/no-referrer, prompt URL cleanup and no third-party content. A top-level unauthenticated GET callback cannot call `Complete`; define and test the authenticated callback relay and same-browser binding. Qualify browser cancellation/recovery, OTP/recovery replay, broker and federation paths, concurrent tabs, API/issuer/database outages and restarts. Current source checks close none of those [release gates](RELEASE_ACCEPTANCE.md).

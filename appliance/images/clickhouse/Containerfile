@@ -1,0 +1,21 @@
+# Build from the repository root. No network package install or database initialization.
+FROM docker.io/altinity/clickhouse-server@sha256:6254bc404966150468130d2b5b02ebdf7238f21d2d85fbde77bc76c7181447df
+USER 0:0
+COPY LICENSE /opt/nebulalog/LICENSE-NEBULALOG
+COPY appliance/images/clickhouse/BOM.json /opt/nebulalog/BOM.json
+COPY appliance/images/clickhouse/licenses /opt/nebulalog/licenses
+COPY appliance/images/clickhouse/server.xml appliance/images/clickhouse/users.xml.in appliance/images/clickhouse/client.xml.in /opt/nebulalog/
+COPY --chmod=0555 appliance/images/clickhouse/entrypoint.sh appliance/images/clickhouse/storage-gate.sh appliance/images/clickhouse/data-state.sh /opt/nebulalog/
+RUN test "$(sha256sum /usr/bin/clickhouse)" = '080dce0336607e1d38e4deb9c9b95bfca34f587bdfd0613d8584fdce6bf8ee21  /usr/bin/clickhouse' && \
+    rm -f /entrypoint.sh && \
+    install -d -o 101 -g 101 -m 0700 /run/nebulalog-clickhouse && \
+    dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\n' > /opt/nebulalog/debian-package-bom.tsv && \
+    truncate -s 0 /etc/machine-id && rm -f /var/lib/dbus/machine-id /var/lib/systemd/random-seed
+USER 101:101
+ENV CLICKHOUSE_CONFIG="" CLICKHOUSE_PASSWORD_FILE=/run/secrets/nebulalog-ch-password HOME=/run/nebulalog-clickhouse
+LABEL org.opencontainers.image.title="Captain’s Log ClickHouse FIPS candidate" \
+      org.opencontainers.image.version="25.3.8.30001-nebulalog.1" \
+      org.opencontainers.image.licenses="AGPL-3.0-only AND Apache-2.0 AND LicenseRef-Vendor-Component-Licenses"
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/opt/nebulalog/entrypoint.sh"]
+CMD ["server"]

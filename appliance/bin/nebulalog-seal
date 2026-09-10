@@ -1,0 +1,94 @@
+#!/bin/bash
+set -euo pipefail
+[ "$(id -u)" = 0 ]
+. /etc/os-release
+[ "$ID" = rocky ]
+[ "$(cat /proc/sys/crypto/fips_enabled)" = 1 ]
+[ "$(getenforce)" = Enforcing ]
+exec 9</etc
+flock -n 9 || { echo 'Another image provisioner or sealer is active' >&2; exit 78; }
+python3 /usr/libexec/nebulalog/provision-guard verify-seal
+# This operation destroys the disposable build identity. It must never be used
+# to sanitize an installed customer appliance or a first-boot qualification VM.
+test -x /usr/local/bin/nebulalog
+python3 - <<'PYGUARD'
+from pathlib import Path
+import os, stat
+import json, sys
+base=Path('/etc/nebulalog')
+for path in (base/'bootstrap/state', base/'bootstrap/unsealed-build'):
+    info=path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
+        raise SystemExit('Sealing requires the private build marker')
+if (base/'bootstrap/state').read_text().strip() != 'unconfigured':
+    raise SystemExit('Cannot seal an initialized appliance')
+if any(path.exists() for path in (base/'bootstrap/firstboot.json',base/'storage.json',base/'configured')):
+    raise SystemExit('Cannot seal an enrolled appliance; use its pristine build base')
+if os.path.ismount('/var/lib/nebulalog') or any(Path('/var/lib/nebulalog').iterdir()):
+    raise SystemExit('Cannot seal an appliance containing data')
+sys.path.insert(0, '/usr/lib/nebulalog')
+from nebulalog_manager.update_enrollment import UpdateEnrollment
+UpdateEnrollment().verify_build_inputs(require_factory=True)
+PYGUARD
+case "${1:-}" in
+  '')
+    # The detached root unit survives the SSH build session it must close.
+    systemd-run --unit=nebulalog-image-seal --on-active=3s --property=Type=oneshot \
+      /usr/local/sbin/nebulalog-seal --finish
+    exit 0
+    ;;
+  --finish) test -n "${INVOCATION_ID:-}" ;;
+  *) echo 'Unsupported seal invocation' >&2; exit 2 ;;
+esac
+# Confirm kdump is off explicitly after installation and provisioning.
+# Stop its build-time crash kernel before clearing identity; offline cleanup
+# removes the now-unused image after confirming no boot entry references it.
+systemctl disable --now kdump.service
+[ "$(systemctl show --property=UnitFileState --value kdump.service)" = disabled ]
+[ "$(systemctl show --property=ActiveState --value kdump.service)" = inactive ]
+systemctl disable sshd
+systemctl stop sshd
+firewall-offline-cmd --set-default-zone=drop
+firewall-offline-cmd --zone=drop --add-service=https
+# No listeners are enabled until first boot has configured TLS/auth/data storage.
+rm -f /etc/sudoers.d/nebulalog-build
+# Packer is the only disposable account; do not kill unrelated user sessions.
+loginctl terminate-user packer || true
+for attempt in 1 2 3 4 5; do
+  if ! pgrep -u packer >/dev/null; then break; fi
+  sleep 1
+done
+if pgrep -u packer >/dev/null; then
+  echo 'Build account still has running processes; sealing refused' >&2
+  exit 1
+fi
+userdel --remove packer
+# Clear the build VM's static address, DNS, hostname, MAC bindings and leases.
+# Keep NetworkManager enabled; the generic Ethernet profile lets console setup
+# choose static addressing even on a network that has no DHCP server.
+systemctl stop NetworkManager.service NetworkManager-wait-online.service
+[ "$(systemctl show --property=ActiveState --value NetworkManager.service)" = inactive ]
+PYTHONPATH=/usr/lib/nebulalog python3 -m nebulalog_manager.image_seal_network
+restorecon -RF /etc/NetworkManager/system-connections /etc/hostname /etc/hosts /etc/resolv.conf /etc/sysconfig/network
+# Finish ExecStop's seed save before deleting it. Leaving this oneshot active
+# would recreate the seed at shutdown; keep the unit enabled for the next boot.
+systemctl stop systemd-random-seed.service
+[ "$(systemctl show --property=ActiveState --value systemd-random-seed.service)" = inactive ]
+rm -f /etc/ssh/ssh_host_* /var/lib/systemd/random-seed
+truncate -s 0 /etc/machine-id
+# Rocky minimal installations can omit this directory on the separate /var
+# filesystem. Never follow a substituted directory link while creating it.
+[ ! -L /var/lib/dbus ]
+install -d -o root -g root -m 0755 /var/lib/dbus
+rm -f /var/lib/dbus/machine-id
+ln -s /etc/machine-id /var/lib/dbus/machine-id
+rm -rf /tmp/nebulalog-appliance
+rm -f /tmp/nebulalog-keycloak-realm.json
+rm -rf /tmp/nebulalog-image-bundle
+dracut --force --no-hostonly
+rm /etc/nebulalog/bootstrap/unsealed-build
+rm /etc/nebulalog/bootstrap/private-build.json
+printf 'sealed\n' > /etc/nebulalog/bootstrap/image-state
+chmod 0600 /etc/nebulalog/bootstrap/image-state
+sync
+shutdown -P now

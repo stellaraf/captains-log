@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily host file integrity assessment
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+Unit=nebulalog-aide.service
+[Install]
+WantedBy=timers.target

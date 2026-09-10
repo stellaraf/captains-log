@@ -1,0 +1,13 @@
+[Unit]
+Description=Restore Captain’s Log maintenance access gate before serving HTTPS
+After=nebulalog-firstboot.service
+Requires=nebulalog-firstboot.service
+RequiresMountsFor=/var/lib/nebulalog
+Before=nebulalog-edge.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/nebulalog/update-boot-gate
+RemainAfterExit=yes
+UMask=0077
+TimeoutStartSec=180

@@ -1,0 +1,31 @@
+[Unit]
+Description=Captain’s Log first-installation virtual console
+After=local-fs.target systemd-user-sessions.service auditd.service firewalld.service NetworkManager.service
+Wants=auditd.service firewalld.service NetworkManager.service
+Before=getty@tty1.service
+ConditionVirtualization=vm
+ConditionPathExists=/etc/nebulalog/bootstrap/image-state
+ConditionPathExists=!/etc/nebulalog/bootstrap/unsealed-build
+ConditionPathExists=!/etc/nebulalog/configured
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/libexec/nebulalog/nebulalog-console
+WorkingDirectory=/
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+StandardInput=tty-fail
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+LimitCORE=0
+Restart=no
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=Check Captain's Log GitHub Releases every 15 minutes
+[Timer]
+OnCalendar=*-*-* *:00/15:00
+Persistent=true
+AccuracySec=1s
+[Install]
+WantedBy=timers.target

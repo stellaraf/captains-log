@@ -1,0 +1,13 @@
+# Security hardening
+
+The production architecture requires install-time FIPS, encrypted application persistence, SELinux Enforcing, firewalld default deny, auditd, file integrity monitoring, authenticated access and least-privilege containers. These are release gates, not claims inferred from a developer Compose deployment.
+
+The image recipe supplies minimum kernel/sysctl controls, separate host log/audit/tmp filesystems, audit watches, a daily AIDE check timer, SSH-disabled sealing and public-key-only build SSH. [AIDE preparation and explicit enrollment](AIDE.md) bind the initial database to a sealed appliance's static runtime configuration and captured host source, before its final SCAP assessment/review and setup completion. Final completion requires a recent enrolled clean check. The timer reports missing enrollment as failure, and findings never reset the baseline. This console workflow and actual SELinux/timer execution still require guest qualification; normal Administrator UI management is not yet connected. Full CIS/STIG remediation is not accomplished by the supplied minimum controls.
+
+Quadlets use immutable image references rendered from approved release metadata, no privileged flag, no container socket, no public database ports, non-root container UIDs and dropped capabilities. UID ownership, image entrypoints, read-only roots and SELinux contexts must be tested on the actual images. The host manager has narrow fixed operations; no endpoint accepts arbitrary shell or SQL.
+
+Inbound production defaults are TCP 443 only. Configured Syslog can open UDP/TCP 514 and TLS 6514; restrict senders by network and firewall where possible. SSH stays disabled unless an administrator explicitly enables a documented recovery mode. Use host firewall rules and inspect effective Podman network rules: port publication can introduce rules whose interaction must be verified. Database administration remains on the private container network.
+
+Application tokens, database passwords, TLS keys, export files, retained raw logs, manager journals and backup scratch are sensitive. The encrypted data mount must be required before service startup. Audit captures administrative actions, retention changes, authentication configuration, updates and storage operations without logging secrets.
+
+The first-boot wizard, HTTPS edge configuration, module validation, audited manager/UI bridge, baseline remediation and a complete host assessment are not yet release-qualified. Do not disable an enforcement check to make an incomplete image appear ready. See [FIPS](FIPS.md), [SELinux](SELINUX.md), [compliance](COMPLIANCE.md) and [updates](UPDATES.md).

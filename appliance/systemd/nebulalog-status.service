@@ -1,0 +1,13 @@
+[Unit]
+Description=Publish sanitized Captain’s Log host status
+After=nebulalog-firstboot.service
+RequiresMountsFor=/var/lib/nebulalog
+ConditionPathExists=/var/lib/nebulalog/configuration/lifecycle.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/nebulalog/publish-status
+UMask=0077
+TimeoutStartSec=45
+Nice=10
+NoNewPrivileges=yes

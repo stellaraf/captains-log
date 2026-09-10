@@ -1,0 +1,16 @@
+[Unit]
+Description=Check appliance host file integrity
+Requires=nebulalog-firstboot.service
+After=nebulalog-firstboot.service
+RequiresMountsFor=/var/lib/nebulalog
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/nebulalog/nebulalog-aide check
+TimeoutStartSec=3750
+UMask=0077
+PrivateTmp=true
+# Preserve the actual writable encrypted-mount view required by the host gate.
+ProtectSystem=full
+ReadWritePaths=/var/lib/nebulalog/manager
+Nice=10
+IOSchedulingClass=idle

@@ -1,0 +1,9 @@
+.git
+.local
+**/node_modules
+**/dist
+bin
+appliance/output
+*.ova
+*.iso
+*.qcow2

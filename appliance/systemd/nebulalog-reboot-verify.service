@@ -1,0 +1,15 @@
+[Unit]
+Description=Verify Captain’s Log after an operating system maintenance reboot
+After=nebulalog-postgresql.service nebulalog-clickhouse.service nebulalog-keycloak.service nebulalog-api.service nebulalog-ingest.service nebulalog-edge.service
+Wants=nebulalog-postgresql.service nebulalog-clickhouse.service nebulalog-keycloak.service nebulalog-api.service nebulalog-ingest.service nebulalog-edge.service
+RequiresMountsFor=/var/lib/nebulalog
+ConditionPathExists=/var/lib/nebulalog/configuration/lifecycle.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/nebulalog/update-reboot-complete
+UMask=0077
+TimeoutStartSec=3600
+
+[Install]
+WantedBy=multi-user.target

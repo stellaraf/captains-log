@@ -1,0 +1,15 @@
+# Host configuration and lifecycle evidence; application audit remains separate.
+-w /etc/nebulalog/ -p wa -k nebulalog_configuration
+-w /etc/crypttab -p wa -k nebulalog_encryption
+-w /etc/fstab -p wa -k nebulalog_storage
+-w /etc/crypto-policies/ -p wa -k nebulalog_fips
+-w /etc/selinux/ -p wa -k nebulalog_selinux
+-w /etc/systemd/system/ -p wa -k nebulalog_services
+-w /etc/firewalld/ -p wa -k nebulalog_firewall
+-w /etc/passwd -p wa -k nebulalog_accounts
+-w /etc/group -p wa -k nebulalog_accounts
+-w /etc/shadow -p wa -k nebulalog_accounts
+-w /etc/sudoers -p wa -k nebulalog_privilege
+-w /etc/sudoers.d/ -p wa -k nebulalog_privilege
+-w /usr/bin/rpm -p x -k nebulalog_packages
+-w /usr/bin/dnf -p x -k nebulalog_packages

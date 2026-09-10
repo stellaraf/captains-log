@@ -1,0 +1,12 @@
+[Unit]
+Description=Apply Rocky 9 updates within the configured maintenance window
+RequiresMountsFor=/var/lib/nebulalog
+After=nebulalog-firstboot.service network-online.target
+ConditionPathExists=/etc/nebulalog/maintenance.json
+ConditionPathExists=/usr/libexec/nebulalog/update-os-preflight
+ConditionPathExists=/usr/libexec/nebulalog/update-reboot-prepare
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /usr/libexec/nebulalog/host-boot os-updates
+TimeoutStartSec=2h
+UMask=0077

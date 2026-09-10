@@ -1,0 +1,111 @@
+name: nebulalog-dev
+services:
+  postgres:
+    image: postgres:17.6-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${PG_ADMIN_PASSWORD:?Run scripts/dev-init.py}
+      NEBULALOG_PASSWORD: ${PG_PASSWORD:?}
+      KEYCLOAK_PASSWORD: ${KC_DB_PASSWORD:?}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./deploy/dev/postgres-init.sh:/docker-entrypoint-initdb.d/10-nebulalog.sh:ro
+    ports: ["127.0.0.1:25432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: nebulalog
+      CLICKHOUSE_USER: nebulalog
+      CLICKHOUSE_PASSWORD: ${CH_PASSWORD:?}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - ch-data:/var/lib/clickhouse
+      - ./migrations/clickhouse.sql:/docker-entrypoint-initdb.d/10-events.sql:ro
+      - ./deploy/dev/clickhouse.xml:/etc/clickhouse-server/config.d/nebulalog.xml:ro
+    ports: ["127.0.0.1:28123:8123"]
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
+    mem_limit: 3g
+    cpus: 3
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --spider http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3.3
+    restart: unless-stopped
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD:?}
+      KC_BOOTSTRAP_ADMIN_USERNAME: nlbootstrap
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD:?}
+      KC_HOSTNAME: http://127.0.0.1:18089
+      KC_HEALTH_ENABLED: true
+      JAVA_OPTS_KC_HEAP: -XX:MaxRAMPercentage=65
+    ports: ["127.0.0.1:18089:8080"]
+    volumes:
+      - ./deploy/keycloak/realm.json:/opt/keycloak/data/import/nebulalog-realm.json:ro
+      - ./deploy/keycloak/themes/nebulalog:/opt/keycloak/themes/nebulalog:ro
+    depends_on:
+      postgres: {condition: service_healthy}
+    mem_limit: 1g
+  app:
+    profiles: ["application"]
+    restart: unless-stopped
+    stop_grace_period: 45s
+    user: "${DEV_UID:-501}:${DEV_GID:-20}"
+    build: .
+    environment:
+      PG_DSN: postgres://nebulalog:${PG_PASSWORD}@postgres:5432/nebulalog?sslmode=disable
+      CH_URL: http://clickhouse:8123
+      CH_USER: nebulalog
+      CH_PASSWORD: ${CH_PASSWORD}
+      OIDC_ISSUER: http://127.0.0.1:18089/realms/nebulalog
+      OIDC_BACKCHANNEL_URL: http://keycloak:8080
+      OIDC_URL: http://127.0.0.1:18089
+      OIDC_REALM: nebulalog
+      OIDC_CLIENT_ID: nebulalog
+      IDENTITY_ADMIN_URL: http://keycloak:8080
+      IDENTITY_CLIENT_ID: nebulalog-identity-manager
+      IDENTITY_CLIENT_SECRET: ${KC_IDENTITY_CLIENT_SECRET:?Run scripts/dev-init.py then scripts/dev-auth.py}
+      IDENTITY_ALLOW_HTTP: 'true'
+      IDENTITY_ENABLE_WRITES: 'true'
+      PANOS_TIMEZONE: ${PANOS_TIMEZONE:-America/Phoenix}
+      SYSLOG_UDP: :5514
+      SYSLOG_TCP: :5514
+      SYSLOG_TLS: :6514
+      SYSLOG_CERT: /run/certs/syslog-server.crt
+      SYSLOG_KEY: /run/certs/syslog-server.key
+      COLLECTOR_TLS_CA_PATH: /run/certs/syslog-ca.crt
+      COLLECTOR_TLS_CERT_PATH: /run/certs/syslog-server.crt
+    ports:
+      - "127.0.0.1:18080:8080"
+      - "${SYSLOG_BIND_IP:-127.0.0.1}:5514:5514/tcp"
+      - "${SYSLOG_BIND_IP:-127.0.0.1}:5514:5514/udp"
+      - "${SYSLOG_BIND_IP:-127.0.0.1}:6514:6514/tcp"
+    volumes:
+      - ./.local/app-data:/var/lib/nebulalog
+      - ./.local/certs/syslog-ca.crt:/run/certs/syslog-ca.crt:ro
+      - ./.local/certs/syslog-server.crt:/run/certs/syslog-server.crt:ro
+      - ./.local/certs/syslog-server.key:/run/certs/syslog-server.key:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      clickhouse: {condition: service_healthy}
+volumes:
+  pg-data:
+  ch-data:

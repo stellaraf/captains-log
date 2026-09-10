@@ -1,0 +1,153 @@
+"""OS package policy and integrity-chain tests; native RPM proof is separate."""
+import copy
+import hashlib
+import json
+from pathlib import Path
+import stat
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+
+from nebulalog_manager import os_payload as rpm, aide_updates
+from nebulalog_manager.common import Refused
+import test_aide_updates as aide_fixture
+
+
+def header():
+    # The names/types are observed from native Rocky RPM 4.16 --xml, including
+    # the unchanged two-path linux-firmware-whence July/August 2026 payload set.
+    return {'Name':['linux-firmware-whence'], 'Epoch':[0], 'Version':['20260804'],
+            'Release':['161.2.el9_8'], 'Arch':['noarch'], 'Filedigestalgo':[8],
+            'Basenames':['linux-firmware-whence','WHENCE'],
+            'Dirnames':['/usr/share/licenses/','/usr/share/licenses/linux-firmware-whence/'],
+            'Dirindexes':[0,1], 'Filemodes':[stat.S_IFDIR|0o755,stat.S_IFREG|0o644],
+            'Filesizes':[0,7], 'Filedigests':['',hashlib.sha256(b'license').hexdigest()],
+            'Fileusername':['root','root'], 'Filegroupname':['root','root'],
+            'Fileflags':[0,128], 'Filelinktos':['','']}
+
+
+class RpmPolicyTests(unittest.TestCase):
+    def test_native_xml_types_and_epoch_version_identity(self):
+        data = '<rpmHeader><rpmTag name="Name"><string>passt</string></rpmTag><rpmTag name="Version"><string>0^20251210.gd04c480</string></rpmTag><rpmTag name="Release"><string>6.el9_8</string></rpmTag><rpmTag name="Arch"><string>x86_64</string></rpmTag></rpmHeader>'
+        self.assertEqual(rpm.identity(rpm.headers(data)[0])['nevra'], 'passt-0:0^20251210.gd04c480-6.el9_8.x86_64')
+        self.assertEqual(rpm.payload(header())['files'][1]['sha256'], hashlib.sha256(b'license').hexdigest())
+
+    def test_header_parser_refuses_entities_duplicates_and_unexpected_types(self):
+        for data in ('<!DOCTYPE rpmHeader><rpmHeader/>', '<rpmHeader><rpmTag name="Name"/><rpmTag name="Name"/></rpmHeader>', '<rpmHeader><rpmTag name="Name"><file>bad</file></rpmTag></rpmHeader>'):
+            with self.subTest(data=data), self.assertRaises(Refused):rpm.headers(data)
+
+    def test_payload_refuses_scripts_links_config_ghost_setuid_and_unknown_hash(self):
+        for key,value in [('Postin',['touch /etc/arbitrary']),('Filelinktos',['','elsewhere']),
+                          ('Fileflags',[0,1]),('Fileflags',[0,16]),('Fileflags',[0,64]),('Filemodes',[stat.S_IFDIR|0o755,stat.S_IFREG|0o4755]),
+                          ('Filedigestalgo',[1]),('Filecaps',['','cap_net_admin=ep'])]:
+            with self.subTest(key=key,value=value), self.assertRaises(Refused):
+                rpm.payload({**header(),key:value})
+
+    def test_boot_checker_and_package_manager_require_explicit_migration(self):
+        for name in ('kernel-core','aide','rpm','dnf','python3','openssl-libs','shim-x64','dracut','cryptsetup-libs'):
+            with self.subTest(name=name), self.assertRaisesRegex(Refused,'migration_recipe'):
+                rpm.payload({**header(),'Name':[name]})
+
+    def test_external_triggers_match_package_or_file_prefix_not_neighbor(self):
+        rpm.external_triggers([{'Filetriggername':['/usr/lib']}],['license'],['/usr/library/file'])
+        for installed,paths in [([{'Triggername':['license']}],['/usr/share/license']),
+                                ([{'Transfiletriggername':['/usr/lib']}],['/usr/lib/modprobe.d/file']),
+                                ([{'Filetriggername':['unexpected']}],['/usr/share/license'])]:
+            with self.subTest(installed=installed), self.assertRaises(Refused):rpm.external_triggers(installed,['license'],paths)
+
+    def test_signature_requires_enrolled_rsa_signature_not_digest_only(self):
+        valid='test.rpm:\n Header V4 RSA/SHA256 Signature, key ID 350d275d: OK\n Header SHA256 digest: OK\n Payload SHA256 digest: OK\n'
+        self.assertEqual(rpm.signature(Path('/retained/test.rpm'),Path('/keys'),Mock(return_value=valid))['key_id'],'350d275d')
+        for text in ('Header SHA256 digest: OK', valid.replace('350d275d','deadbeef'),valid.replace('RSA/SHA256','DSA/SHA1'),valid+'BAD signature'):
+            with self.subTest(text=text), self.assertRaises(Refused):rpm.signature(Path('/retained/test.rpm'),Path('/keys'),Mock(return_value=text))
+
+    def test_private_signature_database_is_labeled_without_changing_global_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/"keydb"
+            runner = Mock(return_value="gpg-pubkey 350d275d")
+            rpm.init_keydb(path, runner)
+            self.assertEqual(runner.call_args_list[0].args[0], ["/usr/bin/chcon", "--reference=/var/lib/rpm", str(path)])
+            self.assertEqual(runner.call_args_list[1].args[0], ["/usr/bin/rpm", "--dbpath", str(path), "--initdb"])
+            with self.assertRaises(FileExistsError):rpm.init_keydb(path, runner)
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(Refused, "isolated_keyring_changed"):
+                rpm.init_keydb(Path(directory)/"keydb", Mock(return_value="gpg-pubkey 350d275d\ngpg-pubkey deadbeef"))
+
+    def test_exact_apply_argv_has_no_solver_or_validation_bypass(self):
+        plan={'excludedocs':False,'packages':[{'rpm':'a'*64+'.rpm'}]}
+        expected=['/usr/bin/rpm','--upgrade','/stage/packages/'+'a'*64+'.rpm']
+        self.assertEqual(rpm.command(Path('/stage'),plan),expected)
+        self.assertEqual(rpm.command(Path('/stage'),plan,test=True),expected[:2]+['--test']+expected[2:])
+        for forbidden in ('--nodeps','--nosignature','--noscripts','--notriggers','--oldpackage','--replacefiles'):
+            self.assertNotIn(forbidden,rpm.command(Path('/stage'),plan))
+
+    def test_prepare_report_refuses_any_drift_and_forward_only_exact_files(self):
+        plan={'files':[{'path':'/usr/share/licenses/example'}]}
+        rpm.allowed_integrity_report({'changed':{'/usr/share/licenses/example':'f ...'}},plan,'forward')
+        for report,phase in [({'changed':{'/usr/share/licenses/example':'f ...'}},'prepare'),
+                             ({'changed':{'/etc/passwd':'f ...'}},'forward'),
+                             ({'added':{'/usr/share/licenses/example':'f ...'}},'forward'),
+                             ({'removed':{'/usr/share/licenses/example':'f ...'}},'forward'), ({},'rollback')]:
+            with self.subTest(report=report,phase=phase),self.assertRaises(Refused):rpm.allowed_integrity_report(report,plan,phase)
+
+
+class OSIntegrityTransitionTests(unittest.TestCase):
+    for _name,_value in aide_fixture.AuthorizedAideTests.__dict__.items():
+        if not _name.startswith('__') and not _name.startswith('test_'):
+            locals()[_name]=_value
+
+    def os_fixture(self):
+        self.authorized_fixture()
+        self.monitored.remove(self.generation)
+        self.monitored.remove(self.code)
+        self.plan={'schema':1,'kind':'os-payload-v1','sequence':0,'manifest_sha256':'a'*64,
+                   'files':[{'path':str(self.runtime),'before':self.desc(self.runtime),'after':self.desc(self.runtime,b'new managed\n')}],
+                   'directories':[],'skipped_docs':[]}
+        self.plan_path=self.stage/'os-integrity-plan.json'
+        self.write_private(self.plan_path,json.dumps(self.plan).encode())
+
+    def activate(self):self.runtime.write_bytes(b'new managed\n')
+
+    def test_os_payload_uses_retained_aide_update_chain_and_fresh_acceptance(self):
+        self.os_fixture();self.prepare_update();self.activate()
+        result=self.accept_update()
+        self.assertTrue(result['ok'])
+        self.assertEqual(self.manager.check()['state'],'clean')
+        self.assertFalse(self.accept_update()['baseline_changed'])
+        self.assertEqual(self.scan_calls.count('update'),1)
+        self.assert_original()
+
+    def test_os_prepare_refuses_preexisting_drift_even_in_replaced_file(self):
+        self.os_fixture();self.runtime.write_bytes(b'unexpected')
+        with self.assertRaisesRegex(Refused,'live_file_not_planned'):self.prepare_update()
+        self.assertEqual(self.scan_calls.count('update'),0)
+
+    def test_os_acceptance_refuses_unrelated_drift_without_adopting_database(self):
+        self.os_fixture();self.prepare_update();self.activate();self.unrelated.write_bytes(b'unrelated drift')
+        with self.assertRaisesRegex(Refused,'unrelated_integrity_change'):self.accept_update()
+        self.assertEqual((self.state/'aide.db.gz').read_bytes(),self.initial_db)
+        self.assertEqual(json.loads((self.state/'authorized/pending.json').read_text())['state'],'scanning')
+        self.assert_original()
+
+    def test_os_acceptance_refuses_metadata_and_automatic_rpm_rollback(self):
+        self.os_fixture();self.prepare_update();self.activate()
+        with patch.object(aide_updates,'_metadata',return_value={'xattrs_sha256':'d'*64,'acl_sha256':'e'*64,'selinux_sha256':'f'*64}):
+            with self.assertRaisesRegex(Refused,'acl_xattrs_or_selinux_changed'):self.accept_update()
+        with self.assertRaisesRegex(Refused,'rollback_requires'):self.accept_update('rollback')
+        self.assertEqual(self.scan_calls.count('update'),0)
+
+    def test_os_cas_interruption_recovers_same_scan_without_reexecuting_package(self):
+        self.os_fixture();self.prepare_update();self.activate()
+        original=aide_updates._replace_current
+        def interrupt(*args,**kwargs):
+            original(*args,**kwargs)
+            raise OSError('after CAS interruption')
+        with patch.object(aide_updates,'_replace_current',side_effect=interrupt),self.assertRaises(OSError):self.accept_update()
+        self.assertEqual(json.loads((self.state/'authorized/pending.json').read_text())['state'],'ready')
+        self.assertTrue(self.accept_update()['ok'])
+        self.assertEqual(self.scan_calls.count('update'),1)
+        self.assertEqual(self.manager.check()['state'],'clean')
+        self.assert_original()
+
+
+if __name__=='__main__':unittest.main()

@@ -1,0 +1,7 @@
+[Unit]
+Description=Evaluate the configured OS update maintenance window
+[Timer]
+OnCalendar=*-*-* *:00/15:00
+Persistent=true
+[Install]
+WantedBy=timers.target

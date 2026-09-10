@@ -1,0 +1,149 @@
+{
+  "format": "nebulalog-component-lock-v1",
+  "reviewed_at": "2026-09-07",
+  "platform": "linux/amd64",
+  "qualification": "FIPS candidate; actual guest/provider/OE qualification required",
+  "base_image": "docker.io/rockylinux/rockylinux:9.8@sha256:ed654c694190a670bb5c33f68995b862214fc96ffbdca95e07a8935ba0a3717d",
+  "postgresql_version": "17.11-1PGDG.rhel9.8",
+  "openssl_version": "1:3.5.5-6.el9_8",
+  "pgdg_signing_key": {
+    "name": "PGDG-RPM-GPG-KEY-RHEL",
+    "url": "https://download.postgresql.org/pub/repos/yum/keys/PGDG-RPM-GPG-KEY-RHEL",
+    "sha256": "a70c9527426017d00fa4e6f9d2941d515357a27a7be82e155248ece53bbe5453",
+    "bytes": 2484,
+    "primary_fingerprint": "D4BF08AE67A0B4C7A1DBCCD240BCA2B408B40D20",
+    "signing_subkey_fingerprint": "190043FB30BA8636FCB021BEC07038AF3576435C"
+  },
+  "rpms": [
+    {
+      "name": "acl-2.3.1-4.el9.x86_64.rpm",
+      "url": "https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/a/acl-2.3.1-4.el9.x86_64.rpm",
+      "sha256": "6e3673a879e19461e2404f18a999725f7b796344885150dc6e2c81502419867b",
+      "bytes": 70898
+    },
+    {
+      "name": "dbus-1.12.20-8.el9.x86_64.rpm",
+      "url": "https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/d/dbus-1.12.20-8.el9.x86_64.rpm",
+      "sha256": "f9ab612861c66de02ad73a0ffb56b2f83b71de2326ea595ffeac47eea517e18f",
+      "bytes": 7005
+    },
+    {
+      "name": "dbus-broker-28-9.el9_8.x86_64.rpm",
+      "url": "https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/d/dbus-broker-28-9.el9_8.x86_64.rpm",
+      "sha256": "fc1775336f65da4c997c0dd832065d679b13a603ab7679c826c9ac3a08bb4c6d",
+      "bytes": 173162
+    },
+    {
+      "name": "dbus-common-1.12.20-8.el9.noarch.rpm",
+      "url": "https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/d/dbus-common-1.12.20-8.el9.noarch.rpm",
+      "sha256": "1dd8709f43f63277d6305b2ef572cb091ef748ce1588a0bafc95866c397335b9",
+      "bytes": 13888
+    },
+    {
+      "name": "glibc-2.34-275.el9_8.x86_64.rpm",
+      "url": "https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/g/glibc-2.34-275.el9_8.x86_64.rpm",
+      "sha256": "8094d98d60e676de0eee5710d69fce571dcd34350d19339128c024299720e4e2",
+      "bytes": 2054184
+    },
+    {
+      "name": "glibc-common-2.34-275.el9_8.x86_64.rpm",
+      "url": "https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/g/glibc-common-2.34-275.el9_8.x86_64.rpm",
+      "sha256": "243156253aaa83cf19e0475583f56f4b9759037919276f5677f8b6cbb9b269c9",
+      "bytes": 306583
+    },
+    {
+      "name": "glibc-langpack-en-2.34-275.el9_8.x86_64.rpm",
+      "url": "https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/g/glibc-langpack-en-2.34-275.el9_8.x86_64.rpm",
+      "sha256": "9f11192f3faa1a29def4b866ac89dd1a520d6a563f93e48a5cf7b81ed066c77f",
+      "bytes": 569958
+    },
+    {
+      "name": "glibc-minimal-langpack-2.34-275.el9_8.x86_64.rpm",
+      "url": "https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/g/glibc-minimal-langpack-2.34-275.el9_8.x86_64.rpm",
+      "sha256": "6722cd0ca8bcf59d038e81a4ec9683c93d3f89e3014db83b197433a1ad002586",
+      "bytes": 27397
+    },
+    {
+      "name": "kmod-libs-28-11.el9.x86_64.rpm",
+      "url": "https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/k/kmod-libs-28-11.el9.x86_64.rpm",
+      "sha256": "f994cf4f4d1bea1b5ce9b3f1eb7ec01eba9562cdaa3c7af9fd58fe8771720916",
+      "bytes": 63663
+    },
+    {
+      "name": "libicu-67.1-10.el9_6.x86_64.rpm",
+      "url": "https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/l/libicu-67.1-10.el9_6.x86_64.rpm",
+      "sha256": "14c314868326269c62498d149399888ce3c819efddaba79d50d2a5ac90c29b87",
+      "bytes": 10034103
+    },
+    {
+      "name": "libseccomp-2.5.2-2.el9.x86_64.rpm",
+      "url": "https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/l/libseccomp-2.5.2-2.el9.x86_64.rpm",
+      "sha256": "c5043228059ffb4e2ef855671909b22bd42784907979a27d25ca9f5163408ad1",
+      "bytes": 72270
+    },
+    {
+      "name": "openssl-3.5.5-6.el9_8.x86_64.rpm",
+      "url": "https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/o/openssl-3.5.5-6.el9_8.x86_64.rpm",
+      "sha256": "642306bcb3710cb25d62858ad84113097c756c1586ec1a4bcc2c2e14d6b3ba4a",
+      "bytes": 1478354
+    },
+    {
+      "name": "openssl-fips-provider-3.5.5-6.el9_8.x86_64.rpm",
+      "url": "https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/o/openssl-fips-provider-3.5.5-6.el9_8.x86_64.rpm",
+      "sha256": "599c29922a29d382861c74abc4edeb275e178ca2856cdbb830e1748ebdfae187",
+      "bytes": 834502
+    },
+    {
+      "name": "openssl-libs-3.5.5-6.el9_8.x86_64.rpm",
+      "url": "https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/o/openssl-libs-3.5.5-6.el9_8.x86_64.rpm",
+      "sha256": "0510665a524c551efaeda3b9b400a7a6c415a18b24140d8725aaec9feac17a55",
+      "bytes": 2415012
+    },
+    {
+      "name": "postgresql17-17.11-1PGDG.rhel9.8.x86_64.rpm",
+      "url": "https://download.postgresql.org/pub/repos/yum/17/redhat/rhel-9.8-x86_64/postgresql17-17.11-1PGDG.rhel9.8.x86_64.rpm",
+      "sha256": "f0976e4d897792e119316833cc2b02c606348ce970db6a046f196c7b34d78d3d",
+      "bytes": 2027690
+    },
+    {
+      "name": "postgresql17-libs-17.11-1PGDG.rhel9.8.x86_64.rpm",
+      "url": "https://download.postgresql.org/pub/repos/yum/17/redhat/rhel-9.8-x86_64/postgresql17-libs-17.11-1PGDG.rhel9.8.x86_64.rpm",
+      "sha256": "779f3f477b67a9f23f73f319ee1f8f521dcb80300db7faa6fc8c27fb566d1523",
+      "bytes": 353512
+    },
+    {
+      "name": "postgresql17-server-17.11-1PGDG.rhel9.8.x86_64.rpm",
+      "url": "https://download.postgresql.org/pub/repos/yum/17/redhat/rhel-9.8-x86_64/postgresql17-server-17.11-1PGDG.rhel9.8.x86_64.rpm",
+      "sha256": "4ef530fdbff21ce6b666c59d1fba8f7a59b0f233345bc073f73c2e6a58469ba9",
+      "bytes": 7393749
+    },
+    {
+      "name": "systemd-252-67.el9.rocky.0.1.x86_64.rpm",
+      "url": "https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/s/systemd-252-67.el9.rocky.0.1.x86_64.rpm",
+      "sha256": "48386f4809508b1985afd88d889a692bb796bb37b694190f7b27486e0d8075c2",
+      "bytes": 4212022
+    },
+    {
+      "name": "systemd-pam-252-67.el9.rocky.0.1.x86_64.rpm",
+      "url": "https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/s/systemd-pam-252-67.el9.rocky.0.1.x86_64.rpm",
+      "sha256": "b26660321bfec14de20c886f3d39eda8145cbebb11b709fadeef274ab5a89bf4",
+      "bytes": 272421
+    },
+    {
+      "name": "systemd-rpm-macros-252-67.el9.rocky.0.1.noarch.rpm",
+      "url": "https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/s/systemd-rpm-macros-252-67.el9.rocky.0.1.noarch.rpm",
+      "sha256": "46a4220ee7f29c3190952ce6155a3e6cefe28ac139cf8df3a35b7bf9e4aa2db5",
+      "bytes": 54986
+    }
+  ],
+  "rocky_signing_key": {
+    "path": "/etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9",
+    "sha256": "3a66e521e7a4abac9768d889c7cd60a8250f59512b275cf576c8a10ff34624c1",
+    "trust_source": "contained in pinned RESF Rocky9.8 base image"
+  },
+  "licenses": {
+    "postgresql": "PostgreSQL License; upstream license retained in installed RPM",
+    "rocky_components": "individual RPM license fields and /usr/share/licenses retained; see runtime rpm-bom.tsv",
+    "nebulalog_initializer": "AGPL-3.0-only; original repository code; no docker-library entrypoint copied"
+  }
+}

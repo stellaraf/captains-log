@@ -1,0 +1,10 @@
+<clickhouse>
+  <!-- Keep small metrics merges compact and limit merge blocks under the dev memory cap. -->
+  <metric_log><settings>index_granularity = 8192, merge_max_block_size = 1024, min_rows_for_wide_part = 131072</settings></metric_log>
+  <max_server_memory_usage>2415919104</max_server_memory_usage>
+  <background_pool_size>4</background_pool_size>
+  <background_move_pool_size>2</background_move_pool_size>
+  <background_schedule_pool_size>16</background_schedule_pool_size>
+  <merge_tree><number_of_free_entries_in_pool_to_execute_mutation>4</number_of_free_entries_in_pool_to_execute_mutation><number_of_free_entries_in_pool_to_lower_max_size_of_merge>4</number_of_free_entries_in_pool_to_lower_max_size_of_merge><number_of_free_entries_in_pool_to_execute_optimize_entire_partition>4</number_of_free_entries_in_pool_to_execute_optimize_entire_partition></merge_tree>
+  <logger><level>warning</level><console>true</console></logger>
+</clickhouse>

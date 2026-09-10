@@ -1,0 +1,12 @@
+<config>
+  <host>127.0.0.1</host><port>9440</port><secure>true</secure>
+  <user>nebulalog</user><password>@PASSWORD@</password>
+  <openSSL><client>
+    <caConfig>/etc/nebulalog/tls/ca.crt</caConfig><loadDefaultCAFile>false</loadDefaultCAFile>
+    <verificationMode>strict</verificationMode><extendedVerification>true</extendedVerification>
+    <disableProtocols>sslv2,sslv3,tlsv1,tlsv1_1</disableProtocols>
+    <cipherList>ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384</cipherList>
+    <cipherSuites>TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384</cipherSuites>
+    <invalidCertificateHandler><name>RejectCertificateHandler</name></invalidCertificateHandler>
+  </client></openSSL>
+</config>

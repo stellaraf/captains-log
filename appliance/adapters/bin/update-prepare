@@ -1,0 +1,3 @@
+#!/bin/sh
+# Fixed boot ABI pins pending operations to their retained coordinator.
+exec /usr/bin/python3 -I -B /usr/libexec/nebulalog/host-boot update-prepare "$@"

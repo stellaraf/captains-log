@@ -1,0 +1,40 @@
+[Unit]
+Description=Captain’s Log authenticated Web/API
+After=nebulalog-firstboot.service nebulalog-postgresql.service nebulalog-clickhouse.service nebulalog-keycloak.service
+Requires=nebulalog-firstboot.service nebulalog-postgresql.service nebulalog-clickhouse.service nebulalog-keycloak.service
+RequiresMountsFor=/var/lib/nebulalog
+
+[Container]
+Image=@NEBULALOG_IMAGE@
+ContainerName=nebulalog-api
+Network=nebulalog.network
+NetworkAlias=api
+User=10001:10001
+ReadOnly=true
+NoNewPrivileges=true
+Environment=REQUIRE_FIPS=true
+Environment=COLLECTOR_STATUS_PATH=/var/lib/nebulalog/runtime/collector.json
+Environment=COLLECTOR_TLS_CA_PATH=/etc/nebulalog/tls/ca.crt
+Environment=COLLECTOR_TLS_CERT_PATH=/etc/nebulalog/tls/server.crt
+Environment=NEBULALOG_APPLIANCE_STATUS_PATH=/run/nebulalog-status/status.json
+DropCapability=all
+EnvironmentFile=/etc/nebulalog/api.env
+Environment=API_LISTEN=:8080
+Environment=WEB_DIR=/app/web
+Environment=EXPORT_DIR=/var/lib/nebulalog/exports
+Volume=/var/lib/nebulalog/exports:/var/lib/nebulalog/exports:Z
+Volume=/var/lib/nebulalog/runtime:/var/lib/nebulalog/runtime:ro,z
+Volume=/run/nebulalog-status:/run/nebulalog-status:ro,z
+Volume=/var/lib/nebulalog/configuration/tls/ca.crt:/etc/nebulalog/tls/ca.crt:ro,z
+Volume=/var/lib/nebulalog/configuration/tls/server.crt:/etc/nebulalog/tls/server.crt:ro,z
+Volume=/var/lib/nebulalog/configuration/tls/trust-bundle.pem:/etc/nebulalog/tls/trust-bundle.pem:ro,z
+Tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m
+PublishPort=127.0.0.1:8080:8080
+Exec=serve
+
+[Service]
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=900
+[Install]
+WantedBy=multi-user.target
