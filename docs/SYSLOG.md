@@ -2,6 +2,8 @@
 
 Captain’s Log accepts configurable UDP, TCP, and TLS listeners. Appliance defaults are UDP 514, TCP 514, and TLS 6514. Deployment port mappings may differ. Standard PAN-OS CSV is accepted without a custom format.
 
+Follow the [complete firewall setup guide](FIREWALL_SETUP.md) to enable event generation and forward every available category with **All Logs**, including informational events. A running listener and an attached forwarding profile cannot create logs that PAN-OS suppressed. In particular, enable both **Report Benign Files** and **Report Grayware Files** for complete eligible WildFire file reporting; the [WildFire setup step](FIREWALL_SETUP.md#5-include-benign-and-grayware-wildfire-files) explains defaults, email-link exclusions, and why earlier unlogged submissions are not backfilled.
+
 ## Download appliance trust for Palo Alto
 
 An Administrator can open **Administration → Diagnostics → Encrypted log forwarding** to inspect the configured certificates and choose **Download Syslog CA Certificate**. First boot generates a unique RSA-3072 CA and server certificate on the appliance after the host security gates pass. The CA signing key stays on encrypted appliance storage with root-only permissions. The API receives read-only mounts of public certificates and the public trust bundle; it does not receive the CA or server private key.
@@ -52,7 +54,7 @@ A registry revision identifies a documented field mapping, not the firewall's so
 | HIP-MATCH | HIP Match | Dedicated mapping |
 | IPTAG | IP-Tag | Dedicated mapping |
 | DECRYPTION | Decryption | Dedicated mapping |
-| Unverified native families, including dedicated new DNS Security and Tunnel | Parsing diagnostics | Raw retained until the exact wire schema is verified |
+| Unverified native families, including dedicated new DNS Security, Tunnel, GTP, SCTP, and Correlation | Parsing diagnostics | Raw retained until the exact wire schema is verified |
 
 Unified searches across categories. No `UNIFIED` or `ALARMS` wire format is invented. Alarms availability must be described as a derived/application capability rather than parser support.
 
@@ -71,5 +73,7 @@ When API and ingestion run as separate Quadlet services, ingestion atomically pu
 Stats expose received, parsed, failed, inserted, queue depth, spool bytes, dropped, last received, listener state, and last error. Current events/sec and bytes/sec use **50 completed 100 ms buckets divided by five**, including idle intervals. This represents a full five-second window ending at the most recent 100 ms boundary, with at most 100 ms display latency. Excluding the partial bucket avoids a periodic rate underestimate. Lifetime averages are exposed separately as `average_events_per_second` and `average_bytes_per_second`; `rate_window_seconds` reports five. Counts restart with the collector process; pending WAL work survives. Parsed/inserted counters can include replayed work accepted by an earlier process and therefore need not be less than this process's received count. Stats are concurrent snapshots, not a transactionally consistent accounting ledger.
 
 A listener may receive non-PAN-OS devices on a shared port. Such messages remain in Parsing diagnostics with their sender and original payload. Investigate error counts by sender and serial before attributing them to a firewall parser defect. Restrict incoming senders at the host/network firewall for a dedicated production deployment.
+
+For an empty log category, first confirm a matching event exists in the firewall's native log database. Then follow the [per-category delivery checks](FIREWALL_SETUP.md#7-commit-and-verify-each-category) through forwarding, receipt, parsing, database insertion, and UI filters. File upload counts, WildFire analysis verdict counts, established TLS connections, and collector health each describe different stages; none alone proves a specific log reached storage.
 
 Tests cover real UDP/TCP/TLS sockets, certificates, fragmented/coalesced messages, outage/restart replay identity, raw failures, WAL corruption, capacity backpressure, and parser field correctness. The PA-1410's native 130-field Traffic and 140-field Threat layouts have sanitized regression fixtures; see [hardware evidence](validation/PALO_REAL.md).

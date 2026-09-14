@@ -42,6 +42,16 @@ At **2026-09-08 08:30:37 UTC**, a bounded read-only database audit found **168,0
 
 At **2026-09-08 10:44:47 UTC**, a fresh normal password/OTP development check passed all 19 category API requests, the Threat/DNS shared-event comparison, wide Traffic pagination/detail and the existing refresh/application browser suites. A real one-day/seven-day Traffic memory failure was corrected by the [bounded event-read profile](TRAFFIC_QUERY_MEMORY.md). Configuration remained empty in the tested period with correct guidance; this check neither changed the firewall nor established support for unobserved native families. Fresh native Traffic, DNS/THREAT and System ingestion was independently observed after deployment.
 
+## Complete WildFire verdict logging follow-up
+
+On **2026-09-14**, the PA-1410's WildFire runtime counters showed **12 files forwarded** and **12 benign verdicts received**, while its native WildFire log query completed with **zero entries**. Benign and grayware reporting were not explicitly enabled; both default to disabled. Captain’s Log likewise contained zero WildFire submission rows, with no PAN-OS parser failures. Authenticated browser/API checks returned HTTP 200 and zero rows for both the last hour and the last 30 days. This identified a source logging gap, not an application filter failure.
+
+The existing forwarding profile already selected **All Logs** for WildFire and sent them through the verified **TLS/6514** destination. With user authorization, only `report-benign-file` and `report-grayware-file` were set to `yes`. The live PAN-OS schema exposed both fields. The candidate diff contained exactly those two leaf additions; commit **50955** completed **FIN / OK**, the running configuration matched the expected change, and no candidate differences or configuration locks remained. File-submission rules, security actions, destinations, and transport were preserved.
+
+Four source package test suites passed. A separate isolated full-parser check passed five controlled cases: benign, grayware, malware, and phishing `THREAT/wildfire` events remained WildFire Submissions; `THREAT/wildfire-virus` remained Threat. These were synthetic variations of a sanitized native Threat fixture, **not real WildFire captures**, and none were injected into the collector or event database.
+
+The reporting settings apply to future qualifying events; they do not backfill earlier unlogged submissions. A subsequent native WildFire event still needs to be matched to its stored record to establish live submission delivery. Follow the [complete forwarding setup](../FIREWALL_SETUP.md), including the [required WildFire reporting settings](../FIREWALL_SETUP.md#5-include-benign-and-grayware-wildfire-files), instead of treating upload or verdict counters as log-delivery evidence.
+
 ## Field correctness beyond the parse flag
 
 1. **Twenty-five** actual stored Traffic rows were compared to their preserved native CSV values across **fourteen normalized fields**. The native layout contained **130 CSV fields**. No mismatches were found.

@@ -925,8 +925,10 @@ function Setup() {
         <div>
           <h2>Forward PAN-OS logs to Captain’s Log</h2>
           <p>
-            Standard syslog output is supported. A custom message format is not
-            required.
+            Enable event generation and forward every available log category.
+            All Logs sends the records the firewall creates; it cannot recover
+            events suppressed by a profile or a disabled reporting setting.
+            Use the standard syslog format without customization.
           </p>
         </div>
       </div>
@@ -935,27 +937,42 @@ function Setup() {
           [
             "Create a syslog server profile",
             "Device → Server Profiles → Syslog",
-            "Create a syslog server profile and add this appliance’s reachable IP address or DNS name. Choose UDP, TCP or TLS and match the configured collector port. Typical ports: UDP/TCP 514 and TLS 6514.",
+            "Add this appliance’s reachable IP address or DNS name. Prefer SSL (the PAN-OS name for TLS) on port 6514. Download the Syslog CA Certificate in Diagnostics, verify its fingerprint against the trusted console, and import it as a Trusted Root CA without a private key. Use a name or IP covered by the server certificate. Match the collector port; development UDP/TCP is normally 5514 and appliance UDP/TCP is 514.",
           ],
           [
-            "Create a log forwarding profile",
+            "Forward all available categories",
             "Objects → Log Forwarding",
-            "Create a log forwarding profile. Add match lists for the log categories you want to retain and select the syslog server profile.",
+            "Add a match list for every Log Type available on this firewall: Traffic, Threat, URL Filtering, WildFire, Data Filtering, Authentication, Decryption, Tunnel Inspection, DNS Security, GTP and SCTP where supported. Select All Logs and the syslog server profile for every entry, with no severity, action or verdict exclusions. Preserve existing destinations. Unverified wire formats remain in Parsing diagnostics.",
           ],
           [
-            "Attach forwarding to security rules",
+            "Cover every applicable rule and zone",
             "Policies → Security → Actions",
-            "For each applicable rule, select the configured log forwarding profile and enable Log at Session End. Creating the server profile alone does not forward Traffic logs.",
+            "Enable Log at Session End and select the forwarding profile on all applicable allow, deny, drop, exception and bypass rules, including Panorama pre/post rules. Override intrazone-default and interzone-default logging where required, preserving their traffic actions. Check Authentication, DoS Protection and Network → Zones forwarding too. Add session-start logging where immediate visibility into long-lived sessions is needed; it adds an early record.",
+          ],
+          [
+            "Enable the inspection profiles that generate logs",
+            "Policies → Security → Actions → Profile Settings",
+            "Verify the appropriate Antivirus, Anti-Spyware/DNS Security, Vulnerability Protection, URL Filtering, File Blocking, Data Filtering and WildFire Analysis profiles or group on each allowed traffic path. Check profile matches, licenses and inspection exceptions. For permitted URL categories, alert generates a URL log while allow does not. Use logging actions for permitted detections and file transfers while preserving existing blocking protections.",
+          ],
+          [
+            "Include benign and grayware WildFire files",
+            "Device → Setup → WildFire → General Settings",
+            "Enable both Report Benign Files and Report Grayware Files; both are disabled by default. Keep the WildFire forwarding match at All Logs, including informational and low severity. The WildFire Analysis profile must submit qualifying files and receive analysis results. PAN-OS does not log benign or grayware email links. These settings apply to new qualifying events after commit and do not backfill earlier unlogged submissions.",
+          ],
+          [
+            "Include successful decryption handshakes",
+            "Policies → Decryption → Options",
+            "On each applicable rule, enable both successful and unsuccessful SSL/TLS handshake logging and select the forwarding profile. Successful handshake logging is disabled by default. Preserve existing decrypt/no-decrypt decisions and account for the added log volume. Some protocols and handshake outcomes do not generate Decryption records.",
           ],
           [
             "Configure management-plane forwarding",
             "Device → Log Settings",
-            "Configure the supported System, Configuration, User-ID, HIP Match, GlobalProtect and other management log settings relevant to your PAN-OS release.",
+            "For each available category, including System, Configuration, User-ID, HIP Match, GlobalProtect, IP-Tag and Correlation where available, add an All Logs match to the syslog profile. Include informational events and preserve existing destinations. These settings are separate from security-rule forwarding; a warning-or-higher filter leaves normal activity out.",
           ],
           [
-            "Commit and verify",
-            "Commit → Administration / Firewalls → Logs / Traffic",
-            "Commit the firewall changes. Generate matching traffic, verify the receiver counters increase and confirm the firewall appears in inventory. Open Traffic to inspect the received event.",
+            "Commit and verify each category",
+            "Commit → Monitor → Logs → Captain’s Log",
+            "Review the pending diff, complete the commit and any Panorama push, then verify the running settings. Find a fresh event in the firewall’s own Monitor logs first, then match its serial, time, session/sequence and relevant fields in Captain’s Log. For WildFire, compare the file hash and verdict where available. Submission counters and a healthy TLS listener alone are not delivery proof. If a native event exists but the view is empty, check forwarding, Parsing diagnostics, insertion errors, time range and filters.",
           ],
         ].map(([title, path, body], i) => (
           <article key={title}>
@@ -968,6 +985,15 @@ function Setup() {
           </article>
         ))}
       </div>
+      <p>
+        <a
+          href="https://github.com/stellaraf/captains-log/blob/main/docs/FIREWALL_SETUP.md"
+          target="_blank"
+          rel="noreferrer"
+        >
+          Complete firewall setup guide and Palo Alto references
+        </a>
+      </p>
       <section className="panel" aria-labelledby="empty-log-guide">
         <div className="section-toolbar">
           <div>

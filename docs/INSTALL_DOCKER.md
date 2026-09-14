@@ -25,6 +25,12 @@ Ports: Web/API18080, identity18089, Syslog TCP/UDP5514 and TLS6514. Database por
 25432/28123 are loopback-only for integration development; remove those mappings
 for a community server. Never expose Keycloak development mode to the Internet.
 
+After the listener is healthy, complete the [firewall logging setup](FIREWALL_SETUP.md):
+configure all available forwarding categories and the profiles/settings that
+generate them, including benign and grayware WildFire file reporting. Use the
+published host port, and verify a fresh firewall-native event against the stored
+Captain’s Log record for each active category.
+
 PostgreSQL and ClickHouse use dedicated named volumes. Spool, private CSV exports
 and the local TLS key use `.local/app-data` / `.local/certs`. The app drops all
 capabilities, has a read-only root, uses a non-root development UID, and has no

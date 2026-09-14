@@ -47,7 +47,9 @@ certificate is for testing and must be replaced/trusted before firewall TLS use.
 
 The Compose deployment is not the Rocky/FIPS/LUKS production appliance.
 See [Docker deployment](docs/INSTALL_DOCKER.md) and
-[firewall forwarding setup](docs/FIREWALL_SETUP.md).
+[complete firewall logging setup](docs/FIREWALL_SETUP.md). The setup guide covers
+all available log types, rule/profile coverage, informational events, and the
+WildFire benign/grayware reporting settings needed to generate submission logs.
 
 ## Architecture
 
