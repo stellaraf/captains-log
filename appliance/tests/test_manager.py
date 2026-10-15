@@ -407,3 +407,28 @@ class TransactionTests(unittest.TestCase):
         with self.assertRaisesRegex(Refused,"OS maintenance"):
             self.install(manager)
         self.assertEqual(calls,[])
+
+    def test_kernel_recovery_blocks_every_component_mutation_after_healthy_fallback(self):
+        manager, calls = self.setup_manager()
+        for field in ("kernel_finalization", "kernel_retention", "kernel_rollback"):
+            for phase in ("pending", "failed", "recovery_required", "unknown"):
+                operation = {"state": "complete", "finalization": "complete", field: phase}
+                path = manager.state.parent / "os-transaction.json"
+                atomic_json(path, operation)
+                before = path.read_bytes()
+                for action, state, finalization in (("install", "committed", "complete"),
+                        ("rollback", "committed", "complete"), ("recover", "activating", "pending"),
+                        ("finalize", "committed", "failed")):
+                    with self.subTest(field=field, phase=phase, action=action):
+                        atomic_json(manager.state / "transaction.json", {"state": state, "finalization": finalization})
+                        with patch("nebulalog_manager.updates.require_linux_root"), \
+                                patch("nebulalog_manager.updates.trusted_file", side_effect=lambda p: p), \
+                                self.assertRaisesRegex(Refused, "OS"):
+                            if action == "install":
+                                self.install(manager)
+                            else:
+                                getattr(manager, action)(self.public)
+                        self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(calls, [])
+                self.assertIsNone(manager.status()["recovery_action"])
+                self.assertEqual(manager.status()["recovery_blocked_by"], "os_update")

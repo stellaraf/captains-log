@@ -179,7 +179,10 @@ def _bound_plan(manager, stage, path, *, preparing):
     if path == stage / 'ordinary-boot-plan.json':
         from . import ordinary_boot
         return ordinary_boot.bound_integrity_plan(manager, stage, path, preparing=preparing)
-    from . import kernel_boot, kernel_retention, kernel_retention_generation
+    from . import kernel_boot, kernel_retention, kernel_retention_generation, kernel_rollback
+    if path.parent == stage and (path.name == kernel_rollback.INTEGRITY or kernel_rollback.RESUME_NAME.fullmatch(path.name)
+                                or kernel_rollback.EXECUTION_NAME.fullmatch(path.name)):
+        return kernel_rollback.bound_integrity_plan(manager, stage, path, preparing=preparing)
     if path.parent == stage and kernel_boot.NAME.fullmatch(path.name):
         return kernel_boot.bound_integrity_plan(manager, stage, path, preparing=preparing)
     if path == stage / kernel_retention.INTEGRITY:
@@ -260,6 +263,9 @@ def _bound_plan(manager, stage, path, *, preparing):
 
 
 def _snapshot(manager, plan, phase, retained=None):
+    if plan.get('kind') == 'rocky-kernel-rollback-v1':
+        from . import kernel_rollback
+        return kernel_rollback.integrity_snapshot(manager, plan, phase, retained)
     if plan.get('kind') == 'ordinary-boot-v1':
         from . import ordinary_boot
         return ordinary_boot.integrity_snapshot(manager, plan, phase, retained)
@@ -309,6 +315,9 @@ def _parse_update(result, database_in, database_out):
 
 
 def _allowed_report(report, plan, phase):
+    if plan.get('kind') == 'rocky-kernel-rollback-v1':
+        from . import kernel_rollback
+        return kernel_rollback.allowed_integrity_report(report, plan, phase)
     if plan.get('kind') == 'ordinary-boot-v1':
         from . import ordinary_boot
         return ordinary_boot.allowed_integrity_report(report, plan, phase)
@@ -650,11 +659,12 @@ def _resume_kernel_pending(manager, state, identity, base, stage, plan_path, pla
     following ordinary preparation and acceptance must measure the new boot's
     exact qualified GRUB change and reject all unrelated filesystem drift.
     """
-    if plan.get('kind') != 'kernel-boot-v1' or plan.get('phase') not in {'postboot', 'resume'}:
+    if plan.get('kind') != 'kernel-boot-v1' or plan.get('phase') not in {'postboot', 'resume', 'recovery_resume'}:
         _refuse('kernel_resume_plan_required')
     from . import kernel_boot
     prior, prior_sha = kernel_boot.integrity_predecessor(stage, plan_path)
-    allowed = {'postboot': {'arm'}, 'resume': {'commit', 'resume'}}
+    allowed = {'postboot': {'arm', 'retry_arm'}, 'resume': {'commit', 'resume'},
+               'recovery_resume': {'arm', 'retry_arm', 'postboot', 'recovery_resume', 'abort'}}
     if prior.get('kind') != 'kernel-boot-v1' or prior.get('phase') not in allowed[plan['phase']]:
         _refuse('kernel_resume_commit_required')
     _, prepared = _prepared(manager, state, identity, stage, prior, prior_sha)
@@ -740,6 +750,54 @@ def _resume_retention_pending(manager, state, identity, base, stage, plan_path, 
     manager._sync(root / 'pending.json', root, state)
 
 
+def _resume_rollback_pending(manager, state, identity, base, stage, plan_path, plan, plan_sha):
+    """Supersede only a rejected candidate erase's exact interrupted ancestry."""
+    from . import kernel_rollback
+    origin = kernel_rollback.resume_origin(stage, plan_path)
+    _, original = _prepared(manager, state, identity, stage, origin['integrity'], origin['integrity_sha256'])
+    if (original is None or original['original_enrollment_sha256'] != digest(base)
+            or digest(original) != origin['prepared_sha256']):
+        _refuse('rollback_resume_original_preparation_changed')
+    pending = _pending(manager, state, identity)
+    if pending is None or pending['state'] == 'complete':
+        return
+    prior, prior_sha, prior_path, seen = plan, plan_sha, Path(plan_path), set()
+    while True:
+        if prior_sha in seen or len(seen) >= MAX_CHAIN:
+            _refuse('rollback_resume_ancestry_limit')
+        seen.add(prior_sha)
+        _, prepared = _prepared(manager, state, identity, stage, prior, prior_sha)
+        if prepared is not None:
+            if prepared['original_enrollment_sha256'] != digest(base):
+                _refuse('rollback_resume_preparation_changed')
+            if pending.get('prepared') == _pointer(prepared):
+                break
+        if 'rollback_plan_sha256' not in prior:
+            _refuse('rollback_resume_different_acceptance_pending')
+        prior, prior_sha = kernel_rollback.resume_integrity_predecessor(stage, prior_path)
+        if 'rollback_plan_sha256' in prior:
+            prior_path = Path(stage) / ('kernel-rollback-resume-' + prior['id'] + '-integrity.json')
+        elif prior != origin['integrity'] or prior_sha != origin['integrity_sha256']:
+            _refuse('rollback_resume_original_plan_changed')
+    if (pending.get('direction') != 'forward'
+            or pending.get('previous_database_sha256') != prepared['database_sha256']):
+        _refuse('rollback_resume_different_acceptance_pending')
+    metadata = _snapshot(manager, plan, 'prepare')
+    root = state / 'authorized'
+    archive = {'schema': 1, 'resume_plan_sha256': plan_sha, 'prior_plan_sha256': prior_sha,
+               'original_preparation_sha256': origin['prepared_sha256'], 'pending': pending}
+    _immutable(manager, root / 'artifacts' / (pending['id'] + '.' + plan_sha + '.rollback-resume.json'), archive, identity)
+    if pending['state'] == 'ready':
+        _retain_interrupted_forward(manager, state, identity, base, pending)
+    head, checksum, _ = _chain(manager, state, identity, base)
+    if (manager._database(state / 'aide.db.gz', identity)[1] != checksum
+            or pending['state'] == 'scanning' and (head != pending['previous'] or checksum != pending['previous_database_sha256'])
+            or _snapshot(manager, plan, 'prepare', metadata) != metadata):
+        _refuse('rollback_resume_historical_database_changed')
+    manager.records.write(root / 'pending.json', {'schema': 1, 'state': 'complete', 'entry': head, 'database_sha256': checksum}, identity)
+    manager._sync(root / 'pending.json', root, state)
+
+
 def _resume_ordinary_pending(manager, state, identity, base, stage, plan_path, plan, plan_sha):
     """Resolve only this generation or an exact ordinary ancestor's old CAS."""
     from . import ordinary_boot
@@ -791,12 +849,15 @@ def prepare(manager, stage, plan_path):
     with _locked(manager) as (state, identity):
         plan, plan_sha = _bound_plan(manager, stage, plan_path, preparing=True)
         base = manager._initial_enrollment(state, identity)
-        if plan.get('kind') == 'kernel-boot-v1' and plan.get('phase') in {'postboot', 'resume'}:
+        if plan.get('kind') == 'kernel-boot-v1' and plan.get('phase') in {'postboot', 'resume', 'recovery_resume'}:
             manager._monitor(identity, state, base)
             _resume_kernel_pending(manager, state, identity, base, stage, plan_path, plan, plan_sha)
         if plan.get('kind') == 'rocky-kernel-retention-resume-v1':
             manager._monitor(identity, state, base)
             _resume_retention_pending(manager, state, identity, base, stage, plan_path, plan, plan_sha)
+        if plan.get('kind') == 'rocky-kernel-rollback-v1' and 'rollback_plan_sha256' in plan:
+            manager._monitor(identity, state, base)
+            _resume_rollback_pending(manager, state, identity, base, stage, plan_path, plan, plan_sha)
         if plan.get('kind') == 'ordinary-boot-v1':
             manager._monitor(identity, state, base)
             _resume_ordinary_pending(manager, state, identity, base, stage, plan_path, plan, plan_sha)

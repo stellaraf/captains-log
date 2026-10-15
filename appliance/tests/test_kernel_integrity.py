@@ -253,6 +253,77 @@ class KernelIntegrationTests(unittest.TestCase):
                 kernel.mark_complete(self.stage, bad)
             self.assertEqual(json.loads((self.root / 'manager/kernel-pending.json').read_text()), pending)
 
+    def rollback_fixture(self):
+        payload, installed, pending = self.pending_fixture()
+        self.journal['state'] = 'recovery_required'
+        self.state()
+        self.write(self.root / 'manager/maintenance.json', {'active': True, 'release': str(self.stage)})
+        completion = {'schema': 1, 'status': 'rolled_back', 'plan_sha256': 'b' * 64,
+                      'result_sha256': 'c' * 64, 'integrity_sha256': 'd' * 64, 'database_sha256': 'e' * 64,
+                      'boot_id': BOOT, 'kernel': NEW, 'recovery_kernel': OLD, 'candidate_plan_sha256': PLAN_SHA,
+                      'installed_sha256': rpm.sha(kernel.encode(installed)), 'release_accepted': False}
+        self.write(self.stage / 'kernel-rollback-complete.json', completion)
+        health = {'ok': True, 'stage': str(self.stage), 'boot_id': self.boot, 'kernel': OLD,
+                  'checks': {name: True for name in REQUIRED_CHECKS}}
+        for context in (patch.object(kernel, 'require_linux_root'),
+                        patch('nebulalog_manager.kernel_rollback.verified_completion', return_value=completion),
+                        patch.object(kernel.security, 'status', return_value={'host_controls_ok': True})):
+            context.start()
+            self.addCleanup(context.stop)
+        runner = Mock(side_effect=lambda argv, **kw: OLD if argv == ['/usr/bin/uname', '-r'] else '/boot/vmlinuz-' + OLD)
+        return payload, installed, pending, completion, health, runner
+
+    def test_verified_rollback_cleanup_retries_after_unlink_without_adopting_foreign_candidate(self):
+        payload, installed, pending, completion, health, runner = self.rollback_fixture()
+        result = kernel.mark_rolled_back(self.stage, completion, health, runner=runner)
+        self.assertEqual((result['status'], result['release_accepted']), ('rolled_back', False))
+        self.assertFalse((self.root / 'manager/kernel-pending.json').exists())
+        self.assertEqual(kernel.load_candidate(self.stage), (self.stage, payload, PLAN_SHA, installed))
+        self.assertEqual(kernel.mark_rolled_back(self.stage, completion, health, runner=runner), result)
+        with self.assertRaisesRegex(Refused, 'quarantined'):
+            kernel.reject_quarantined(self.stage, NEW)
+        foreign = {**pending, 'stage': str(self.stage.parent / 'foreign')}
+        self.write(self.root / 'manager/kernel-pending.json', foreign)
+        self.assertEqual(kernel.load_candidate(self.stage), (self.stage, payload, PLAN_SHA, installed))
+        with self.assertRaisesRegex(Refused, 'another_kernel_candidate'):
+            kernel.mark_rolled_back(self.stage, completion, health, runner=runner)
+        self.assertEqual(json.loads((self.root / 'manager/kernel-pending.json').read_text()), foreign)
+
+    def test_rollback_requires_exact_completion_current_old_health_and_keeps_pending(self):
+        _, _, pending, completion, health, runner = self.rollback_fixture()
+        for value in ({**health, 'checks': {}}, {**health, 'kernel': NEW}, {**health, 'boot_id': NEW_BOOT}):
+            with self.subTest(value=value), self.assertRaises(Refused):
+                kernel.mark_rolled_back(self.stage, completion, value, runner=runner)
+            self.assertEqual(json.loads((self.root / 'manager/kernel-pending.json').read_text()), pending)
+        with self.assertRaisesRegex(Refused, 'verified_rollback_completion'):
+            kernel.mark_rolled_back(self.stage, {**completion, 'database_sha256': 'f' * 64}, health, runner=runner)
+
+    def test_rollback_disposition_precedes_pending_unlink_and_resumes_quarantine_failure(self):
+        _, _, pending, completion, health, runner = self.rollback_fixture()
+        record = kernel.record
+        def crash(stage, name, value):
+            if name.startswith('kernel-rejected-'):
+                raise OSError('quarantine publication interrupted')
+            return record(stage, name, value)
+        with patch.object(kernel, 'record', side_effect=crash), self.assertRaises(OSError):
+            kernel.mark_rolled_back(self.stage, completion, health, runner=runner)
+        self.assertTrue((self.stage / 'kernel-rollback-pending.json').exists())
+        self.assertEqual(json.loads((self.root / 'manager/kernel-pending.json').read_text()), pending)
+        self.assertEqual(kernel.mark_rolled_back(self.stage, completion, health, runner=runner)['status'], 'rolled_back')
+
+    def test_actual_fallback_or_rollback_ownership_prevents_new_automatic_adoption(self):
+        _, _, pending = self.pending_fixture()
+        next_stage = self.stage.parent / 'next-window'
+        next_stage.mkdir()
+        self.write(next_stage / 'operation.json', {**self.operation, 'stage': str(next_stage)})
+        for name in ('kernel-fallback.json', 'kernel-retry-reservation.json', 'kernel-rollback-owner.json'):
+            path = self.stage / name
+            self.write(path, {})
+            with self.subTest(name=name), self.assertRaisesRegex(Refused, 'explicit_recovery'):
+                kernel.adopt_pending(next_stage)
+            path.unlink()
+        self.assertFalse((next_stage / 'kernel-deferred.json').exists())
+
 
 class KernelResumeTests(unittest.TestCase):
     def test_old_kernel_reboot_can_use_fresh_backup_without_replaying_rpm(self):

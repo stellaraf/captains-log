@@ -10,7 +10,8 @@ STAGED = {"update-preflight": "preflight", "update-backup": "backup", "update-pr
           "update-activate": "activate", "update-health": "health", "update-rollback": "rollback",
           "update-finalize": "finalize"}
 HOST = {"update-os-preflight": "os_preflight", "update-os-postcheck": "os_postcheck", "update-os-recover": "os_recover", "update-reboot-prepare": "reboot_prepare", "update-reboot-abort": "reboot_abort",
-        "update-boot-gate": "boot_gate", "update-reboot-complete": "reboot_complete"}
+        "update-boot-gate": "boot_gate", "update-reboot-complete": "reboot_complete",
+        "update-kernel-retry": "kernel_retry", "update-kernel-rollback": "kernel_rollback"}
 
 
 def main():

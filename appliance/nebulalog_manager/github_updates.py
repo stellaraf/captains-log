@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 
 from .common import Refused, atomic_json, audit, locked, require_linux_root, run, trusted_file
 from .update_enrollment import enrolled_key, _read, _tree
-from .updates import UpdateManager, _unique, verify_release
+from .updates import UpdateManager, _unique, verify_release, os_maintenance_pending
 
 CONFIG = Path("/etc/nebulalog/github-updates.json")
 PUBLIC_KEY = Path("/etc/nebulalog/release-public.pem")
@@ -186,8 +186,7 @@ class GitHubUpdater:
                 os_transaction = manager_status.get("os_transaction") or {}
                 if (manager_status.get("maintenance_release_pending") or
                         transaction.get("state", "committed") not in {"committed", "rolled_back", "preflight_failed"} or
-                        os_transaction and (os_transaction.get("state") not in {"complete", "failed", "reboot_aborted"} or
-                                            os_transaction.get("finalization", "complete") != "complete")):
+                        os_maintenance_pending(os_transaction)):
                     return self.record(policy, "blocked", reason="recovery_pending")
                 current = manager_status["current"]
                 downloads = self.state / "downloads"

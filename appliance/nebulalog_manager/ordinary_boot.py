@@ -232,6 +232,7 @@ def _settled(identity, stage=None):
                 or value.get('finalization', 'complete') != 'complete'
                 or value.get('kernel_finalization') not in {None, 'complete'}
                 or value.get('kernel_retention') not in {None, 'complete'}
+                or value.get('kernel_rollback') not in {None, 'complete'}
                 or value.get('reboot_pending') is True):
             refuse('pending_os_owner')
         _settled_os_pair(identity, value)
@@ -448,6 +449,28 @@ def _qualified_boot(stage, plan):
                         installed, installed_sha, {'boot_id': operation['boot_id']})
 
 
+def _rollback_history_environment(state, stage, plan, original):
+    """A compound removal may span only its verified recovery observations."""
+    from . import kernel_rollback as rollback
+    prior = plan.get('previous')
+    seen = set()
+    boundaries = [(original['recovery']['boot_id'], original['preserved'][native.ENV])]
+    while prior is not None:
+        if prior['sha256'] in seen or len(seen) >= MAX_GENERATIONS:
+            refuse('accepted_rollback_observation_limit')
+        seen.add(prior['sha256'])
+        value, _ = rollback.load_resume(stage, prior, historical=True)
+        boundaries.append((value['boot_id'], value['files'][0]['after']))
+        prior = value['previous']
+    if (state['kernel'] != original['recovery_kernel'] or state['default_kernel'] != original['recovery_kernel']
+            or not any(state['boot_id'] == boot and state['grub']['description'] == description
+                       for boot, description in boundaries)):
+        refuse('accepted_rollback_observation_gap')
+    _env(state, state['grub']['description'], plan['files'][0]['after'],
+         state['grub']['raw'], plan['after_raw'])
+    state['boot_id'] = plan['boot_id']
+
+
 def _os_stage(stage, identity):
     if stage.parent != identity.root / 'manager/os-updates' or not TOKEN.fullmatch(stage.name) or stage.resolve() != stage:
         refuse('accepted_os_stage_changed')
@@ -576,6 +599,34 @@ def _fold(initial, history, identity):
                 _boot_history_environment(state, stage, boot)
                 state['boot_id'], state['kernel'] = boot['boot_id'], boot['running_kernel']
                 state['default_kernel'] = boot['running_kernel']
+            checkpoint = True
+        elif kind == 'rocky-kernel-rollback-v1':
+            from . import kernel_rollback as rollback
+            _os_stage(stage, identity)
+            compound = 'rollback_plan_sha256' in plan
+            wanted = plan['rollback_plan_sha256'] if compound else plan['manifest_sha256']
+            original, checksum = rollback.load_plan_by_checksum(stage, wanted)
+            if compound:
+                reference = {'filename': 'kernel-rollback-resume-' + plan['id'] + '-integrity.json',
+                             'sha256': entry['plan_sha256']}
+                retained, _ = rollback.load_resume(stage, reference, historical=True)
+                if retained != plan:
+                    refuse('accepted_rollback_resume_changed')
+            elif plan != rollback.integrity_plan(original, checksum):
+                refuse('accepted_rollback_plan_changed')
+            repeated = checksum in erased
+            _inventory(state, original['before_inventory'], original['after_inventory'], repeated=repeated)
+            for path, value in original['removed'].items():
+                if not native.protected_path(path):
+                    continue
+                if not repeated and not _known_description(state['artifacts'].get(path), value):
+                    refuse('accepted_rollback_preimage_changed')
+                if repeated and path in state['artifacts']:
+                    refuse('accepted_rollback_artifact_reappeared')
+                state['artifacts'].pop(path, None); unresolved.discard(path)
+            erased.add(checksum)
+            if compound:
+                _rollback_history_environment(state, stage, plan, original)
             checkpoint = True
         elif kind is None:
             # Fixed runtime generations cannot write any boot artifact or RPM

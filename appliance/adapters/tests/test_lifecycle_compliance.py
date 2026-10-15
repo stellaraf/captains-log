@@ -303,6 +303,10 @@ class LifecycleComplianceTests(unittest.TestCase):
 
     def test_new_boot_retains_maintenance_until_exact_review_then_retries(self):
         self.health_fixture()
+        # This fixture exercises retained compliance review. Backup age and
+        # renewal have separate lifecycle tests with real backup receipts.
+        self.manager._os_recovery_backup = Mock(side_effect=lambda stage, latest, transaction:
+                                                (latest, transaction, stage))
         stage = self.root / "manager/os-updates/one"
         stage.mkdir(parents=True, mode=0o700)
         atomic_json(self.root / "manager/os-latest.json", {"state": "reboot_prepared", "stage": str(stage),

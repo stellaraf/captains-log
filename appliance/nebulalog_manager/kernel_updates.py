@@ -514,6 +514,7 @@ def plan_cached(stage, packages, *, runner=run):
         refuse('incomplete_kernel_package_set')
     proposed.sort(key=lambda p: p['name'])
     kernel = proposed[0]['kernel']
+    reject_quarantined(stage, kernel)
     old = runner(['/usr/bin/uname', '-r'])
     if not KERNEL.fullmatch(old) or kernel == old or any(p['nevra'] in before for p in proposed):
         refuse('candidate_is_not_a_new_kernel')
@@ -1003,7 +1004,19 @@ def load_candidate(stage):
     stage = Path(stage)
     pending_path = stage.parent.parent / 'kernel-pending.json'
     first = None
-    if os.path.lexists(pending_path):
+    rollback = None
+    if os.path.lexists(stage / 'kernel-rollback-pending.json'):
+        retained = strict_json(rpm.read(stage / 'kernel-rollback-pending.json', 65536))
+        exact(retained, {'schema', 'pending', 'completion'})
+        exact(retained['completion'], {'filename', 'sha256'})
+        if type(retained['schema']) is not int or retained['schema'] != 1 or retained['completion']['filename'] != 'kernel-rollback-complete.json':
+            refuse('rollback_candidate_binding_changed')
+        raw = rpm.read(stage / retained['completion']['filename'], rpm.MAX_XML)
+        if rpm.sha(raw) != retained['completion']['sha256']:
+            refuse('rollback_candidate_binding_changed')
+        rollback = strict_json(raw)
+        pending = retained['pending']
+    elif os.path.lexists(pending_path) and not os.path.lexists(stage / 'kernel-completed.json'):
         pending = strict_json(rpm.read(pending_path, 8192))
     else:
         completed = strict_json(rpm.read(stage / 'kernel-completed.json', 65536))
@@ -1017,6 +1030,13 @@ def load_candidate(stage):
     candidate = Path(pending['stage'])
     if pending['schema'] != 1 or candidate.is_symlink() or candidate.resolve().parent != stage.resolve().parent:
         refuse('pending_candidate_stage_changed')
+    owner_path = candidate / 'kernel-rollback-owner.json'
+    if first is None and rollback is None and os.path.lexists(owner_path):
+        owner = strict_json(rpm.read(owner_path, 8192))
+        if owner != {'schema': 1, 'stage': str(stage), 'candidate_plan_sha256': pending['plan_sha256'],
+                     'installed_sha256': pending['installed_sha256'],
+                     'operation_sha256': rpm.sha(rpm.read(stage / 'operation.json', 8192))}:
+            refuse('candidate_rollback_owned_elsewhere')
     if candidate != stage:
         reference = strict_json(rpm.read(stage / 'kernel-deferred.json', 8192))
         if reference != {'schema': 1, 'kind': 'kernel-deferred-v1', 'candidate': pending,
@@ -1034,7 +1054,66 @@ def load_candidate(stage):
             or first[0]['kernel_plan_sha256'] != checksum or first[0]['installed_sha256'] != pending['installed_sha256']
             or first[0]['kernel'] != payload['kernel'] or first[0]['recovery_kernel'] != payload['old_kernel']):
         refuse('completed_candidate_acceptance_changed')
+    if rollback is not None and (rollback.get('status') != 'rolled_back' or rollback.get('release_accepted') is not False
+            or rollback.get('candidate_plan_sha256') != checksum or rollback.get('installed_sha256') != pending['installed_sha256']
+            or rollback.get('kernel') != payload['kernel'] or rollback.get('recovery_kernel') != payload['old_kernel']):
+        refuse('rollback_candidate_completion_changed')
     return candidate, payload, checksum, installed
+
+
+def reject_quarantined(stage, candidate):
+    """A failed vendor version cannot be silently selected by the next poll."""
+    if not isinstance(candidate, str) or not KERNEL.fullmatch(candidate):
+        refuse('invalid_quarantine_kernel')
+    path = Path(stage).parent.parent / ('kernel-rejected-' + candidate + '.json')
+    if os.path.lexists(path):
+        # Even a damaged rejection is a negative gate, never permission to retry.
+        refuse('candidate_quarantined_after_rollback')
+
+
+def mark_rolled_back(stage, completion, health, *, runner=run):
+    """Retain verified removal and rejection before clearing our pending only.
+
+    Runtime health binds the current old-kernel boot; the immutable removal
+    receipt may be historical when cleanup resumes after another boot. This
+    never releases maintenance or accepts the rejected candidate.
+    """
+    from . import kernel_boot, kernel_rollback
+    require_linux_root()
+    stage = Path(stage)
+    kernel_boot._context(stage)
+    verified = kernel_rollback.verified_completion(stage, runner=runner)
+    if verified != completion:
+        refuse('verified_rollback_completion_required')
+    candidate, payload, checksum, installed = load_candidate(stage)
+    kernel_boot._check_health(health, stage, kernel_boot.boot_id(), payload['old_kernel'])
+    if (runner(['/usr/bin/uname', '-r']) != payload['old_kernel']
+            or runner(['/usr/sbin/grubby', '--default-kernel']) != '/boot/vmlinuz-' + payload['old_kernel']
+            or security.status(runner).get('host_controls_ok') is not True):
+        refuse('rollback_runtime_identity_changed')
+    pending = {'schema': 1, 'stage': str(candidate), 'plan_sha256': checksum,
+               'installed_sha256': rpm.sha(rpm.read(candidate / 'kernel-installed.json', rpm.MAX_XML)),
+               'operation_sha256': payload['operation_sha256'], 'kernel': payload['kernel'], 'old_kernel': payload['old_kernel']}
+    raw = rpm.read(stage / 'kernel-rollback-complete.json', rpm.MAX_XML)
+    if strict_json(raw) != completion:
+        refuse('rollback_completion_changed')
+    retained = {'schema': 1, 'pending': pending,
+                'completion': {'filename': 'kernel-rollback-complete.json', 'sha256': rpm.sha(raw)}}
+    record(stage, 'kernel-rollback-pending.json', retained)
+    quarantine = {'schema': 1, 'kernel': payload['kernel'], 'candidate_stage': str(candidate),
+                  'candidate_plan_sha256': checksum, 'rollback_stage': str(stage), 'completion': retained['completion']}
+    record(stage.parent.parent, 'kernel-rejected-' + payload['kernel'] + '.json', quarantine)
+    path = stage.parent.parent / 'kernel-pending.json'
+    if os.path.lexists(path):
+        if strict_json(rpm.read(path, 8192)) != pending:
+            refuse('another_kernel_candidate_pending')
+        path.unlink()
+        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    return {'ok': True, 'status': 'rolled_back', 'completion_sha256': rpm.sha(raw), 'release_accepted': False}
 
 
 def mark_complete(stage, acceptance, *, runner=run):
@@ -1087,6 +1166,10 @@ def adopt_pending(stage):
     if not os.path.lexists(pending_path):
         return None
     pending = strict_json(rpm.read(pending_path, 8192))
+    reject_quarantined(stage, pending.get('kernel'))
+    origin = Path(pending['stage'])
+    if any(os.path.lexists(origin / name) for name in ('kernel-fallback.json', 'kernel-retry-reservation.json', 'kernel-rollback-owner.json')):
+        refuse('failed_candidate_requires_explicit_recovery')
     reference = {'schema': 1, 'kind': 'kernel-deferred-v1', 'candidate': pending,
                  'operation_sha256': rpm.sha(rpm.read(stage / 'operation.json', 8192))}
     record(stage, 'kernel-deferred.json', reference)

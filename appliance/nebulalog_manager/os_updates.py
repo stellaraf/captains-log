@@ -6,7 +6,7 @@ import re
 from .common import CommandFailed, Refused, atomic_json, audit, locked, require_linux_root, run, trusted_file
 from .security import status
 from . import os_payload, livepatch
-from .updates import REQUIRED_CHECKS, in_maintenance_window
+from .updates import REQUIRED_CHECKS, in_maintenance_window, os_maintenance_pending
 
 
 def _hook(name, runner, *, timeout=3600):
@@ -46,10 +46,7 @@ def maintain(config: Path, state: Path=Path("/var/lib/nebulalog/manager"), runne
         livepatch.require_settled(state / "updates")
         journal = state / "os-transaction.json"
         previous = json.loads(journal.read_text()) if journal.exists() else None
-        if previous and (previous.get("state") not in ("complete", "failed", "reboot_aborted")
-                         or previous.get("finalization", "complete") != "complete"
-                         or previous.get("kernel_finalization", "complete") not in (None, "complete")
-                         or previous.get("kernel_retention", "complete") not in (None, "complete")):
+        if os_maintenance_pending(previous):
             raise Refused("An interrupted OS transaction or pending reboot requires recovery before another update")
         component_record = state / "updates/transaction.json"
         if component_record.exists():

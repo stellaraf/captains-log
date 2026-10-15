@@ -60,8 +60,8 @@ class OSMaintenanceTests(unittest.TestCase):
         self.assertFalse((self.root / 'os-transaction.json').exists())
 
     def test_kernel_finalization_or_retention_blocks_new_maintenance(self):
-        for field in ('kernel_finalization', 'kernel_retention'):
-            for status in ('pending', 'failed'):
+        for field in ('kernel_finalization', 'kernel_retention', 'kernel_rollback'):
+            for status in ('pending', 'failed', 'recovery_required', 'unknown'):
                 with self.subTest(field=field, status=status):
                     atomic_json(self.root / 'os-transaction.json', {'state': 'complete', 'finalization': 'complete', field: status})
                     with self.assertRaisesRegex(Refused, 'requires recovery'):

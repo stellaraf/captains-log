@@ -35,6 +35,15 @@ HOST_PHASE_CHECKS = {
 }
 
 
+def os_maintenance_pending(transaction):
+    """Kernel recovery is pending even after the old runtime becomes healthy."""
+    return bool(transaction and (
+        transaction.get("state") not in {"complete", "failed", "reboot_aborted"}
+        or transaction.get("finalization", "complete") != "complete"
+        or any(transaction.get(field, "complete") not in (None, "complete")
+               for field in ("kernel_finalization", "kernel_retention", "kernel_rollback"))))
+
+
 def _unique(pairs):
     result = {}
     for key, value in pairs:
@@ -209,8 +218,7 @@ class UpdateManager:
         pending = bool(record and record.get("state") in ("committed", "rolled_back") and record.get("finalization") != "complete")
         os_path = self.state.parent / "os-transaction.json"
         os_transaction = json.loads(os_path.read_text()) if os_path.exists() else None
-        os_pending = bool(os_transaction and (os_transaction.get("state") not in {"complete", "failed", "reboot_aborted"}
-                          or os_transaction.get("finalization", "complete") != "complete"))
+        os_pending = os_maintenance_pending(os_transaction)
         interrupted = bool(record and record.get("state") in {"preflight", "preparing", "activating", "checking", "rolling_back", "recovery_required"})
         recovery = "nebulalog update finalize" if pending else "nebulalog update recover" if interrupted else None
         return {"current": json.loads(current.read_text()) if current.exists() else {"sequence": 0, "components": {}},
@@ -322,7 +330,10 @@ class UpdateManager:
         with locked(self.state.parent / "transaction.lock"), locked(self.state / "transaction.lock"):
             livepatch.require_settled(self.state)
             enrolled_key(self.state, public_key)
-            transaction = self.status()["transaction"]
+            status = self.status()
+            if os_maintenance_pending(status["os_transaction"]):
+                raise Refused("OS recovery must finish before component finalization")
+            transaction = status["transaction"]
             if not transaction or transaction.get("state") not in ("committed", "rolled_back"):
                 raise Refused("No completed component transaction is awaiting finalization")
             if transaction.get("finalization") == "complete":
@@ -352,7 +363,7 @@ class UpdateManager:
             if status["maintenance_release_pending"]:
                 raise Refused("Complete pending maintenance release with nebulalog update finalize before another update")
             os_transaction = status["os_transaction"]
-            if os_transaction and (os_transaction.get("state") not in ("complete", "failed", "reboot_aborted") or os_transaction.get("finalization", "complete") != "complete"):
+            if os_maintenance_pending(os_transaction):
                 raise Refused("OS maintenance or reboot recovery must finish before a component update")
             if status["transaction"] and status["transaction"].get("state") not in ("committed", "rolled_back", "preflight_failed"):
                 raise Refused("An interrupted or failed update requires recovery before another install")
@@ -467,6 +478,8 @@ class UpdateManager:
             status = self.status()
             if status["maintenance_release_pending"]:
                 raise Refused("Finalize the completed transaction before requesting operator rollback")
+            if os_maintenance_pending(status["os_transaction"]):
+                raise Refused("OS recovery must finish before component rollback")
             transaction = status["transaction"]
             if not transaction or transaction.get("state") != "committed" or not transaction.get("previous"):
                 raise Refused("No last committed reversible transaction is available")
@@ -513,7 +526,7 @@ class UpdateManager:
             if not transaction or transaction.get("state") not in {"preflight", "preparing", "activating", "checking", "rolling_back", "recovery_required"}:
                 raise Refused("No interrupted component transaction is available for recovery")
             os_transaction = status["os_transaction"]
-            if os_transaction and (os_transaction.get("state") not in {"complete", "failed", "reboot_aborted"} or os_transaction.get("finalization", "complete") != "complete"):
+            if os_maintenance_pending(os_transaction):
                 raise Refused("OS recovery must finish before component recovery")
             stage, _ = self._retained_release(transaction, public_key, recovery=True)
             transaction["state"] = "rolling_back"

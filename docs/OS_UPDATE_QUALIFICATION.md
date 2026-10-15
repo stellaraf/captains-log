@@ -187,22 +187,68 @@ hashes passed with the corrected exact package identities. This verifies capture
 and layout compatibility, not AIDE enrollment, reboot recovery or a healthy
 appliance. The guest and its existing baseline were not changed.
 
+An isolated native reboot on October 15 also exposed changes beyond GRUB:
+nine existing EFI files changed inode on VFAT remount, and nine fixed `/etc`
+and `/root` files changed ctime during the successful vendor tmpfiles service.
+Their contents and security metadata matched. The full AIDE check rejected
+these changes before replacing its database; the original baseline remains
+preserved. Signed vendor payload/source inspection supports the explanation,
+but a typed, narrowly scoped metadata transition and its native qualification
+are still required. No AIDE attributes have been disabled to pass this test.
+
+### Failed candidate recovery
+
+After the fallback kernel boots, `kernel_recovery_required` holds the candidate
+for an explicit operator decision. Automatic OS/component updates remain
+blocked while this recovery, retention or rollback is incomplete. Returning
+the old runtime to service does not accept the candidate update.
+
+`sudo nebulalog update kernel-retry` permits one additional candidate attempt,
+for at most two attempts total. It requires a verified current fallback boot,
+fresh backup, all runtime/security checks, and encrypted-storage unlock
+readiness. The reservation is bound to the original candidate, even if a later
+operation adopts that candidate. A durable request precedes the reboot; an
+interrupted request cannot silently request another reboot. A failed attempt
+stays held for recovery and never becomes an automatic retry loop.
+
+`sudo nebulalog update kernel-rollback` removes only the exact never-accepted
+candidate's four vendor packages. It verifies retained signed inputs, keeps
+the running recovery kernel and its default, and records one erase attempt
+before RPM runs. Full integrity and current runtime checks precede completion.
+Only then does it quarantine that exact failed version and clear its owned
+pending pointer. Other versions remain eligible for later vendor updates.
+Source RPMs, backups and recovery evidence are retained.
+
+Interrupted rollback handles a verified completed erase on the same or a later
+boot, including AIDE database publication interruptions. An unattempted older
+plan receives a new immutable execution generation. Partial or ambiguous RPM
+results stay held and never cause a second erase command. Completion evidence
+keeps its original boot identity; current recovery requires separate fresh
+boot and health checks.
+
+Source tests exercise retry cancellation, attempt limits, rollback ownership,
+full integrity history, later-boot recovery and failed post-removal health.
+These commands are not yet accepted on the native appliance. In particular,
+a vendor success-timer change after retry arming can retain maintenance rather
+than automatically cancel the arm; the existing exact evidence and one-shot
+selection are preserved for recovery. Native reboot metadata handling above
+must also be qualified before claiming this workflow operational.
+
 The following cases remain explicit qualification or implementation gaps:
 
 - Interruption between the GRUB temporary-file creation and replacement, and
   the complete candidate-kernel boot/promotion path on a configured appliance.
 - Native qualification of later-boot exact-erasure recovery and its earlier
-  acceptance generations; supported recovery for partial erasure and an
-  unattempted plan from an earlier boot remains unfinished.
+  acceptance generations and unattempted plans from earlier boots. Partial
+  erasure remains a held condition requiring a separately qualified recovery.
 - Native qualification of ordinary-reboot integrity reconciliation before the
   first kernel update, after completed update/retention, and after a late vendor
   boot-success timer change. Drift during a measured phase must retain its
   maintenance gate and recover through a new qualified generation.
 - Native interruption qualification of atomic kernel-default protection and
   its once-only RPM-command boundary.
-- Retry or rollback of an unaccepted candidate after a verified fallback boot.
-  That state is reported as `kernel_recovery_required` with retry held; it must
-  not become an endless automatic reboot loop or a successful-update claim.
+- Native retry/rollback qualification after verified fallback, including the
+  armed success-timer interruption described above.
 - The complete general vendor update transaction, critical packages and their
   service/generated-file migrations, and native VMware/AHV acceptance.
 

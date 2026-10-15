@@ -41,7 +41,7 @@ MANAGER_MODULES = (
     "bootloader.py", "common.py", "console.py", "enrollment.py", "firstboot.py", "github_updates.py", "guest_validation.py",
     "host_activation.py", "host_dispatch.py", "host_identity.py", "host_job_storage.py", "host_jobs.py", "host_operations.py", "host_payload.py",
     "host_plan_socket.py", "host_plans.py", "image_bundle.py", "image_seal_network.py", "livepatch.py", "os_payload.py", "os_updates.py",
-    "kernel_boot.py", "kernel_integrity.py", "kernel_retention.py", "kernel_retention_generation.py", "kernel_retention_integration.py", "kernel_updates.py",
+    "kernel_boot.py", "kernel_integrity.py", "kernel_retention.py", "kernel_retention_generation.py", "kernel_retention_integration.py", "kernel_rollback.py", "kernel_updates.py",
     "ordinary_boot.py", "ordinary_boot_state.py",
     "publisher_inputs.py", "security.py", "setup_integrity.py", "sizing.py", "status_snapshot.py", "storage.py", "update_enrollment.py", "updates.py",
 )
@@ -50,6 +50,7 @@ COMMANDS = ("bootstrap-runtime", "enroll-installed-release", "load-image-bundle"
             "nebulalog-baseline", "nebulalog-console", "nebulalog-firstboot", "nebulalog-seal", "nebulalog-setup",
             "publish-status", "validate-guest")
 ADAPTER_COMMANDS = ("update-activate", "update-backup", "update-boot-gate", "update-finalize", "update-health",
+                    "update-kernel-retry", "update-kernel-rollback",
                     "update-os-postcheck", "update-os-preflight", "update-os-recover", "update-preflight",
                     "update-prepare", "update-reboot-abort", "update-reboot-complete", "update-reboot-prepare", "update-rollback")
 UNITS = ("nebulalog-aide.service", "nebulalog-aide.timer", "nebulalog-app-update.service", "nebulalog-app-update.timer",

@@ -1018,6 +1018,174 @@ class Lifecycle:
         atomic_json(pointer, {"boot_id": proof["boot_id"], "sha256": hashlib.sha256(kernel_updates.encode(acceptance)).hexdigest()})
         return kernel_updates.mark_complete(stage, acceptance, runner=self.cmd)
 
+    def _kernel_recovery_health(self, stage, kernel, boot_id):
+        if self.boot_id() != boot_id or self.cmd(["/usr/bin/uname", "-r"]) != kernel:
+            raise Refused("Kernel recovery requires the exact current recovery boot")
+        result = self.health(stage, os_health=True)
+        if (result.get("ok") is not True
+                or any(result.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS)
+                or self.boot_id() != boot_id or self.cmd(["/usr/bin/uname", "-r"]) != kernel):
+            raise Refused("Kernel recovery requires all current runtime checks")
+        return {name: True for name in REQUIRED_CHECKS}
+
+    def _kernel_recovery_authorization(self, stage, backup_stage):
+        observed = self.boot_id()
+        running = self.cmd(["/usr/bin/uname", "-r"])
+        checks = self._kernel_recovery_health(stage, running, observed)
+        checksum = kernel_integrity.checked_backup(backup_stage)
+        if self.boot_id() != observed:
+            raise Refused("Kernel recovery boot changed during backup verification")
+        return {"ok": True, "stage": str(stage), "boot_id": observed, "kernel": running,
+                "checks": checks, "backup_stage": str(backup_stage), "backup_sha256": checksum}
+
+    def kernel_retry(self):
+        """Explicitly request the single permitted retry of a failed candidate."""
+        self.guard()
+        self.encrypted()
+        with locked(self.data / "manager/transaction.lock"), locked(self.data / "manager/updates/transaction.lock"):
+            latest_path = self.data / "manager/os-latest.json"
+            journal = self.data / "manager/os-transaction.json"
+            latest = json.loads(trusted_file(latest_path).read_text())
+            transaction = json.loads(trusted_file(journal).read_text())
+            stage, current_boot = self._reboot_binding(latest, transaction, new_boot=True)
+            if (transaction.get("kernel_finalization") != "recovery_required"
+                    or transaction.get("kernel_outcome") != "recovery"
+                    or os.path.lexists(stage / "kernel-acceptance-current.json")
+                    or os.path.lexists(stage / "kernel-rollback-intent.json")):
+                raise Refused("Kernel retry requires an unaccepted candidate after verified fallback")
+            # A request receipt precedes systemctl. An interrupted request is
+            # never silently issued again; rollback can cancel the owned arm.
+            if os.path.lexists(stage / "kernel-retry-request.json"):
+                raise Refused("A kernel retry was already requested; inspect reboot completion or use kernel-rollback")
+            self.maintenance(True, stage)
+            transaction = {**transaction, "state": "recovery_required", "finalization": "pending",
+                           "kernel_finalization": "recovery_required", "kernel_retry": "preparing"}
+            atomic_json(journal, transaction)
+            try:
+                recovery = kernel_boot.reconcile_recovery(stage, **self._kernel_callbacks())
+                if recovery.get("outcome") != "recovery" or recovery.get("boot_id") != current_boot:
+                    raise Refused("Kernel retry requires a verified current fallback boot")
+                proof = kernel_boot.verified_recovery(stage, runner=self.cmd)
+                latest, transaction, backup_stage = self._os_recovery_backup(stage, latest, transaction)
+                self._kernel_recovery_health(stage, proof["recovery_kernel"], current_boot)
+                unlock = self.unlock_readiness("/boot/vmlinuz-" + proof["kernel"])
+                local_auth(self.config)
+                def authorize(directory):
+                    if directory != stage:
+                        raise Refused("Kernel retry authorization belongs to another operation")
+                    return self._kernel_recovery_authorization(stage, backup_stage)
+                armed = kernel_boot.retry_candidate(stage, authorize=authorize, **self._kernel_callbacks())
+                if (armed.get("ok") is not True or armed.get("status") != "retry_armed"
+                        or armed.get("attempt") != 2 or armed.get("boot_id") != current_boot
+                        or armed.get("release_accepted") is not False):
+                    raise Refused("Kernel retry did not return an exact bounded arm receipt")
+                transaction = {**transaction, "state": "reboot_preparing", "kernel_retry": "armed",
+                               "retry_boot_id": current_boot, "reboot_pending": True}
+                atomic_json(journal, transaction)
+                self.service("stop", tuple(reversed(self.services)))
+                self.cmd(["sync", "-f", str(self.data)], timeout=120)
+                if self.boot_id() != current_boot:
+                    raise Refused("Kernel retry boot changed before its reboot request")
+                request = {"schema": 1, "stage": str(stage), "boot_id": current_boot,
+                           "transition_sha256": armed["transition_sha256"], "attempt": 2}
+                kernel_updates.record(stage, "kernel-retry-request.json", request)
+                atomic_json(latest_path, {**latest, "state": "reboot_prepared", "retry_boot_id": current_boot})
+                transaction = {**transaction, "state": "reboot_requested", "kernel_retry": "requested"}
+                atomic_json(journal, transaction)
+                audit(self.data / "manager/audit.jsonl", "os.kernel_retry_requested", boot_id=current_boot)
+                self.cmd(["systemctl", "reboot"], timeout=120)
+            except Exception as exc:
+                try:
+                    state = kernel_boot.candidate_status(stage, runner=self.cmd)
+                    if state.get("phase") in {"retry_arm", "postboot", "recovery_resume"}:
+                        kernel_boot.abort_candidate(stage, **self._kernel_callbacks())
+                    self.service("start", self.services)
+                    kernel_boot.reconcile_recovery(stage, **self._kernel_callbacks())
+                    proof = kernel_boot.verified_recovery(stage, runner=self.cmd)
+                    checks = self._kernel_recovery_health(stage, proof["recovery_kernel"], current_boot)
+                    failed = {**transaction, "state": "complete", "finalization": "pending",
+                              "kernel_retry": "held", "kernel_finalization": "recovery_required",
+                              "kernel_outcome": "recovery", "reboot_pending": True,
+                              "kernel_recovery_reason": "retry_request_failed", "error": type(exc).__name__}
+                    atomic_json(latest_path, {**latest, "state": "reboot_completed", "observed_boot_id": current_boot})
+                    atomic_json(journal, failed)
+                    self.maintenance(False, stage)
+                    atomic_json(journal, {**failed, "finalization": "complete", "health": checks})
+                except Exception as recovery_error:
+                    self.maintenance(True, stage)
+                    atomic_json(journal, {**transaction, "state": "recovery_required", "finalization": "failed",
+                                         "kernel_retry": "held", "error": type(recovery_error).__name__})
+                    raise Refused("Kernel retry recovery requires attention; maintenance remains active") from recovery_error
+                raise Refused("Kernel retry could not complete; the old kernel and runtime were verified, candidate recovery remains pending") from exc
+            return self.receipt(stage, "kernel-retry", status="reboot_requested", boot_id=current_boot,
+                                attempt=2, reboot_pending=True, release_accepted=False, unlock=unlock)
+
+    def kernel_rollback(self):
+        """Remove only the owned unaccepted candidate after verified fallback."""
+        self.guard()
+        self.encrypted()
+        with locked(self.data / "manager/transaction.lock"), locked(self.data / "manager/updates/transaction.lock"):
+            latest = json.loads(trusted_file(self.data / "manager/os-latest.json").read_text())
+            transaction = json.loads(trusted_file(self.data / "manager/os-transaction.json").read_text())
+            stage, current_boot = self._reboot_binding(latest, transaction, new_boot=True)
+            if (os.path.lexists(stage / "kernel-acceptance-current.json")
+                    or not (transaction.get("kernel_finalization") == "recovery_required"
+                            and transaction.get("kernel_outcome") == "recovery"
+                            or transaction.get("kernel_rollback") in {"pending", "failed", "complete"})):
+                raise Refused("Kernel rollback requires the owned unaccepted fallback candidate")
+            return self._kernel_rollback(stage, latest, transaction, current_boot)
+
+    def _kernel_rollback(self, stage, latest, transaction, current_boot):
+        from nebulalog_manager import kernel_rollback
+        latest_path = self.data / "manager/os-latest.json"
+        journal = self.data / "manager/os-transaction.json"
+        self.maintenance(True, stage)
+        transaction = {**transaction, "state": "recovery_required", "finalization": "pending",
+                       "kernel_finalization": "recovery_required", "kernel_rollback": "pending"}
+        atomic_json(journal, transaction)
+        try:
+            if not any(os.path.lexists(stage / name) for name in
+                       (kernel_rollback.PLAN, kernel_rollback.INTENT, kernel_rollback.COMPLETE)):
+                proof = kernel_boot.prepare_rollback_recovery(stage, **self._kernel_callbacks())
+                if proof.get("outcome") != "recovery" or proof.get("boot_id") != current_boot:
+                    raise Refused("Kernel rollback requires exact current fallback integrity")
+            self.service("start", self.services)
+            # Existing rollback evidence takes priority: candidate files may
+            # already be gone. Its typed recovery validates the retained scope
+            # and boot history without repeating RPM or recapturing a baseline.
+            latest, transaction, backup_stage = self._os_recovery_backup(stage, latest, transaction)
+            def authorize(directory):
+                if directory != stage:
+                    raise Refused("Kernel rollback authorization belongs to another operation")
+                return self._kernel_recovery_authorization(stage, backup_stage)
+            result = kernel_rollback.rollback(stage, authorize=authorize, runner=self.cmd)
+            if (result.get("ok") is not True or result.get("status") != "rolled_back"
+                    or result.get("release_accepted") is not False):
+                raise Refused("Kernel rollback did not verify exact removal and integrity")
+            checks = self._kernel_recovery_health(stage, result["recovery_kernel"], current_boot)
+            completed = kernel_updates.mark_rolled_back(stage, {k: v for k, v in result.items() if k != "ok"},
+                {"ok": True, "stage": str(stage), "boot_id": current_boot,
+                 "kernel": result["recovery_kernel"], "checks": checks}, runner=self.cmd)
+            if completed.get("status") != "rolled_back" or completed.get("release_accepted") is not False:
+                raise Refused("Kernel rollback disposition was not durably verified")
+            latest = {**latest, "state": "reboot_completed", "observed_boot_id": current_boot}
+            transaction = {**transaction, "state": "complete", "finalization": "pending",
+                           "kernel_finalization": "complete", "kernel_rollback": "complete",
+                           "kernel_outcome": "rolled_back", "kernel_retry": "held", "reboot_pending": False,
+                           "observed_boot_id": current_boot, "health": checks}
+            atomic_json(latest_path, latest)
+            atomic_json(journal, transaction)
+            self.maintenance(False, stage)
+            atomic_json(journal, {**transaction, "finalization": "complete"})
+        except Exception as exc:
+            self.maintenance(True, stage)
+            atomic_json(journal, {**transaction, "state": "recovery_required", "finalization": "failed",
+                                 "kernel_rollback": "failed", "rollback_error": type(exc).__name__})
+            raise Refused("Kernel rollback requires recovery; maintenance and exact evidence are retained") from exc
+        audit(self.data / "manager/audit.jsonl", "os.kernel_rolled_back", boot_id=current_boot)
+        return self.receipt(stage, "kernel-rollback", status="rolled_back", boot_id=current_boot,
+                            reboot_pending=False, release_accepted=False, checks=checks, rollback=completed)
+
     def _kernel_retention_acceptance(self, stage, backup_stage, directory):
         if directory != stage:
             raise Refused("Kernel retention acceptance belongs to another operation")
@@ -1361,10 +1529,15 @@ class Lifecycle:
             latest = json.loads(trusted_file(path).read_text())
             transaction = json.loads(trusted_file(journal).read_text())
             if (transaction.get("state") == "complete" and transaction.get("finalization", "complete") == "complete"
-                    and transaction.get("kernel_finalization") not in ("pending", "failed")
-                    and transaction.get("kernel_retention") not in ("pending", "failed")):
+                    and transaction.get("kernel_finalization", "complete") in (None, "complete")
+                    and transaction.get("kernel_retention", "complete") in (None, "complete")
+                    and transaction.get("kernel_rollback", "complete") in (None, "complete")):
                 return self._ordinary_boot_complete()
             stage, current_boot = self._reboot_binding(latest, transaction, new_boot=True)
+            if (transaction.get("kernel_rollback") in {"pending", "failed"}
+                    or transaction.get("kernel_rollback") == "complete"
+                    and transaction.get("finalization") != "complete"):
+                return self._kernel_rollback(stage, latest, transaction, current_boot)
             if (transaction.get("kernel_retention") in ("pending", "failed")
                     and os.path.lexists(stage / "kernel-acceptance-current.json")):
                 self.maintenance(True, stage)
@@ -1388,7 +1561,8 @@ class Lifecycle:
             candidate = None
             boot_result = None
             try:
-                self.checked_backup(stage)
+                latest, transaction, backup_stage = self._os_recovery_backup(stage, latest, transaction)
+                self.checked_backup(backup_stage)
                 candidate = self._kernel_candidate(stage)
                 if candidate is not None:
                     boot_result = kernel_boot.verify_postboot(stage, **self._kernel_callbacks())

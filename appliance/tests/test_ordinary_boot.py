@@ -178,6 +178,14 @@ class GenerationTests(Fixtures):
             path.unlink()
         self.assertEqual(list(self.owner.iterdir()), [])
 
+    def test_incomplete_kernel_rollback_cannot_be_claimed_as_ordinary_boot(self):
+        self.write(self.root / 'manager/os-latest.json', {})
+        self.write(self.root / 'manager/os-transaction.json', {'state': 'complete',
+                   'finalization': 'complete', 'kernel_finalization': 'complete', 'kernel_rollback': 'failed'})
+        with self.assertRaisesRegex(Refused, 'pending_os_owner'):
+            self.reboot()
+        self.assertEqual(list(self.owner.iterdir()), [])
+
     def test_only_environment_can_differ_in_aide_report(self):
         stage = self.reboot(); plan, _ = core._load(stage)
         for phase in ('prepare', 'forward'):
@@ -297,6 +305,80 @@ class ReducerTests(Fixtures):
         self.assertTrue(value['checkpoint_required'])
         self.reconcile_and_finalize(current)
         self.assertIsNone(self.pending())
+
+    def rollback_history(self):
+        from nebulalog_manager import kernel_rollback as rollback
+        stage = self.os_stage()
+        initial = copy.deepcopy(self.initial)
+        candidate = '5.14.0-687.57.1.el9_8.x86_64'
+        removed = {'/boot/vmlinuz-' + candidate: description(b'candidate')}
+        initial['artifacts'].update(removed)
+        initial['inventory'] = sorted(initial['inventory'] + ['kernel-core-0:' + candidate])
+        original = {'before_inventory': initial['inventory'], 'after_inventory': self.initial['inventory'],
+                    'removed': removed, 'preserved': {core.native.ENV: initial['grub']['description']},
+                    'mutable_directories': ['/boot'], 'recovery_kernel': KERNEL,
+                    'recovery': {'boot_id': BOOT}}
+        checksum = 'd' * 64
+        def resolve(owner, wanted):
+            self.assertEqual(owner, stage); self.assertEqual(wanted, checksum)
+            return original, checksum
+        self.patch(rollback, 'load_plan_by_checksum', side_effect=resolve)
+        base = rollback.integrity_plan(original, checksum)
+        row = self.accepted_row(stage, base)
+        after = environment(copy.deepcopy(self.initial), boot_success='1'); after['boot_id'] = NEXT
+        compound = {**base, 'id': '2' * 32, 'rollback_plan_sha256': checksum, 'previous': None,
+                    'boot_id': NEXT, 'after_raw': after['grub']['raw'],
+                    'files': [{'path': core.native.ENV, 'before': original['preserved'][core.native.ENV],
+                               'after': after['grub']['description']}]}
+        compound_row = self.accepted_row(stage, compound, number=2)
+        def resume(owner, reference, **kwargs):
+            self.assertEqual(owner, stage)
+            self.assertTrue(kwargs.get('historical'))
+            self.assertEqual(reference, {'filename': 'kernel-rollback-resume-' + compound['id'] + '-integrity.json',
+                                         'sha256': compound_row['entry']['plan_sha256']})
+            return compound, reference['sha256']
+        self.patch(rollback, 'load_resume', side_effect=resume)
+        return initial, row, compound_row, after, removed
+
+    def test_rollback_history_erases_once_across_later_boot_compound(self):
+        initial, base, compound, expected, removed = self.rollback_history()
+        state, unresolved, checkpoint = core._fold(initial, [base, compound], self.identity)
+        self.assertEqual(state, expected)
+        self.assertEqual(unresolved, set())
+        self.assertTrue(checkpoint)
+        self.assertTrue(set(removed).isdisjoint(state['artifacts']))
+
+    def test_rollback_history_can_accept_compound_without_prior_removal_entry(self):
+        initial, _, compound, expected, _ = self.rollback_history()
+        state, unresolved, checkpoint = core._fold(initial, [compound], self.identity)
+        self.assertEqual(state, expected)
+        self.assertFalse(unresolved)
+        self.assertTrue(checkpoint)
+
+    def test_rollback_history_rejects_wrong_boot_or_removal_preimage(self):
+        initial, _, compound, _, removed = self.rollback_history()
+        wrong_boot = copy.deepcopy(initial); wrong_boot['boot_id'] = 'cccccccc-cccc-cccc-cccc-cccccccccccc'
+        with self.assertRaisesRegex(Refused, 'accepted_rollback_observation_gap'):
+            core._fold(wrong_boot, [compound], self.identity)
+        wrong_file = copy.deepcopy(initial)
+        wrong_file['artifacts'][next(iter(removed))]['sha256'] = 'f' * 64
+        with self.assertRaisesRegex(Refused, 'accepted_rollback_preimage_changed'):
+            core._fold(wrong_file, [compound], self.identity)
+
+    def test_rollback_history_cannot_treat_reappeared_candidate_as_already_erased(self):
+        initial, base, compound, _, removed = self.rollback_history()
+        # A subsequent signed payload could reintroduce a path; a repeated
+        # removal receipt grants no authority to erase that newer artifact.
+        real_inventory = core._inventory
+        calls = []
+        def inventory(state, before, after, *, repeated=False):
+            real_inventory(state, before, after, repeated=repeated)
+            calls.append(repeated)
+            if repeated: state['artifacts'].update(removed)
+        with patch.object(core, '_inventory', side_effect=inventory):
+            with self.assertRaisesRegex(Refused, 'accepted_rollback_artifact_reappeared'):
+                core._fold(initial, [base, compound], self.identity)
+        self.assertEqual(calls, [False, True])
 
     def test_updated_payload_content_cannot_be_filled_from_observation(self):
         stage, payload, after, paths = self.install(); self.observed = self.commit(stage, payload, after)

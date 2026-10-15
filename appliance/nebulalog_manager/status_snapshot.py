@@ -235,15 +235,21 @@ class Collector:
             configured = False
         marker = self.state / "maintenance.json"
         maintenance_active = read_json(marker).get("active") is True if marker.exists() else False
-        recovery_action = "nebulalog update finalize" if value.get("maintenance_release_pending") is True else ""
+        os_blocks_recovery = updates.os_maintenance_pending(os_transaction)
+        recovery_action = "nebulalog update finalize" if value.get("maintenance_release_pending") is True and not os_blocks_recovery else ""
+        if (os_transaction.get("kernel_rollback") in {"pending", "failed"}
+                or os_transaction.get("kernel_finalization") == "recovery_required"
+                and os_transaction.get("kernel_outcome") == "recovery"
+                and os_transaction.get("kernel_retry") != "requested"):
+            recovery_action = "nebulalog update kernel-rollback"
+        elif (os_transaction.get("kernel_finalization") in {"pending", "failed"}
+                or os_transaction.get("kernel_retention") in {"pending", "failed"}):
+            recovery_action = "nebulalog update reboot-complete"
         if not recovery_action and os_transaction.get("recovery_phase") == "postcheck" and (os_transaction.get("state") == "recovery_required" or
                 os_transaction.get("state") == "complete" and os_transaction.get("finalization") in {"pending", "failed"}):
             recovery_action = "nebulalog update os-recover"
         if not recovery_action and os_transaction.get("boot_id") and (os_transaction.get("state") in {"reboot_requested", "recovery_required"} or os_transaction.get("state") == "complete" and os_transaction.get("finalization") in {"failed", "pending"}):
             recovery_action = "nebulalog update reboot-complete"
-        os_blocks_recovery = bool(os_transaction and (
-            os_transaction.get("state") not in {"complete", "failed", "reboot_aborted"}
-            or os_transaction.get("finalization", "complete") != "complete"))
         if not recovery_action and not os_blocks_recovery and transaction.get("state") in {
                 "preflight", "preparing", "activating", "checking", "rolling_back", "recovery_required"}:
             recovery_action = "nebulalog update recover"
@@ -253,8 +259,7 @@ class Collector:
             channel = {"status": "unavailable", "automatic_updates": False}
         if channel["automatic_updates"] and (maintenance_active or value.get("maintenance_release_pending") or
                 transaction.get("state", "committed") not in {"committed", "rolled_back", "preflight_failed"} or
-                os_transaction and (os_transaction.get("state") not in {"complete", "failed", "reboot_aborted"} or
-                                    os_transaction.get("finalization", "complete") != "complete")):
+                os_blocks_recovery):
             channel.update(status="blocked", automatic_updates=False)
         return {"status": "observed", "current_sequence": integer(current.get("sequence")), "components": components,
                 "github": channel,

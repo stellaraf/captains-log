@@ -45,6 +45,8 @@ def main(argv=None) -> int:
     p.add_argument("--trust-source", required=True, help="Auditable description/reference for that independent authentication")
     up.add_parser("reboot-complete", help="Verify a changed OS boot and retry its maintenance release")
     up.add_parser("os-recover", help="Retry retained same-boot OS health and maintenance release; never reruns package updates")
+    up.add_parser("kernel-retry", help="Request one bounded retry after a verified fallback to the old kernel")
+    up.add_parser("kernel-rollback", help="Remove the exact failed candidate after verified fallback, or resume its recovery")
     p = up.add_parser("rollback")
     p.add_argument("--public-key", type=Path, default=Path("/etc/nebulalog/release-public.pem"))
     p = up.add_parser("finalize", help="Recheck a completed transaction and retry maintenance release")
@@ -111,7 +113,7 @@ def main(argv=None) -> int:
                 result = manager.finalize(args.public_key)
             elif args.action == "recover":
                 result = manager.recover(args.public_key)
-            elif args.action in ("reboot-complete", "os-recover"):
+            elif args.action in ("reboot-complete", "os-recover", "kernel-retry", "kernel-rollback"):
                 from .common import require_linux_root
                 from .os_updates import _hook
                 require_linux_root()
