@@ -90,6 +90,10 @@ class HostUpdateFixture(HostFixture):
         plan_path = stage / "host-runtime-plan.json"
         if not plan_path.exists():
             atomic_json(plan_path, {"fixture": "lifecycle evidence only", "sequence": tx["sequence"]})
+        if name == "update-preflight":
+            # This mocked hook models the durable proof produced by real preflight;
+            # adapter tests independently validate its contents and recovery use.
+            atomic_json(stage / "adapter-backup-intent.json", {"fixture": "preactivation evidence only"})
         if name == "update-backup":
             atomic_json(self.maintenance, {"active": True})
             result.update(postgresql=True, configuration=True)

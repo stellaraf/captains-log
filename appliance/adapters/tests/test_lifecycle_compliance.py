@@ -66,7 +66,8 @@ class LifecycleComplianceTests(unittest.TestCase):
         policy_file = self.root / "reviewed-policy.json"
         atomic_json(policy_file, policy)
         self.baseline_manager(self.configuration).select(policy_file, baseline._sha(policy_file), INSTALLATION, "cis-level2")
-        self.manager = Lifecycle({"compliance_policy": str(self.configuration / "security-policy.json"), "issuer": "https://fixture.invalid"},
+        self.manager = Lifecycle({"compliance_policy": str(self.configuration / "security-policy.json"), "issuer": "https://fixture.invalid",
+                                  "schema_revision": "1"},
                                  self.runner, state=self.root / "manager/updates", data=self.root,
                                  configuration=self.configuration, quadlets=self.quadlets, guard=lambda: None)
         self.manager.boot_id = lambda: self.boot
@@ -265,6 +266,15 @@ class LifecycleComplianceTests(unittest.TestCase):
         self.assertEqual(json.loads((self.stage / "adapter-compliance.json").read_text())["status"], "failed")
 
     def health_fixture(self):
+        # The PostgreSQL storage barrier has its own lifecycle integration
+        # tests. Retain its operation/hold contract here while exercising the
+        # real compliance assessment, review and health/finalization paths.
+        def storage_maintenance(stage, *, held, delivery_held=False, host_only=False):
+            self.assertIn(stage.parent, (self.root / "manager/os-updates", self.stage.parent))
+            self.assertIs(type(held), bool)
+            self.assertFalse(delivery_held)
+            self.assertFalse(host_only)
+        self.manager.storage_maintenance = Mock(side_effect=storage_maintenance)
         self.manager.api_ready = Mock()
         self.manager.get = lambda path, token=None: json.dumps({"status": "ok", "application_crypto_fips_enabled": True}).encode()
         self.manager.web = lambda: b'<div id="root"></div>'
@@ -319,9 +329,11 @@ class LifecycleComplianceTests(unittest.TestCase):
             self.manager.reboot_complete()
         self.assertEqual(json.loads(journal.read_text())["state"], "recovery_required")
         self.manager.maintenance.assert_called_with(True, stage)
+        self.manager.storage_maintenance.assert_called_with(stage, held=True, delivery_held=False)
         self.approve(stage)
         self.assertEqual(self.manager.reboot_complete()["status"], "complete")
         self.manager.maintenance.assert_called_with(False, stage)
+        self.manager.storage_maintenance.assert_called_with(stage, held=False, delivery_held=False)
         self.assertEqual(self.scans, 2)
 
     def test_same_boot_os_recovery_accepts_exact_review_without_repeating_dnf(self):
@@ -347,9 +359,11 @@ class LifecycleComplianceTests(unittest.TestCase):
             self.manager.os_recover()
         self.assertEqual(json.loads(journal.read_text())["state"], "recovery_required")
         self.manager.maintenance.assert_called_with(True, stage)
+        self.manager.storage_maintenance.assert_called_with(stage, held=True, delivery_held=False)
         self.approve(stage)
         self.assertEqual(self.manager.os_recover()["status"], "updated")
         self.manager.maintenance.assert_called_with(False, stage)
+        self.manager.storage_maintenance.assert_called_with(stage, held=False, delivery_held=False)
         self.assertEqual(self.scans, 2)
         self.assertEqual([call for call in calls if call[0] == "dnf"], [["dnf", "needs-restarting", "--reboothint"]])
 

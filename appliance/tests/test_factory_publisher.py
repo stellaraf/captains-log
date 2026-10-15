@@ -273,7 +273,7 @@ class FactoryBuildInputsTests(unittest.TestCase):
         self.write(public.DESCRIPTOR_SOURCE, serialized(public_descriptor(self.fingerprint)))
 
     def capture(self, **kwargs):
-        return stages.capture(self.root, self.bundle, self.provenance, sequence=1, schema_revision="1", **kwargs)
+        return stages.capture(self.root, self.bundle, self.provenance, sequence=1, schema_revision="2", **kwargs)
 
     def test_missing_public_inputs_require_explicit_private_capture(self):
         with self.assertRaisesRegex(ValueError, "explicitly select --private-unsealed"):
