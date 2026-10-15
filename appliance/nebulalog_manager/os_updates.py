@@ -6,7 +6,7 @@ import re
 from .common import CommandFailed, Refused, atomic_json, audit, locked, require_linux_root, run, trusted_file
 from .security import status
 from . import os_payload, livepatch
-from .updates import REQUIRED_CHECKS, in_maintenance_window, os_maintenance_pending
+from .updates import UpdateManager, REQUIRED_CHECKS, in_maintenance_window, os_maintenance_pending
 
 
 def _hook(name, runner, *, timeout=3600):
@@ -59,6 +59,7 @@ def maintain(config: Path, state: Path=Path("/var/lib/nebulalog/manager"), runne
             component = json.loads(component_record.read_text())
             if component.get("state") not in ("preflight_failed", "committed", "rolled_back") or (component.get("state") in ("committed", "rolled_back") and component.get("finalization") != "complete"):
                 raise Refused("Component maintenance must finish before OS maintenance")
+            UpdateManager(state / "updates")._guard_hooks(component, Path(component.get("release", "")), legacy_accepted=True)
         transaction = dict(previous) if resume else {"state": "preflight", "payload_started": False,
                                                      "started_at": datetime.now(timezone.utc).isoformat()}
         if previous and previous.get("reboot_pending") is True and not resume:

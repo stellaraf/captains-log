@@ -220,6 +220,7 @@ def _hold(manager, identity):
 
 def _settled(identity, stage=None):
     from . import livepatch
+    from .updates import UpdateManager
     root = identity.root / 'manager'
     livepatch.require_settled(root / 'updates')
     for name in ('kernel-pending.json',):
@@ -242,6 +243,11 @@ def _settled(identity, stage=None):
         if (value.get('state') not in {'preflight_failed', 'committed', 'rolled_back'}
                 or value.get('state') != 'preflight_failed' and value.get('finalization') != 'complete'):
             refuse('pending_component_owner')
+        # Phase labels cannot exclude a surviving hook with later effects. Use
+        # the same completed-dispatch authority as component/OS admission before
+        # observing a new boot generation or accepting an integrity database.
+        UpdateManager(root / 'updates')._guard_hooks(
+            value, Path(value.get('release', '')), legacy_accepted=True)
     if os.path.lexists(root / 'maintenance.json'):
         marker, _ = _json(root / 'maintenance.json', canonical=False)
         hold = None

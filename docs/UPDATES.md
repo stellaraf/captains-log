@@ -12,7 +12,7 @@ The policy lives in root-owned `/etc/nebulalog/github-updates.json` and defaults
 
 Each published stable `vMAJOR.MINOR.PATCH` release must contain `manifest.json`, `manifest.sig`, and every OCI artifact named in the signed manifest. The version must match the GitHub tag. Downloads use GitHub's numeric asset API; redirects are restricted to GitHub's HTTPS asset hosts, and API credentials are never forwarded to them. The signature, expiry, supported versions, rollback policy and available space are checked before large artifact downloads. Exact byte counts and SHA-256 hashes are verified before the existing transaction engine can activate anything. Release assets cannot choose a command, publisher key, external download origin or installation hook.
 
-A failed health check rolls back and keeps the release sequence high-water mark, so the next 15-minute check cannot repeatedly reinstall the failed release. Pending recovery or incomplete maintenance release blocks new installation. Network errors and missing releases are recorded for subsequent checks. Checks do not overlap; OS, storage and component mutations remain serialized by the manager's existing transaction lock. A long-running update is allowed to finish instead of starting another at the next timer tick.
+A known, fully terminated failed health check rolls back and keeps the release sequence high-water mark, so the next 15-minute check cannot repeatedly reinstall the failed release. Pending recovery or incomplete maintenance release blocks new installation. Network errors and missing releases are recorded for subsequent checks. Checks do not overlap; OS, storage and component mutations remain serialized by the manager's existing transaction lock. A long-running update is allowed to finish instead of starting another at the next timer tick.
 
 Administration → System → Updates reports the repository, configured policy, timer enabled/active observations, publisher enrollment, last/next check and freshness. Automatic operation is reported only when those observations support it; stale, blocked or unenrolled channels do not appear healthy. The development Docker stack has no host timer and continues to report the channel as not connected.
 
@@ -109,8 +109,46 @@ restoring partial database dumps. Incomplete backup files remain available for
 diagnosis. Any candidate migration/activation evidence, changed runtime, foreign
 maintenance owner or unresolved storage action refuses this path. Full health
 checks and durable transaction completion still precede maintenance release.
-Older interrupted transactions without this proof require their complete verified
-backup; missing evidence never authorizes a guessed restore or gate release.
+Every new component transaction also uses hook lifetime protocol 1. The manager
+publishes an immutable dispatch intent before launching each fixed hook. The
+adapter records entry once and publishes a terminal outcome only after its method
+and cleanup paths have ended and every native invocation has a durable success
+acknowledgement. Exact stage, manifest, sequence, coordinator, command digest and
+result bindings are retained. A returned JSON success alone is insufficient.
+Known Python/health failures with settled native work can use recovery; timeout,
+interruption, missing terminal evidence or an unresolved native command keeps the
+operation held before host selection, rollback, fresh health or gate release.
+Status reports `hook_outcome_unsettled` and `recovery_blocked_by:hook_outcome`.
+An available process lock or absent client PID never settles delegated work.
+
+Two fixed observational commands have narrow completion rules. The exact
+PostgreSQL readiness `SELECT 1` probe may acknowledge a normally returned nonzero
+result, with its argv digest and probe identifier bound in the journal. OpenSCAP
+evaluation may acknowledge normal exit 2 only after validating the exact retained
+policy, inputs, profile and completed XML/HTML reports. Original source bytes are
+checked before and after execution; retained copies preserve historical evidence
+across later authorized content changes. Findings still fail health until the
+existing assessment review requirements are met. Changed operations, signals,
+timeouts and malformed reports retain the hold; no failed mutation is waived.
+Direct host AIDE operations also have durable compound dispatch evidence and
+require the complete authorized operation to return exact success. OS, livepatch
+and ordinary-boot admission apply the same settled-hook guard before beginning
+their work.
+A missing preactivation snapshot may be recaptured only before the first hook
+was ever dispatched. Unknown attempts are not replayed. Native schema transport
+recovery has separate exact executor fencing, but the new outer hook guard still
+holds unknown dispatches before entering that recovery. Earlier native schema
+fault tests do not qualify integrated recovery through this new protocol.
+
+An older already committed and finalized release remains an accepted starting
+point for a new installation after exact retained signature/current/history and
+maintenance checks. This bridge does not retroactively claim hook evidence. Any
+mixed new-protocol artifacts refuse the legacy allowance, and interrupted,
+failed-preflight or pending-finalization legacy transactions stay held. Legacy
+rollback history remains readable; it cannot authorize effects without qualified
+hook terminal authority. An older pinned coordinator without protocol support
+fails the initial preflight before backup or service changes. These source rules
+still require installed-guest upgrade/recovery acceptance.
 
 Native x86_64 UEFI/Secure Boot build work is present; tested vTPM enrollment and unattended encrypted-storage reboot on both selected hypervisors remain required. The GitHub transaction also carries compatible management-software generations with exact AIDE renewal; baseline/SCAP policy migrations, checker changes and broad OS package recipes remain separate unfinished work. These are explicit candidate limitations, not accepted all-software update coverage.
 

@@ -192,13 +192,18 @@ class HostRuntime:
         return result
 
     def integrity(self, action, direction="forward"):
-        function = getattr(aide.Aide(), "authorized_update_" + action, None)
-        if function is None:
-            raise Refused("Host update requires installed authorized-change AIDE integration")
-        result = function(self.stage, self.plan_path, **({"direction": direction} if action != "prepare" else {}))
-        if not isinstance(result, dict) or result.get("ok") is not True:
-            raise Refused("Authorized host integrity acceptance did not pass")
-        return result
+        if action not in {"prepare", "accept"} or direction not in {"forward", "rollback"}:
+            raise Refused("Unknown fixed host integrity operation")
+        def perform():
+            function = getattr(aide.Aide(), "authorized_update_" + action, None)
+            if function is None:
+                raise Refused("Host update requires installed authorized-change AIDE integration")
+            result = function(self.stage, self.plan_path, **({"direction": direction} if action != "prepare" else {}))
+            if not isinstance(result, dict) or result.get("ok") is not True:
+                raise Refused("Authorized host integrity acceptance did not pass")
+            return result
+        label = "host-integrity-" + action + ("-" + direction if action == "accept" else "")
+        return self.lifecycle.component_operation(self.stage, label, perform)
 
     def preflight(self):
         self.phase("update-preflight")

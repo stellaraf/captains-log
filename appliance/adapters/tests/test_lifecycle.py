@@ -81,7 +81,7 @@ class LifecycleTests(unittest.TestCase):
                          "artifacts": [{"name": "app.oci", "bytes": artifact.stat().st_size, "sha256": digest_file(artifact)}]}
         atomic_json(self.stage / "manifest.json", self.manifest)
         self.transaction = {"release": str(self.stage), "manifest_sha256": digest_file(self.stage / "manifest.json"),
-                            "state": "preflight", "previous": {"components": {"nebulalog": {"version": "0.1.0"}}}}
+                            "state": "preflight", "hook_protocol": 1, "sequence": 2, "previous": {"components": {"nebulalog": {"version": "0.1.0"}}}}
         atomic_json(self.root / "manager/updates/transaction.json", self.transaction)
         self.commands = Commands()
         self.manager = Lifecycle({"schema_revision": "1"}, self.commands, state=self.root / "manager/updates",

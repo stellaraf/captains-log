@@ -402,7 +402,13 @@ class PollTests(unittest.TestCase):
             nonlocal once
             if Path(argv[0]).name == "update-health" and once:
                 once = False
-                return '{"ok":true,"checks":{"ingestion":false}}'
+                self.calls.append("update-health")
+                from nebulalog_manager.host_dispatch import HookJournal
+                journal = HookJournal(Path(argv[1]), self.manager.status()["transaction"])
+                ticket = journal.enter("update-health")
+                result = {"ok": True, "checks": {"ingestion": False}}
+                journal.finish(ticket, "success", result=result)
+                return json.dumps(result)
             return original(argv, **kwargs)
         self.manager.runner = runner
         self.assertEqual(self.poll()["status"], "blocked")

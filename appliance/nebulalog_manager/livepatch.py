@@ -357,6 +357,9 @@ def apply_bundle(bundle, state, public_key, *, health_check=None, runner=run, no
                 if (not isinstance(record, dict) or record.get('state') not in terminal
                         or record.get('finalization', 'complete') != 'complete'):
                     raise Refused('Existing appliance maintenance requires recovery before livepatch')
+                if path == state / 'transaction.json':
+                    from .updates import UpdateManager
+                    UpdateManager(state)._guard_hooks(record, Path(record.get('release', '')), legacy_accepted=True)
         if (state.parent / 'maintenance.json').exists():
             raise Refused('Existing appliance maintenance has not been released')
         sequence, previous = 0, None

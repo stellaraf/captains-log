@@ -299,14 +299,22 @@ class TransactionTests(unittest.TestCase):
             nonlocal health_count
             if argv[0]=="openssl":return run(argv,**kwargs)
             name=Path(argv[0]).name;calls.append(name)
-            if name==fail:raise Refused("simulated adapter failure")
-            if name=="update-backup":return json.dumps({"ok":True,"postgresql":True,"configuration":True})
+            from nebulalog_manager.host_dispatch import HookJournal
+            journal=HookJournal(Path(argv[1]),json.loads((state/"transaction.json").read_text()))
+            ticket=journal.enter(name)
+            def result(value):
+                journal.finish(ticket,"success",result=value)
+                return json.dumps(value)
+            if name==fail:
+                journal.finish(ticket,"failed")
+                raise Refused("simulated adapter failure")
+            if name=="update-backup":return result({"ok":True,"postgresql":True,"configuration":True})
             if name=="update-health":
                 health_count+=1
                 checks={k:True for k in REQUIRED_CHECKS}
                 if fail=="health-once" and health_count==1:checks["ingestion"]=False
-                return json.dumps({"ok":True,"checks":checks})
-            return '{"ok":true}'
+                return result({"ok":True,"checks":checks})
+            return result({"ok":True})
         return UpdateManager(state,hooks,runner),calls
     def install(self,manager):
         with patch("nebulalog_manager.updates.require_linux_root"),patch("nebulalog_manager.updates.trusted_file",side_effect=lambda p:p):
@@ -342,14 +350,11 @@ class TransactionTests(unittest.TestCase):
 
     def interrupted_preflight(self):
         manager, calls = self.setup_manager()
-        runner = manager.runner
-        def interrupted(argv, **kwargs):
-            if Path(argv[0]).name == "update-preflight": raise KeyboardInterrupt("preflight interrupted")
-            return runner(argv, **kwargs)
-        manager.runner = interrupted
-        with self.assertRaises(KeyboardInterrupt): self.install(manager)
+        # This interruption occurs before dispatch publication, not inside a
+        # running adapter. Only that zero-dispatch window can recapture proof.
+        with patch.object(manager, "_hook", side_effect=KeyboardInterrupt("before first dispatch")):
+            with self.assertRaises(KeyboardInterrupt): self.install(manager)
         self.assertEqual(manager.status()["transaction"]["state"], "preflight")
-        manager.runner = runner
         return manager, calls
 
     def recover(self, manager):
@@ -361,20 +366,15 @@ class TransactionTests(unittest.TestCase):
                 patch("nebulalog_manager.updates.trusted_file", side_effect=trusted):
             return manager.recover(self.public)
 
-    def test_recovery_rechecks_interrupted_preflight_before_restoring_host_or_stopping_services(self):
+    def test_recovery_rechecks_undispatched_preflight_before_restoring_host_or_stopping_services(self):
         manager, calls = self.interrupted_preflight()
         runner = manager.runner
-        interrupts = [True, False]
         def preflight(argv, **kwargs):
             if Path(argv[0]).name == "update-preflight":
                 self.assertEqual(manager.status()["transaction"]["state"], "preflight")
-                if interrupts.pop(0): raise KeyboardInterrupt("second preflight interruption")
                 atomic_json(Path(argv[1]) / "adapter-backup-intent.json", {"fixture": True})
             return runner(argv, **kwargs)
         manager.runner = preflight
-        with self.assertRaises(KeyboardInterrupt): self.recover(manager)
-        self.assertEqual(manager.status()["transaction"]["state"], "preflight")
-        self.assertEqual(calls, [])
         result = self.recover(manager)
         self.assertEqual(result["state"], "rolled_back")
         self.assertEqual(calls, ["update-preflight", "update-rollback", "update-health", "update-finalize"])
@@ -441,6 +441,10 @@ class TransactionTests(unittest.TestCase):
             if Path(argv[0]).name=="update-finalize":
                 calls.append("update-finalize")
                 self.assertEqual(manager.status()["transaction"]["state"],"committed")
+                from nebulalog_manager.host_dispatch import HookJournal
+                journal=HookJournal(Path(argv[1]),manager.status()["transaction"])
+                ticket=journal.enter("update-finalize")
+                journal.finish(ticket,"success",result={"ok":True})
                 return '{"ok":true}'
             return original(argv,**kwargs)
         manager.runner=recovered

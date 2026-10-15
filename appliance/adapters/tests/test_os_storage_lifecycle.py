@@ -247,7 +247,12 @@ class OSStorageLifecycleTests(TestCase):
         self.manager._os_preflight_context = Mock(return_value={"boot_id": BOOT})
         self.manager.health = Mock(return_value={"ok": True, "checks": CHECKS})
         state = self.root / "manager"
-        atomic_json(state / "updates/transaction.json", {"state": "preflight_failed"})
+        from nebulalog_manager.host_dispatch import HookJournal
+        component = HookJournal(self.stage, self.transaction)
+        ticket = component.begin("update-preflight", {"fixture": "known failed preflight"})
+        component.enter("update-preflight")
+        component.finish(ticket, "failed")
+        atomic_json(state / "updates/transaction.json", {**self.transaction, "state": "preflight_failed"})
         policy = self.root / "maintenance-policy.json"
         atomic_json(policy, {"automatic_os_updates": True, "timezone": "UTC"})
         calls = []

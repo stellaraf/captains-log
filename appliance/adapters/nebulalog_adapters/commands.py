@@ -11,13 +11,16 @@ ENVIRONMENT = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root", "LANG":
 
 
 class Commands:
-    def __init__(self, *, inherited_locks=(), observer=None):
+    def __init__(self, *, inherited_locks=(), observer=None, failure_observer=None):
         # Only an exact protected lock already owned by this process may cross
         # exec. Children retain its flock if their lifecycle parent disappears.
         self.inherited_locks = tuple(inherited_locks)
         if observer is not None and not callable(observer):
             raise Refused("Lifecycle command observer must be callable")
+        if failure_observer is not None and not callable(failure_observer):
+            raise Refused("Lifecycle command failure observer must be callable")
         self.observer = observer
+        self.failure_observer = failure_observer
         self._inherited_fds()
 
     def _inherited_fds(self):
@@ -45,7 +48,11 @@ class Commands:
         result = subprocess.run(argv, input=input, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 timeout=timeout, check=False, env=ENVIRONMENT, pass_fds=descriptors)
         if result.returncode:
-            raise CommandFailed(Path(argv[0]).name, result.returncode)
+            if self.failure_observer:
+                self.failure_observer("call", ticket=ticket, returncode=result.returncode)
+            failure = CommandFailed(Path(argv[0]).name, result.returncode)
+            failure.execution_ticket = ticket
+            raise failure
         if self.observer:
             self.observer("complete", "call", ticket=ticket)
         if len(result.stdout) > 16 * 1024 * 1024:
@@ -63,6 +70,8 @@ class Commands:
                 output.flush()
                 os.fsync(output.fileno())
             if result.returncode:
+                if self.failure_observer:
+                    self.failure_observer("capture", ticket=ticket, returncode=result.returncode)
                 raise CommandFailed(Path(argv[0]).name, result.returncode)
             if self.observer:
                 self.observer("complete", "capture", ticket=ticket)
@@ -80,6 +89,8 @@ class Commands:
                                     stderr=subprocess.DEVNULL, timeout=timeout, check=False, env=ENVIRONMENT,
                                     pass_fds=descriptors)
         if result.returncode:
+            if self.failure_observer:
+                self.failure_observer("feed", ticket=ticket, returncode=result.returncode)
             raise CommandFailed(Path(argv[0]).name, result.returncode)
         if self.observer:
             self.observer("complete", "feed", ticket=ticket)

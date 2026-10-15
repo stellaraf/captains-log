@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 from urllib.request import build_opener, HTTPSHandler, ProxyHandler, Request
 import uuid
 
-from nebulalog_manager import aide, kernel_boot, kernel_integrity, kernel_retention, kernel_retention_integration, kernel_updates, os_payload
+from nebulalog_manager import host_dispatch, aide, kernel_boot, kernel_integrity, kernel_retention, kernel_retention_integration, kernel_updates, os_payload
 from nebulalog_manager.backup import _encrypted_staging
 from nebulalog_manager.baseline import Baseline, _json as baseline_json, rule_results
 from nebulalog_manager.common import CommandFailed, Refused, atomic_json, audit, locked, require_linux_root, trusted_file
@@ -1022,8 +1022,59 @@ END $fence$; SELECT 'fenced';"""
                          "--config-file=/etc/nebulalog/clickhouse-client.xml", "--max_execution_time=15",
                          "--query", query, *params], timeout=30)
 
+    def component_hook(self, name, stage):
+        """Publish terminal evidence only after all method effects have ended."""
+        if name not in host_dispatch.HOOK_STATES:
+            raise Refused("Unknown component hook")
+        _, transaction = self.release(stage)
+        journal = host_dispatch.HookJournal(stage, transaction)
+        with locked(stage / "component-hook-lease.lock") as descriptor:
+            ticket = journal.enter(name)
+            original = self.cmd
+            self._component_ticket = ticket
+            if type(original) is Commands:
+                self.cmd = Commands(inherited_locks=((descriptor, stage / "component-hook-lease.lock"),),
+                    observer=lambda phase, kind, **details: journal.command_event(ticket, phase, kind,
+                        scap=getattr(self, "_component_scap", None), **details),
+                    failure_observer=lambda kind, **details: journal.command_event(ticket, "failed", kind, **details))
+            try:
+                result = getattr(self, name.removeprefix("update-"))(stage)
+            except BaseException:
+                # If any native acknowledgement is missing, finish refuses and
+                # leaves the hook unresolved. No timeout/PID inference is used.
+                journal.finish(ticket, "failed")
+                raise
+            else:
+                journal.finish(ticket, "success" if result.get("ok") is True else "failed", result=result)
+                return result
+            finally:
+                self.cmd = original
+                del self._component_ticket
+
+    def component_operation(self, stage, label, operation):
+        """Fence fixed helpers that use their own native-command implementation."""
+        if label not in {"host-integrity-prepare", "host-integrity-accept-forward", "host-integrity-accept-rollback"}:
+            raise Refused("Unknown compound component operation")
+        ticket = getattr(self, "_component_ticket", None)
+        if ticket is None:
+            if type(self.cmd) is Commands:
+                raise Refused("Compound component operation requires an active exact hook")
+            return operation()  # Injected native boundary in source fixtures only.
+        _, transaction = self.release(stage)
+        journal = host_dispatch.HookJournal(stage, transaction)
+        command = journal.command_event(ticket, "dispatch", "call", argv=["fixed-compound", label])
+        result = operation()
+        # The fixed helper must validate its complete acceptance before return.
+        journal.command_event(ticket, "complete", "call", ticket=command)
+        return result
+
+    def _component_guard(self, stage, transaction):
+        return host_dispatch.HookJournal(stage, transaction).assert_settled(
+            allow=getattr(self, "_component_ticket", None))
+
     def preflight(self, stage):
         release, transaction = self.release(stage)
+        self._component_guard(stage, transaction)
         self.encrypted()
         if (self.data / "manager/maintenance.json").exists():
             raise Refused("Existing maintenance requires completion before another component update")
@@ -1119,6 +1170,7 @@ END $fence$; SELECT 'fenced';"""
     def preactivation_recover(self, stage):
         """Resume only proven unchanged code; never restore an incomplete dump."""
         release, transaction = self.release(stage)
+        self._component_guard(stage, transaction)
         if (transaction.get("activation_started") is not False
                 or transaction.get("state") not in {"rolling_back", "recovery_required"}):
             raise Refused("Unchanged-runtime recovery requires a durable preactivation transaction")
@@ -1160,7 +1212,8 @@ END $fence$; SELECT 'fenced';"""
     def backup(self, stage, *, os_backup=False, retain_maintenance=False, maintenance_owner=None):
         release = {}
         if not os_backup:
-            release, _ = self.release(stage)
+            release, transaction = self.release(stage)
+            self._component_guard(stage, transaction)
         owner = maintenance_owner or stage
         if retain_maintenance:
             marker = json.loads(trusted_file(self.data / "manager/maintenance.json").read_text())
@@ -1499,7 +1552,21 @@ END $fence$; SELECT 'fenced';"""
                 raise Refused("Retained assessment policy differs from the installed selection")
             def bounded(argv, **kwargs):
                 kwargs["timeout"] = min(kwargs.get("timeout", 120), 900)
-                return self.cmd(argv, **kwargs)
+                ticket = getattr(self, "_component_ticket", None)
+                evaluation = ticket is not None and argv[:3] == ["oscap", "xccdf", "eval"]
+                if not evaluation:
+                    return self.cmd(argv, **kwargs)
+                _, transaction = self.release(stage)
+                journal = host_dispatch.HookJournal(stage, transaction)
+                self._component_scap = journal.scap_authority(manager.policy_path, argv)
+                try:
+                    return self.cmd(argv, **kwargs)
+                except CommandFailed as failure:
+                    if failure.returncode == 2:
+                        journal.acknowledge_scap(ticket, getattr(failure, "execution_ticket", None), argv)
+                    raise
+                finally:
+                    del self._component_scap
             manager = Baseline(directory, runner=bounded)
             scanned = record.get("scan_complete") is not True
             if scanned:
@@ -1639,6 +1706,7 @@ END $fence$; SELECT 'fenced';"""
 
     def finalize(self, stage):
         release, transaction = self.release(stage)
+        self._component_guard(stage, transaction)
         if transaction.get("state") not in ("committed", "rolled_back"):
             raise Refused("Maintenance cannot end before a durable completed transaction")
         health = json.loads(trusted_file(stage / "adapter-health.json").read_text())

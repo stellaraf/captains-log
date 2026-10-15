@@ -24,7 +24,7 @@ def main():
         if len(sys.argv) != (2 if name in STAGED else 1):
             raise Refused("Unexpected lifecycle arguments")
         manager = Lifecycle(load_config())
-        result = getattr(manager, STAGED[name])(Path(sys.argv[1])) if name in STAGED else getattr(manager, HOST[name])()
+        result = manager.component_hook(name, Path(sys.argv[1])) if name in STAGED else getattr(manager, HOST[name])()
         print(json.dumps(result, sort_keys=True))
         return 0 if result.get("ok") is True else 1
     except Exception as exc:

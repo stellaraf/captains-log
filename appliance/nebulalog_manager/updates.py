@@ -220,13 +220,20 @@ class UpdateManager:
         os_path = self.state.parent / "os-transaction.json"
         os_transaction = json.loads(os_path.read_text()) if os_path.exists() else None
         os_pending = os_maintenance_pending(os_transaction)
-        interrupted = bool(record and record.get("state") in {"preflight", "preparing", "activating", "checking", "rolling_back", "recovery_required"})
+        hook_unsettled = False
+        if record:
+            try:
+                self._guard_hooks(record, Path(record["release"]), legacy_accepted=True)
+            except (Refused, OSError, KeyError, ValueError, TypeError):
+                hook_unsettled = True
+        interrupted = hook_unsettled or bool(record and record.get("state") in {"preflight", "preparing", "activating", "checking", "rolling_back", "recovery_required"})
         recovery = "nebulalog update finalize" if pending else "nebulalog update recover" if interrupted else None
         return {"current": json.loads(current.read_text()) if current.exists() else {"sequence": 0, "components": {}},
                 "enrollment": enrollment_status(self.state),
                 "transaction": record, "maintenance_release_pending": pending,
                 "recovery_action": None if os_pending else recovery,
-                "recovery_blocked_by": "os_update" if os_pending and recovery else None,
+                "recovery_blocked_by": "os_update" if os_pending and recovery else "hook_outcome" if hook_unsettled else None,
+                "hook_outcome_unsettled": hook_unsettled,
                 "os_transaction": os_transaction}
 
     def _retain_host_refusal(self, transaction: dict, stage: Path):
@@ -245,19 +252,55 @@ class UpdateManager:
         except (OSError, ValueError, Refused):
             return
 
+    def _guard_hooks(self, transaction, stage, *, legacy_accepted=False):
+        # A previously accepted legacy release is a bridge starting point only;
+        # this never invents terminal evidence for interrupted legacy work.
+        if (legacy_accepted and "hook_protocol" not in transaction
+                and transaction.get("state") == "committed" and transaction.get("finalization") == "complete"):
+            if any(stage.glob("component-hook-*")) or any(stage.glob("component-command-*")):
+                raise Refused("Legacy component history contains new-protocol execution evidence")
+            if (transaction.get("release") != str(stage) or stage.resolve().parent != (self.state / "releases").resolve()
+                    or digest_file(trusted_file(stage / "manifest.json")) != transaction.get("manifest_sha256")):
+                raise Refused("Legacy accepted component history changed")
+            current = json.loads(trusted_file(self.state / "current.json").read_text())
+            if current.get("sequence") != transaction.get("sequence") or current.get("release") != str(stage):
+                raise Refused("Legacy accepted component history is not the current release")
+            if os.path.lexists(self.state.parent / "maintenance.json"):
+                raise Refused("Legacy component history still owns maintenance")
+            gate = self.state.parent / "storage-maintenance/gate.json"
+            if os.path.lexists(gate):
+                observed = json.loads(trusted_file(gate).read_text())
+                if (observed != {"schema": 1, "held": False, "delivery_held": False, "operation": None}
+                        or type(observed.get("schema")) is not int or observed.get("held") is not False
+                        or observed.get("delivery_held") is not False):
+                    raise Refused("Legacy accepted history has an unsettled storage hold")
+            return 0
+        return host_dispatch.HookJournal(stage, transaction).assert_settled()
+
     def _hook(self, name: str, release: Path) -> dict:
         transaction = json.loads((self.state / "transaction.json").read_text())
+        journal = host_dispatch.HookJournal(release, transaction)
         manifest = json.loads((release / "manifest.json").read_text())
-        if "host" in manifest.get("components", {}):
+        host = "host" in manifest.get("components", {})
+        if host:
             if self.state != host_dispatch.STATE or transaction.get("host_update") is not True:
                 raise Refused("Host update requires the fixed enrolled manager and coordinator pin")
+            command = host_dispatch.hook_command(transaction.get("host_coordinator"), name, release)
+            executor = {"coordinator": transaction["host_coordinator"], "command": command}
+        else:
+            path = trusted_file(self.hooks / name)
+            executor = {"path": str(path), "sha256": digest_file(path)}
+        ticket = journal.begin(name, executor)
+        if host:
             result = host_dispatch.run_hook(transaction.get("host_coordinator"), name, release)
-            self._host_evidence(result, name, release)
-            return result
-        path = trusted_file(self.hooks / name)
-        result = json.loads(self.runner([str(path), str(release)], timeout=3600))
+        else:
+            result = json.loads(self.runner([str(path), str(release)], timeout=3600))
+        # JSON success alone cannot settle a lost hook or delegated native job.
+        journal.successful_result(ticket, result)
         if not isinstance(result, dict) or result.get("ok") is not True:
             raise Refused(f"Appliance {name} did not report success")
+        if host:
+            self._host_evidence(result, name, release)
         return result
 
     def _host_evidence(self, result: dict, name: str, stage: Path):
@@ -286,6 +329,7 @@ class UpdateManager:
             raise Refused("Measured host runtime does not match the durable selected generation")
 
     def _restore_host(self, transaction: dict, stage: Path):
+        self._guard_hooks(transaction, stage)
         if transaction.get("host_update") is True:
             host_activation.restore_previous(stage)
 
@@ -297,6 +341,7 @@ class UpdateManager:
         """A failed maintenance release never reverses an already accepted update."""
         if transaction.get("state") not in ("committed", "rolled_back"):
             raise Refused("Only a durably completed component transaction may finalize")
+        self._guard_hooks(transaction, stage)
         transaction["finalization"] = "pending"
         atomic_json(self.state / "transaction.json", transaction)
         try:
@@ -337,6 +382,7 @@ class UpdateManager:
             transaction = status["transaction"]
             if not transaction or transaction.get("state") not in ("committed", "rolled_back"):
                 raise Refused("No completed component transaction is awaiting finalization")
+            self._guard_hooks(transaction, Path(transaction["release"]), legacy_accepted=True)
             if transaction.get("finalization") == "complete":
                 return transaction
             # Expiry blocks new activation, not recovering access to software that
@@ -368,6 +414,11 @@ class UpdateManager:
                 raise Refused("OS maintenance or reboot recovery must finish before a component update")
             if status["transaction"] and status["transaction"].get("state") not in ("committed", "rolled_back", "preflight_failed"):
                 raise Refused("An interrupted or failed update requires recovery before another install")
+            if status["transaction"]:
+                prior = status["transaction"]
+                if "hook_protocol" not in prior:
+                    self._retained_release(prior, public_key, finalization=True)
+                self._guard_hooks(prior, Path(prior["release"]), legacy_accepted=True)
             current = status["current"]
             release = verify_release(manifest, signature, public_key, bundle,
                                      current_sequence=current["sequence"],
@@ -402,7 +453,7 @@ class UpdateManager:
                            current_sequence=current["sequence"], runner=self.runner)
             transaction = {"state": "preflight", "sequence": release["sequence"], "previous": current,
                            "release": str(stage), "manifest_sha256": release["manifest_sha256"],
-                           "activation_started": False}
+                           "activation_started": False, "hook_protocol": 1}
             if host_update:
                 transaction["host_update"] = True
             def record(state):
@@ -426,7 +477,12 @@ class UpdateManager:
                 # gate is authoritative even if the hook was killed before a receipt.
                 if host_update:
                     self._retain_host_refusal(transaction, stage)
-                record("recovery_required" if (self.state.parent / "maintenance.json").exists() else "preflight_failed")
+                unresolved = False
+                try:
+                    self._guard_hooks(transaction, stage)
+                except (Refused, OSError, ValueError, TypeError):
+                    unresolved = True
+                record("recovery_required" if unresolved or (self.state.parent / "maintenance.json").exists() else "preflight_failed")
                 raise
             try:
                 record("preparing")
@@ -489,6 +545,7 @@ class UpdateManager:
             if not transaction or transaction.get("state") != "committed" or not transaction.get("previous"):
                 raise Refused("No last committed reversible transaction is available")
             stage, release = self._retained_release(transaction, public_key)
+            self._guard_hooks(transaction, stage)
             if any(not c["rollback_safe"] for c in release["components"].values()):
                 raise Refused("Release does not permit this rollback")
             transaction["state"] = "rolling_back"
@@ -534,6 +591,7 @@ class UpdateManager:
             if os_maintenance_pending(os_transaction):
                 raise Refused("OS recovery must finish before component recovery")
             stage, _ = self._retained_release(transaction, public_key, recovery=True)
+            completed_hooks = self._guard_hooks(transaction, stage)
             intent = stage / "adapter-backup-intent.json"
             if transaction.get("activation_started") is False and not os.path.lexists(intent):
                 # A crash before preflight finished has not authorized backup,
@@ -550,7 +608,7 @@ class UpdateManager:
                 gate_idle = (isinstance(observed_gate, dict) and observed_gate == idle
                     and type(observed_gate["schema"]) is int and observed_gate["held"] is False
                     and observed_gate["delivery_held"] is False)
-                if (transaction.get("state") != "preflight"
+                if (completed_hooks != 0 or transaction.get("state") != "preflight"
                         or os.path.lexists(self.state.parent / "maintenance.json")
                         or any(os.path.lexists(stage / name) for name in forbidden)
                         or not gate_idle):
