@@ -47,4 +47,20 @@ transaction provides real package/boot evidence for developing the kernel
 recipe; it is not acceptance of the automatic update manager. See the dated
 measurements in [FIPS qualification](FIPS.md#october-15-vendor-kernel-qualification).
 
-The public [Red Hat knowledgebase entry 7134366](https://access.redhat.com/solutions/7134366) recognizes the same HKDF extraction failure class during FIPS boot in RHEL 9/10 and remains labeled “Solution In Progress.” Its full subscriber-only guidance was not accessed. The installed Rocky kernel is `5.14.0-687.45.1.el9_8.x86_64`; the live [Rocky 9 BaseOS package index](https://download.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/Packages/k/) and the configured repositories provided no newer x86_64 kernel during this qualification. [RHSA-2026:64808](https://access.redhat.com/errata/RHSA-2026:64808), issued September 8, 2026, ships this same kernel version for other listed security fixes. No supported fixed Rocky package for the observed HKDF failure was verified. This does not exclude subscriber-only guidance or a later vendor fix.
+The earlier September qualification used `5.14.0-687.45.1.el9_8.x86_64`;
+the configured repositories provided no newer x86_64 kernel at that time.
+[RHSA-2026:64808](https://access.redhat.com/errata/RHSA-2026:64808), issued
+September 8, ships that version for other listed security fixes. The October
+qualification above supersedes that earlier package-availability observation.
+
+On October 15, source analysis of the signed `687.56.1` and `687.57.1` Rocky
+source RPMs found byte-identical `crypto/hkdf.c` and `crypto/hmac.c`: the first
+HKDF vector's 13-byte salt reaches a generic HMAC FIPS minimum of 14 bytes,
+which returns `-EINVAL` before SHA driver computation. The public
+[Red Hat knowledgebase entry 7134366](https://access.redhat.com/solutions/7134366)
+matches this failure class, was updated September 14, and still showed
+“Solution In Progress” when checked October 15. Subscriber-only guidance was
+not accessed, and no supported vendor fix or CPU-setting remedy was verified.
+The signed-source comparison and references are retained in
+`outputs/vendor-hkdf-analysis-20261015/vendor-remedy-analysis.json` in the
+private T9 build root; this analysis does not relax any acceptance gate.

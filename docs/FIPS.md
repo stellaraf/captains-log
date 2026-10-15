@@ -29,12 +29,24 @@ establish successful automatic OS updating, appliance enrollment, encrypted
 unattended reboot, or VMware/Nutanix acceptance. The product decision remains
 vendor-supplied Rocky kernels; the self-test gate has not been bypassed.
 
+Source analysis of the vendor-signed Rocky source RPMs found `crypto/hkdf.c`
+and `crypto/hmac.c` byte-identical in `687.56.1` and `687.57.1`. The first
+SHA-256 HKDF vector passes a 13-byte salt as the HMAC key; the generic HMAC
+FIPS check requires at least 14 bytes and returns `-EINVAL` before the selected
+SHA driver runs. This explains the observed failure without attributing it to
+the virtual CPU. The public [Red Hat issue 7134366](https://access.redhat.com/solutions/7134366),
+updated September 14 and checked October 15, remains “Solution In Progress”
+and reports the matching failure with SHA-NI. Its subscriber-only guidance
+was not accessed. No supported vendor remedy has been verified.
+
 Retained evidence in the private T9 build root:
 
 - `outputs/vendor-kernel-687.57.1/qualification-result.json`
 - `outputs/vendor-kernel-687.57.1/native-qualification.json`
 - `outputs/vendor-kernel-687.57.1/kernel-journal.log`
 - `outputs/vendor-kernel-687.57.1/recovery-original/`
+- `outputs/vendor-hkdf-analysis-20261015/vendor-remedy-analysis.json`
+- `outputs/vendor-hkdf-analysis-20261015/source-687.57.1-receipt.json`
 
 ## October 12 local qualification evidence
 

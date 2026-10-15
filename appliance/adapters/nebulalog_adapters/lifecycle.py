@@ -854,7 +854,32 @@ class Lifecycle:
             audit(self.data / "manager/audit.jsonl", "os.recovery_verified", reboot_pending=reboot)
             return self.receipt(stage, "os-recover", checks=result["checks"], status=completed["status"], reboot_pending=reboot)
 
-    def unlock_readiness(self):
+    def _reboot_binding(self, latest, transaction, *, new_boot=False):
+        """Bind a reboot action to its recovery directory and original boot."""
+        try:
+            stage = Path(latest["stage"])
+            original_boot = latest["boot_id"]
+            valid_boot = str(uuid.UUID(original_boot)) == original_boot
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise Refused("OS reboot is not bound to a valid recovery operation") from None
+        parent = self.data / "manager/os-updates"
+        if (not valid_boot or not stage.is_absolute() or stage.is_symlink() or not stage.is_dir()
+                or stage.parent != parent or stage.resolve().parent != parent.resolve()
+                or transaction.get("stage") != str(stage) or transaction.get("boot_id") != original_boot):
+            raise Refused("OS reboot is not bound to the exact recovery operation")
+        current_boot = self.boot_id()
+        if new_boot and current_boot == original_boot:
+            raise Refused("Reboot completion requires a different observed boot identity")
+        if not new_boot and current_boot != original_boot:
+            raise Refused("OS reboot preparation or abort requires the original boot")
+        marker = self.data / "manager/maintenance.json"
+        if os.path.lexists(marker):
+            owner = json.loads(trusted_file(marker).read_text())
+            if owner.get("active") is not True or owner.get("release") != str(stage):
+                raise Refused("Another transaction owns appliance maintenance")
+        return stage, current_boot
+
+    def unlock_readiness(self, candidate_kernel=None):
         if self.config.get("unattended_reboot") is not True:
             raise Refused("Unattended reboot has not been enabled after unlock qualification")
         uuids = set()
@@ -866,9 +891,12 @@ class Lifecycle:
             uuids.update(node["uuid"] for node in walk(tree["blockdevices"]) if node.get("fstype") == "crypto_LUKS")
         if not uuids:
             raise Refused("Cannot establish encrypted boot/data ancestry")
-        candidate = self.cmd(["grubby", "--default-kernel"])
-        if not re.fullmatch(r"/boot/vmlinuz-[A-Za-z0-9._+-]+", candidate):
-            raise Refused("Unrecognized default boot kernel")
+        # A candidate may be selected for one boot while the recovery kernel
+        # remains the persistent default. Inspect the actual intended initramfs.
+        candidate = candidate_kernel if candidate_kernel is not None else self.cmd(["grubby", "--default-kernel"])
+        if not isinstance(candidate, str) or not re.fullmatch(r"/boot/vmlinuz-[A-Za-z0-9._+-]+", candidate):
+            raise Refused("Unrecognized selected boot kernel")
+        trusted_file(Path(candidate))
         initrd = trusted_file(Path(candidate.replace("vmlinuz-", "initramfs-") + ".img"))
         crypttab = self.cmd(["lsinitrd", "--file", "/etc/crypttab", str(initrd)], timeout=120)
         for identity in sorted(uuids):
@@ -897,25 +925,33 @@ class Lifecycle:
         self.guard()
         self.encrypted()
         latest = json.loads(trusted_file(self.data / "manager/os-latest.json").read_text())
-        stage = Path(latest["stage"])
-        if stage.is_symlink() or stage.resolve().parent != (self.data / "manager/os-updates").resolve():
-            raise Refused("OS recovery directory is outside the manager")
-        observed = datetime.fromisoformat(latest["observed_at"])
-        if (datetime.now(timezone.utc) - observed).total_seconds() > 7200:
-            raise Refused("OS recovery backup is stale")
+        transaction = json.loads(trusted_file(self.data / "manager/os-transaction.json").read_text())
+        stage, boot_id = self._reboot_binding(latest, transaction)
+        if (latest.get("state") != "postcheck_passed" or transaction.get("state") != "reboot_preparing"
+                or transaction.get("reboot_pending") is not True
+                or any(transaction.get("health", {}).get(name) is not True for name in REQUIRED_CHECKS)):
+            raise Refused("OS reboot preparation requires the accepted pending reboot transaction")
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(latest["observed_at"])).total_seconds()
+        except (KeyError, TypeError, ValueError):
+            raise Refused("OS recovery backup timestamp is invalid") from None
+        if not 0 <= age <= 7200:
+            raise Refused("OS recovery backup is stale or dated in the future")
         self.checked_backup(stage)
         unlock = self.unlock_readiness()
         local_auth(self.config)
-        boot_id = self.boot_id()
         self.maintenance(True, stage)
         try:
             self.service("stop", tuple(reversed(self.services)))
             self.cmd(["sync", "-f", str(self.data)], timeout=120)
         except BaseException:
-            self.service("start", self.services)
-            self.api_ready()
-            local_auth(self.config)
-            self.maintenance(False, stage)
+            # A successful restart alone is not runtime/security acceptance.
+            # Keep the durable gate for os_recover, which checks every required
+            # health contract before releasing it.
+            try:
+                self.service("start", self.services)
+            except Exception as exc:
+                audit(self.data / "manager/audit.jsonl", "os.reboot_prepare_restart_failed", error=type(exc).__name__)
             raise
         atomic_json(self.data / "manager/os-latest.json", {**latest, "state": "reboot_prepared", "boot_id": boot_id})
         return self.receipt(stage, "reboot-prepare", unlock=unlock, services_stopped=list(self.services), boot_id=boot_id)
@@ -924,9 +960,11 @@ class Lifecycle:
         self.guard()
         self.encrypted()
         latest = json.loads(trusted_file(self.data / "manager/os-latest.json").read_text())
-        stage = Path(latest["stage"])
-        if stage.is_symlink() or stage.resolve().parent != (self.data / "manager/os-updates").resolve() or latest.get("state") != "reboot_prepared":
+        transaction = json.loads(trusted_file(self.data / "manager/os-transaction.json").read_text())
+        stage, _ = self._reboot_binding(latest, transaction)
+        if latest.get("state") != "reboot_prepared" or transaction.get("state") != "reboot_requested":
             raise Refused("No operation-owned prepared reboot can be aborted")
+        self.checked_backup(stage)
         self.service("start", self.services)
         result = self.health(stage, os_health=True)
         if result.get("ok") is not True or any(result.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS):
@@ -955,14 +993,14 @@ class Lifecycle:
                     raise Refused("Unrecognized durable maintenance marker")
                 self.maintenance(True, Path(marker["release"]))
                 return {"ok": True, "maintenance": True, "source": "encrypted marker"}
-            for path, terminal in ((self.state / "transaction.json", ("committed", "rolled_back", "preflight_failed")),
-                                   (self.data / "manager/os-transaction.json", ("complete", "failed", "reboot_aborted"))):
+            for path, owner_key, terminal in ((self.state / "transaction.json", "release", ("committed", "rolled_back", "preflight_failed")),
+                                              (self.data / "manager/os-transaction.json", "stage", ("complete", "failed", "reboot_aborted"))):
                 if not path.exists():
                     continue
                 record = json.loads(trusted_file(path).read_text())
                 pending = record.get("state") not in terminal or record.get("finalization", "complete") != "complete"
                 if pending:
-                    self.maintenance(True, Path(record.get("release", str(self.data / "manager"))))
+                    self.maintenance(True, Path(record.get(owner_key, str(self.data / "manager"))))
                     return {"ok": True, "maintenance": True, "source": "interrupted transaction"}
             return {"ok": True, "maintenance": False, "source": "no pending transaction"}
 
@@ -970,7 +1008,7 @@ class Lifecycle:
         """Reconcile an actual new boot; never clear a gate on same-boot success."""
         self.guard()
         self.encrypted()
-        with locked(self.data / "manager/transaction.lock"):
+        with locked(self.data / "manager/transaction.lock"), locked(self.data / "manager/updates/transaction.lock"):
             path = self.data / "manager/os-latest.json"
             journal = self.data / "manager/os-transaction.json"
             if not path.exists() or not journal.exists():
@@ -979,21 +1017,20 @@ class Lifecycle:
             transaction = json.loads(trusted_file(journal).read_text())
             if transaction.get("state") == "complete" and transaction.get("finalization", "complete") == "complete":
                 return {"ok": True, "status": "not_pending"}
-            stage = Path(latest["stage"])
-            if stage.is_symlink() or stage.resolve().parent != (self.data / "manager/os-updates").resolve():
-                raise Refused("Untrusted OS recovery directory")
+            stage, current_boot = self._reboot_binding(latest, transaction, new_boot=True)
             if latest.get("state") not in ("reboot_prepared", "recovery_required", "reboot_completed") or transaction.get("state") not in ("reboot_requested", "recovery_required", "complete"):
                 raise Refused("Interrupted OS work has not reached the verified reboot phase")
-            current_boot = self.boot_id()
-            if not latest.get("boot_id") or current_boot == latest["boot_id"]:
-                raise Refused("Reboot completion requires a different observed boot identity")
             self.maintenance(True, stage)
-            result = self.health(stage, os_health=True)
-            if result.get("ok") is not True or any(result.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS):
-                atomic_json(path, {**latest, "state": "recovery_required", "observed_boot_id": current_boot})
-                atomic_json(journal, {**transaction, "state": "recovery_required", "observed_boot_id": current_boot})
+            try:
+                self.checked_backup(stage)
+                result = self.health(stage, os_health=True)
+                if result.get("ok") is not True or any(result.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS):
+                    raise Refused("New-boot runtime, security or compliance acceptance failed")
+            except Exception as exc:
+                atomic_json(path, {**latest, "state": "recovery_required", "observed_boot_id": current_boot, "error": type(exc).__name__})
+                atomic_json(journal, {**transaction, "state": "recovery_required", "observed_boot_id": current_boot, "error": type(exc).__name__})
                 audit(self.data / "manager/audit.jsonl", "os.reboot_health_failed", boot_id=current_boot)
-                raise Refused("New-boot health or local MFA failed; maintenance remains active")
+                raise Refused("New-boot recovery or health acceptance failed; maintenance remains active") from exc
             # Record a successfully booted, accepted OS before releasing maintenance.
             atomic_json(path, {**latest, "state": "reboot_completed", "observed_boot_id": current_boot})
             completed = {**transaction, "state": "complete", "finalization": "pending", "reboot_pending": False,

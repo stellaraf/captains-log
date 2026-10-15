@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import unittest
@@ -229,11 +230,14 @@ class LifecycleTests(unittest.TestCase):
     def os_reboot_fixture(self):
         stage = self.root / "manager/os-updates/os-one"
         stage.mkdir(parents=True)
+        self.manager.backup(stage, os_backup=True)
         atomic_json(self.root / "manager/os-latest.json", {"state": "reboot_prepared", "stage": str(stage),
                     "boot_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"})
-        atomic_json(self.root / "manager/os-transaction.json", {"state": "reboot_requested"})
+        atomic_json(self.root / "manager/os-transaction.json", {"state": "reboot_requested", "stage": str(stage),
+                    "boot_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"})
         self.manager.boot_id = Mock(return_value="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
         self.manager.health = Mock(return_value={"ok": True, "checks": {name: True for name in REQUIRED_CHECKS}})
+        self.manager.maintenance.reset_mock()
         return stage
 
     def os_postcheck_fixture(self):
@@ -326,6 +330,7 @@ class LifecycleTests(unittest.TestCase):
 
     def test_reboot_abort_requires_full_runtime_acceptance_before_releasing_gate(self):
         stage = self.os_reboot_fixture()
+        self.manager.boot_id.return_value = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
         self.manager.health.return_value = {"ok": True, "checks": {"api": True, "local_auth": True}}
         with self.assertRaisesRegex(Refused, "maintenance remains active"):
             self.manager.reboot_abort()
@@ -549,6 +554,149 @@ class LifecycleTests(unittest.TestCase):
         self.manager.health.assert_not_called()
         self.manager.maintenance.assert_not_called()
 
+    def test_reboot_completion_refuses_mixed_operation_and_boot_records(self):
+        self.os_reboot_fixture()
+        journal = self.root / "manager/os-transaction.json"
+        original = json.loads(journal.read_text())
+        for changed in ({"stage": str(self.stage)}, {"stage": None},
+                        {"boot_id": "cccccccc-cccc-cccc-cccc-cccccccccccc"}, {"boot_id": None}):
+            with self.subTest(changed=changed):
+                atomic_json(journal, {**original, **changed})
+                with self.assertRaisesRegex(Refused, "exact recovery operation"):
+                    self.manager.reboot_complete()
+        self.manager.health.assert_not_called()
+        self.manager.maintenance.assert_not_called()
+
+    def test_reboot_completion_never_replaces_another_maintenance_owner(self):
+        self.os_reboot_fixture()
+        marker = self.root / "manager/maintenance.json"
+        other = {"active": True, "release": str(self.stage)}
+        atomic_json(marker, other)
+        with self.assertRaisesRegex(Refused, "Another transaction owns"):
+            self.manager.reboot_complete()
+        self.assertEqual(json.loads(marker.read_text()), other)
+        self.manager.health.assert_not_called()
+        self.manager.maintenance.assert_not_called()
+
+    def test_reboot_completion_retains_gate_if_recovery_bytes_changed(self):
+        stage = self.os_reboot_fixture()
+        (stage / "recovery/keycloak.dump").write_bytes(b"changed after reboot")
+        with self.assertRaisesRegex(Refused, "maintenance remains active"):
+            self.manager.reboot_complete()
+        self.manager.health.assert_not_called()
+        self.manager.maintenance.assert_called_once_with(True, stage)
+        self.assertEqual(json.loads((self.root / "manager/os-transaction.json").read_text())["state"], "recovery_required")
+        self.assertTrue((stage / "adapter-backup-inventory.json").exists())
+
+    def test_reboot_abort_refuses_other_boot_or_operation_before_service_start(self):
+        self.os_reboot_fixture()
+        self.manager.service = Mock()
+        with self.assertRaisesRegex(Refused, "original boot"):
+            self.manager.reboot_abort()
+        self.manager.boot_id.return_value = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        journal = self.root / "manager/os-transaction.json"
+        atomic_json(journal, {**json.loads(journal.read_text()), "stage": str(self.stage)})
+        with self.assertRaisesRegex(Refused, "exact recovery operation"):
+            self.manager.reboot_abort()
+        self.manager.service.assert_not_called()
+        self.manager.health.assert_not_called()
+        self.manager.maintenance.assert_not_called()
+
+    def reboot_preparation_fixture(self):
+        stage = self.os_reboot_fixture()
+        self.manager.boot_id.return_value = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        atomic_json(self.root / "manager/os-latest.json", {"state": "postcheck_passed", "stage": str(stage),
+                    "boot_id": self.manager.boot_id(), "observed_at": datetime.now(timezone.utc).isoformat()})
+        atomic_json(self.root / "manager/os-transaction.json", {"state": "reboot_preparing", "stage": str(stage),
+                    "boot_id": self.manager.boot_id(), "reboot_pending": True,
+                    "health": {name: True for name in REQUIRED_CHECKS}})
+        self.manager.unlock_readiness = Mock(return_value={"token_test": True})
+        self.manager.service = Mock()
+        return stage
+
+    def test_reboot_preparation_requires_current_accepted_pending_transaction(self):
+        self.reboot_preparation_fixture()
+        journal = self.root / "manager/os-transaction.json"
+        original = json.loads(journal.read_text())
+        for changed in ({"state": "postcheck"}, {"reboot_pending": False}, {"health": {}},
+                        {"health": {name: name != "local_auth" for name in REQUIRED_CHECKS}}):
+            with self.subTest(changed=changed):
+                atomic_json(journal, {**original, **changed})
+                with self.assertRaisesRegex(Refused, "accepted pending reboot"):
+                    self.manager.reboot_prepare()
+        self.manager.unlock_readiness.assert_not_called()
+        self.manager.service.assert_not_called()
+        self.manager.maintenance.assert_not_called()
+
+    def test_reboot_preparation_refuses_future_stale_or_naive_backup_time(self):
+        self.reboot_preparation_fixture()
+        latest = self.root / "manager/os-latest.json"
+        original = json.loads(latest.read_text())
+        for stamp in ((datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+                      (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(),
+                      datetime.now().isoformat(), "not a timestamp"):
+            with self.subTest(timestamp=stamp):
+                atomic_json(latest, {**original, "observed_at": stamp})
+                with self.assertRaisesRegex(Refused, "backup (is stale|timestamp is invalid)"):
+                    self.manager.reboot_prepare()
+        self.manager.unlock_readiness.assert_not_called()
+        self.manager.service.assert_not_called()
+        self.manager.maintenance.assert_not_called()
+
+    def test_reboot_preparation_records_owned_stage_after_stopping_services(self):
+        stage = self.reboot_preparation_fixture()
+        with patch("nebulalog_adapters.lifecycle.local_auth", return_value=("synthetic", {})):
+            result = self.manager.reboot_prepare()
+        self.assertEqual(result["boot_id"], self.manager.boot_id())
+        self.manager.service.assert_called_once_with("stop", tuple(reversed(self.manager.services)))
+        self.manager.maintenance.assert_called_once_with(True, stage)
+        self.assertEqual(json.loads((self.root / "manager/os-latest.json").read_text())["state"], "reboot_prepared")
+
+    def test_reboot_prepare_stop_failure_keeps_gate_until_full_recovery(self):
+        stage = self.reboot_preparation_fixture()
+        self.manager.service.side_effect = [Refused("partial stop"), None]
+        with patch("nebulalog_adapters.lifecycle.local_auth", return_value=("synthetic", {})):
+            with self.assertRaisesRegex(Refused, "partial stop"):
+                self.manager.reboot_prepare()
+        self.assertEqual(self.manager.service.call_args_list[-1].args, ("start", self.manager.services))
+        self.manager.maintenance.assert_called_once_with(True, stage)
+        self.manager.health.assert_not_called()
+        self.assertEqual(json.loads((self.root / "manager/os-latest.json").read_text())["state"], "postcheck_passed")
+
+    def test_reboot_prepare_restart_failure_preserves_original_error_and_gate(self):
+        stage = self.reboot_preparation_fixture()
+        self.manager.service.side_effect = [Refused("partial stop"), Refused("restart failed")]
+        with patch("nebulalog_adapters.lifecycle.local_auth", return_value=("synthetic", {})):
+            with self.assertRaisesRegex(Refused, "partial stop"):
+                self.manager.reboot_prepare()
+        self.manager.maintenance.assert_called_once_with(True, stage)
+        self.assertIn("os.reboot_prepare_restart_failed", (self.root / "manager/audit.jsonl").read_text())
+
+    def test_unlock_readiness_inspects_candidate_instead_of_recovery_default(self):
+        self.manager.config["unattended_reboot"] = True
+        identity = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        candidate = "/boot/vmlinuz-5.14.0-687.57.1.el9_8.x86_64"
+        calls = []
+        def command(argv, **kwargs):
+            calls.append(argv)
+            if argv[0] == "findmnt":
+                return json.dumps({"filesystems": [{"source": "/dev/mapper/root"}]})
+            if argv[0] == "lsblk":
+                return json.dumps({"blockdevices": [{"fstype": "crypto_LUKS", "uuid": identity}]})
+            if argv[0] == "lsinitrd":
+                return "root UUID=" + identity + " none tpm2-device=auto"
+            if argv[:2] == ["cryptsetup", "luksDump"]:
+                return json.dumps({"tokens": {"0": {"type": "systemd-tpm2"}}})
+            if argv[:2] == ["cryptsetup", "open"]:
+                return ""
+            self.fail("Unexpected command: " + repr(argv))
+        self.manager.cmd = command
+        result = self.manager.unlock_readiness(candidate)
+        self.assertEqual(result["candidate_kernel"], candidate)
+        self.assertTrue(result["token_test"])
+        self.assertIn(["lsinitrd", "--file", "/etc/crypttab", candidate.replace("vmlinuz-", "initramfs-") + ".img"], calls)
+        self.assertFalse(any(argv[0] == "grubby" for argv in calls))
+
     def test_new_boot_is_committed_only_after_all_real_health_contracts(self):
         stage = self.os_reboot_fixture()
         result = self.manager.reboot_complete()
@@ -584,6 +732,33 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(transaction["finalization"], "failed")
         self.manager.maintenance.side_effect = None
         self.assertEqual(self.manager.reboot_complete()["status"], "complete")
+
+    def test_boot_gate_recovers_os_owner_after_marker_removed_before_finalization(self):
+        stage = self.os_reboot_fixture()
+        atomic_json(self.root / "manager/updates/transaction.json", {"state": "committed", "finalization": "complete"})
+        journal = self.root / "manager/os-transaction.json"
+        marker = self.root / "manager/maintenance.json"
+        def gate(active, directory):
+            if active:
+                atomic_json(marker, {"active": True, "release": str(directory)})
+            elif marker.exists():
+                marker.unlink()
+        self.manager.maintenance.side_effect = gate
+        real_atomic_json = atomic_json
+        def crash_at_finalization(path, value):
+            if path == journal and value.get("finalization") == "complete":
+                raise SystemExit("power loss after removing marker")
+            return real_atomic_json(path, value)
+        with patch("nebulalog_adapters.lifecycle.atomic_json", side_effect=crash_at_finalization):
+            with self.assertRaisesRegex(SystemExit, "power loss"):
+                self.manager.reboot_complete()
+        self.assertFalse(marker.exists())
+        self.assertEqual(json.loads(journal.read_text())["finalization"], "pending")
+        self.assertTrue(self.manager.boot_gate()["maintenance"])
+        self.assertEqual(json.loads(marker.read_text())["release"], str(stage))
+        self.assertEqual(self.manager.reboot_complete()["status"], "complete")
+        self.assertFalse(marker.exists())
+        self.assertEqual(json.loads(journal.read_text())["finalization"], "complete")
 
     def test_console_only_unlock_never_claims_unattended_reboot_ready(self):
         with self.assertRaisesRegex(Refused, "Unattended reboot"):

@@ -308,7 +308,9 @@ class LifecycleComplianceTests(unittest.TestCase):
         atomic_json(self.root / "manager/os-latest.json", {"state": "reboot_prepared", "stage": str(stage),
                     "boot_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"})
         journal = self.root / "manager/os-transaction.json"
-        atomic_json(journal, {"state": "reboot_requested"})
+        atomic_json(journal, {"state": "reboot_requested", "stage": str(stage),
+                    "boot_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"})
+        self.manager.checked_backup = Mock()
         with self.assertRaisesRegex(Refused, "maintenance remains active"):
             self.manager.reboot_complete()
         self.assertEqual(json.loads(journal.read_text())["state"], "recovery_required")
