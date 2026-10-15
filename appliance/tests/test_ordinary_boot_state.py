@@ -7,7 +7,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 from nebulalog_manager import ordinary_boot_state as state
+from nebulalog_manager import boot_metadata_native as boot_metadata
 from nebulalog_manager.common import Refused
+import test_boot_metadata_native as metadata_fixture
 
 BOOT = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
 NEXT = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
@@ -54,6 +56,57 @@ def environment(snapshot, **changes):
     snapshot['grub'] = {'raw': base64.b64encode(changed).decode(),
                         'description': {**snapshot['grub']['description'], 'bytes': len(changed), 'sha256': state.rpm.sha(changed)}}
     return snapshot
+
+
+def fixture_v2():
+    """New enrollment scope; legacy fixture remains readable, never upgraded."""
+    value = fixture()
+    value['schema'] = 2
+    value['boot_metadata_authority'] = metadata_fixture.stable_authority()
+    for path in state.TMPFILES:
+        value['artifacts'][path] = description(kind='symlink' if path == '/etc/os-release' else 'file',
+                                                mode=0o777 if path == '/etc/os-release' else 0o644)
+    return value
+
+
+class MetadataAuthorityTests(unittest.TestCase):
+    def test_schema2_authority_is_validated_without_capture(self):
+        value = fixture_v2()
+        with patch.object(boot_metadata, 'capture', side_effect=AssertionError('retained read recaptured')):
+            self.assertEqual(state.validate_snapshot(value), value)
+
+    def test_every_tmpfiles_target_is_required_in_new_snapshot(self):
+        for path in state.TMPFILES:
+            value = fixture_v2(); del value['artifacts'][path]
+            with self.subTest(path=path), self.assertRaisesRegex(Refused, 'required_boot_artifact_missing'):
+                state.validate_snapshot(value)
+
+    def test_valid_authority_change_is_not_an_ordinary_boot_delta(self):
+        before = fixture_v2()
+        after = environment(copy.deepcopy(before), boot_success='1')
+        after['boot_metadata_authority']['mount']['uuid'] = 'AAAA-BBBB'
+        state.validate_snapshot(after)
+        with self.assertRaisesRegex(Refused, 'protected_host_state_changed'):
+            state.validate_transition(before, after, same_boot=True)
+
+    def test_missing_or_mutated_authority_is_never_recaptured(self):
+        for mutate in (lambda value: value.pop('boot_metadata_authority'),
+                       lambda value: value['boot_metadata_authority']['targets'].pop(),
+                       lambda value: value['boot_metadata_authority']['writers'].clear(),
+                       lambda value: value['boot_metadata_authority']['configuration'].clear()):
+            value = fixture_v2(); mutate(value)
+            with patch.object(boot_metadata, 'capture', side_effect=AssertionError('silently recaptured')):
+                with self.assertRaises(Refused): state.validate_snapshot(value)
+
+    def test_legacy_measurement_scope_requires_explicit_migration(self):
+        legacy = fixture(); current = environment(fixture_v2(), boot_success='1')
+        # Historical parsing remains possible, but it cannot authorize the
+        # newly measured writer/configuration and fixed target metadata scope.
+        state.validate_snapshot(legacy); state.validate_snapshot(current)
+        with self.assertRaisesRegex(Refused, 'snapshot_schema_migration_required'):
+            state.validate_transition(legacy, current, same_boot=True)
+        with self.assertRaisesRegex(Refused, 'snapshot_schema_migration_required'):
+            state.validate_transition(current, legacy, same_boot=True)
 
 
 class TransitionTests(unittest.TestCase):
@@ -204,7 +257,9 @@ class TransitionTests(unittest.TestCase):
 
 class CaptureTests(unittest.TestCase):
     def setUp(self):
-        self.value = fixture()
+        self.value = fixture_v2()
+        self.metadata_snapshot = metadata_fixture.fixture()[1]
+        self.metadata_snapshot['boot_id'] = BOOT
         self.raw = base64.b64decode(self.value['grub']['raw'])
         self.paths = sorted(self.value['artifacts'])
         self.descriptions = {**self.value['artifacts'], state.ENV: self.value['grub']['description']}
@@ -220,6 +275,7 @@ class CaptureTests(unittest.TestCase):
         self.patch(state.rpm, 'read', side_effect=lambda path, maximum: self.raw if str(path) == state.ENV else (MACHINE + '\n').encode())
         self.paths_mock = self.patch(state, '_paths', side_effect=lambda: list(self.paths))
         self.describe_mock = self.patch(state, 'describe', side_effect=lambda path: copy.deepcopy(self.descriptions[str(path)]))
+        self.metadata_mock = self.patch(boot_metadata, 'capture', side_effect=lambda **kwargs: copy.deepcopy(self.metadata_snapshot))
 
     def patch(self, target, name, **kwargs):
         context = patch.object(target, name, **kwargs); result = context.start(); self.addCleanup(context.stop); return result
@@ -228,6 +284,24 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(state.capture(runner=self.runner), self.value)
         self.assertEqual(self.describe_mock.call_count, 2 * (len(self.paths) + 1))
         self.assertEqual(self.paths_mock.call_count, 2)
+        self.assertEqual(self.metadata_mock.call_count, 2)
+
+    def test_observation_clock_advancement_is_not_protected_state_drift(self):
+        later = copy.deepcopy(self.metadata_snapshot)
+        later['observed_at_ns'] += 1_000_000_000
+        later['uptime_us'] += 1_000_000
+        self.assertEqual(boot_metadata.stable_snapshot(later), boot_metadata.stable_snapshot(self.metadata_snapshot))
+        self.metadata_mock.side_effect = [self.metadata_snapshot, later]
+        self.assertEqual(state.capture(runner=self.runner), self.value)
+
+    def test_native_metadata_or_authority_race_refuses(self):
+        for mutate in (lambda value: value['authority']['mount'].update(uuid='AAAA-BBBB'),
+                       lambda value: value['rows']['/etc/issue'].update(inode=888),
+                       lambda value: value.update(boot_id=NEXT)):
+            changed = copy.deepcopy(self.metadata_snapshot); mutate(changed)
+            self.metadata_mock.side_effect = [self.metadata_snapshot, changed]
+            with self.assertRaisesRegex(Refused, 'snapshot_changed_during_capture'):
+                state.capture(runner=self.runner)
 
     def test_inventory_race_is_refused(self):
         state.rpm.inventory.side_effect = [('', [], self.value['inventory']), ('', [], ['changed'])]

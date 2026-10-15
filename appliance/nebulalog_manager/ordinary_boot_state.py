@@ -3,8 +3,9 @@
 The initial enrollment and accepted-lineage owner supplies the trusted preimage.
 Capturing a current host is observation, never authority to adopt its changes.
 Descriptions retain content, type, owner, mode and every xattr (including ACLs
-and SELinux); inode/timestamps are deliberately left to AIDE's measured scan,
-because the qualified success helper atomically replaces the environment inode.
+and SELinux). Schema-2 snapshots additionally retain stable vendor/mount
+authority for fixed boot metadata effects; old inode/timestamp values remain
+in the authenticated AIDE database, not this boot snapshot.
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ import uuid
 from . import kernel_boot as boot, kernel_updates as kernel, os_payload as rpm
 from .common import Refused, require_linux_root, run
 from .host_job_storage import digest, exact
+from .ordinary_boot_metadata import TMPFILES
 
 ENV = kernel.GRUBENV
 ROOTS = ('/boot', '/usr/lib/modules', '/etc/grub.d')
@@ -67,10 +69,17 @@ def _path(value):
     return value
 
 
+def fields(value):
+    """Retained legacy snapshots grant only their original measurement scope."""
+    if not isinstance(value, dict) or type(value.get('schema')) is not int or value['schema'] not in {1, 2}:
+        refuse('unsupported_snapshot_schema')
+    return FIELDS | ({'boot_metadata_authority'} if value['schema'] == 2 else set())
+
+
 def protected_path(value):
     """The fixed measurement scope, also used by accepted-lineage reduction."""
     _path(value)
-    return value != ENV and (value in FIXED or value in WRITERS
+    return value != ENV and (value in FIXED or value in WRITERS or value in TMPFILES
                             or any(value == root or value.startswith(root + '/') for root in ROOTS))
 
 
@@ -121,10 +130,9 @@ def _environment(snapshot):
 
 def validate_snapshot(value):
     """Validate retained bytes structurally; this never reads the current host."""
-    exact(value, FIELDS)
+    exact(value, fields(value))
     _uuid(value['boot_id'])
-    if (type(value['schema']) is not int or value['schema'] != 1
-            or not kernel.KERNEL.fullmatch(str(value['kernel'])) or value['default_kernel'] != value['kernel']
+    if (not kernel.KERNEL.fullmatch(str(value['kernel'])) or value['default_kernel'] != value['kernel']
             or not isinstance(value['machine_id'], str) or not re.fullmatch(r'[a-f0-9]{32}', value['machine_id'])):
         refuse('invalid_host_identity')
     inventory = value['inventory']
@@ -142,6 +150,10 @@ def validate_snapshot(value):
         '/boot/initramfs-' + value['kernel'] + '.img',
         '/boot/loader/entries/' + value['machine_id'] + '-' + value['kernel'] + '.conf',
         '/usr/lib/modules/' + value['kernel']}
+    if value['schema'] == 2:
+        from . import boot_metadata_native
+        boot_metadata_native.validate_authority(value['boot_metadata_authority'])
+        required.update(TMPFILES)
     if not required <= set(artifacts):
         refuse('required_boot_artifact_missing')
     for path, description in artifacts.items():
@@ -193,7 +205,7 @@ def describe(path):
 
 
 def _paths():
-    paths = set(FIXED) | set(WRITERS)
+    paths = set(FIXED) | set(WRITERS) | set(TMPFILES)
     def failed(_error):
         refuse('artifact_enumeration_failed')
     for root in ROOTS:
@@ -216,7 +228,9 @@ def capture(*, runner=run):
                 'default_kernel': runner(['/usr/sbin/grubby', '--default-kernel']).removeprefix('/boot/vmlinuz-'),
                 'machine_id': rpm.read('/etc/machine-id', 128).decode().strip(),
                 'inventory': rpm.inventory(runner)[2]}
+    from . import boot_metadata_native
     before = identity()
+    metadata = boot_metadata_native.capture(runner=runner)
     paths = _paths()
     artifacts = {path: describe(path) for path in paths}
     env_description = describe(ENV)
@@ -228,11 +242,15 @@ def capture(*, runner=run):
         if actual_owner != owner:
             refuse('flag_writer_package_changed')
         writers[path] = {'sha256': artifacts[path].get('sha256'), 'owner': actual_owner}
-    if (identity() != before or _paths() != paths or describe(ENV) != env_description
+    if (identity() != before or metadata['boot_id'] != before['boot_id']
+            or boot_metadata_native.stable_snapshot(boot_metadata_native.capture(runner=runner))
+               != boot_metadata_native.stable_snapshot(metadata)
+            or _paths() != paths or describe(ENV) != env_description
             or any(describe(path) != expected for path, expected in artifacts.items())):
         refuse('snapshot_changed_during_capture')
-    value = {'schema': 1, **before, 'artifacts': artifacts,
-             'grub': {'raw': base64.b64encode(raw).decode(), 'description': env_description}, 'writers': writers}
+    value = {'schema': 2, **before, 'artifacts': artifacts,
+             'grub': {'raw': base64.b64encode(raw).decode(), 'description': env_description}, 'writers': writers,
+             'boot_metadata_authority': boot_metadata_native.authority(metadata)}
     return validate_snapshot(value)
 
 
@@ -240,9 +258,11 @@ def validate_transition(before, after, *, same_boot):
     """Authorize only the exact vendor byte edits, never a mutable GRUB path."""
     validate_snapshot(before)
     validate_snapshot(after)
+    if before['schema'] != after['schema']:
+        refuse('snapshot_schema_migration_required')
     if type(same_boot) is not bool or (before['boot_id'] == after['boot_id']) != same_boot:
         refuse('transition_boot_identity_changed')
-    if any(before[key] != after[key] for key in FIELDS - {'boot_id', 'grub'}):
+    if any(before[key] != after[key] for key in fields(before) - {'boot_id', 'grub'}):
         refuse('protected_host_state_changed')
     old_raw, old = _environment(before)
     new_raw, new = _environment(after)

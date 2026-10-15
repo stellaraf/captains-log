@@ -1,7 +1,8 @@
 """Ordinary boot generations over the immutable original AIDE enrollment.
 
 This owner never runs RPM, changes GRUB, or creates an OS update journal. Its
-only accepted filesystem delta is the qualified vendor GRUB flag transition.
+GRUB delta is the qualified vendor flag transition. Schema-2 AIDE preparations
+separately bind narrowly qualified reboot metadata to the authenticated DB.
 The expected host comes from enrollment plus the actual accepted AIDE chain;
 capturing the current host is observation, never replacement authority.
 """
@@ -113,14 +114,14 @@ def _load(stage):
         # An intervening accepted OS update may change all of these. Its actual
         # AIDE prefix is checked by the reducer, so the old ordinary observation
         # is used only when the protected state still matches.
-        if any(observation[k] != before[k] for k in native.FIELDS - {'boot_id', 'grub'}):
+        if any(observation.get(k) != before[k] for k in native.fields(before) - {'boot_id', 'grub'}):
             observation = before
     elif value['sequence'] != 0:
         refuse('generation_ancestry_missing')
     expected_transition = _transition(observation, after, checkpoint=value['checkpoint_required'])
     if expected_transition != value['transition']:
         refuse('generation_transition_changed')
-    if any(before[k] != after[k] for k in native.FIELDS - {'boot_id', 'grub'}):
+    if any(before[k] != after.get(k) for k in native.fields(before) - {'boot_id', 'grub'}):
         refuse('generation_protected_state_changed')
     return value, checksum
 
@@ -648,8 +649,8 @@ def _match_expected(expected, actual, unresolved):
         keys = set(observed) - ({'xattrs_sha256'} if path in unresolved else set())
         if set(value) != keys or any(observed.get(key) != item for key, item in value.items()):
             refuse('accepted_artifact_changed')
-    for key in native.FIELDS - {'artifacts', 'grub', 'boot_id'}:
-        if expected[key] != actual[key]:
+    for key in native.fields(expected) - {'artifacts', 'grub', 'boot_id'}:
+        if expected[key] != actual.get(key):
             refuse('accepted_host_identity_changed')
     if expected['grub']['description'] != actual['grub']['description']:
         refuse('accepted_environment_changed')
@@ -666,7 +667,7 @@ def _root_snapshot(history, identity):
 
 
 def _history(manager, stage=None):
-    owner = None
+    authority = None
     if stage is not None:
         # Determine the real pending owner, then require exact immutable
         # ancestry before allowing the reader's narrowly scoped CAS view.
@@ -680,7 +681,8 @@ def _history(manager, stage=None):
                 owner = prepared.get('release')
                 if not owns_maintenance(stage, owner):
                     refuse('foreign_integrity_owner')
-    return aide_updates.accepted_plan_history(manager=manager, allow_pending_owner=owner)
+                authority = aide_updates.pending_plan_authority(stage, Path(stage) / PLAN)
+    return aide_updates.accepted_plan_history(manager=manager, pending_authority=authority)
 
 
 def _effective(history):
@@ -767,7 +769,7 @@ def pending_stage(data, runner=run, *, manager=None):
             if ((hold is None or prior['hold'] == hold)
                     and (os.path.lexists(root / PENDING) or os.path.lexists(identity.root / 'manager/maintenance.json'))):
                 return previous_stage
-        elif any(observation[k] != expected[k] for k in native.FIELDS - {'grub', 'boot_id', 'artifacts'}):
+        elif any(observation.get(k) != expected[k] for k in native.fields(expected) - {'grub', 'boot_id', 'artifacts'}):
             observation = None
     # Fill ONLY missing xattrs for precise previously accepted payload paths.
     # No checkpoint is published until an actual AIDE scan proves these match
@@ -794,7 +796,7 @@ def pending_stage(data, runner=run, *, manager=None):
         elif any(row['plan'].get('kind') == KIND for row in rows):
             refuse('ordinary_generation_pointer_missing')
         return None
-    if observation is None or any(observation[k] != before[k] for k in native.FIELDS - {'boot_id', 'grub'}):
+    if observation is None or any(observation.get(k) != before[k] for k in native.fields(before) - {'boot_id', 'grub'}):
         observation = before
     # Resolving a failure hold requires an actual fresh scan and health even
     # when the now-valid native observation is byte-identical to its baseline.

@@ -44,7 +44,9 @@ class AideLifecycleTests(unittest.TestCase):
         self.stderr = ""
         self.on_check = None
         self.now = "2026-09-07T10:00:00+00:00"
-        self.boot_snapshot = Mock(return_value={})
+        # Lifecycle fixtures exercise the existing strict legacy enrollment.
+        # Schema2 boot metadata authority has separate native/lineage fixtures.
+        self.boot_snapshot = Mock(return_value={'schema': 1})
         for module in (aide, host_job_storage):
             patcher = patch.object(module, "ROOT_UID", os.getuid())
             patcher.start()

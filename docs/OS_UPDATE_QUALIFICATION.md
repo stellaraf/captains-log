@@ -193,8 +193,45 @@ and `/root` files changed ctime during the successful vendor tmpfiles service.
 Their contents and security metadata matched. The full AIDE check rejected
 these changes before replacing its database; the original baseline remains
 preserved. Signed vendor payload/source inspection supports the explanation,
-but a typed, narrowly scoped metadata transition and its native qualification
-are still required. No AIDE attributes have been disabled to pass this test.
+and the native read-only helper independently confirmed all eighteen rows,
+including ACLs, against that preserved database. Source integration now binds
+these observations to the original enrollment and exact accepted AIDE history.
+Native acceptance of the resulting database transition is still required.
+No AIDE attributes have been disabled to pass this test.
+
+New schema-2 enrollment snapshots include the exact vendor tmpfiles writers,
+effective configuration and EFI volume identity. The only additional reboot
+changes eligible for reconciliation are inode changes on nine fixed EFI files
+and ctime changes on nine fixed system/root files inside the successful boot
+tmpfiles invocation. Content, ownership, modes, ACLs, SELinux labels, xattrs,
+link counts and every other monitored attribute must still match. Same-boot
+changes receive no such exception. Historical timestamps come from the
+authenticated AIDE database at its actual second precision, never from a new
+capture or invented nanoseconds.
+
+Each preparation retains its native observation, source database/head, typed
+boot ancestry and any interrupted-operation evidence. A copied ready output
+retains its unpublished provenance through recovery; an old uncopied output
+cannot be installed after a later boot. Ordinary payload updates carry a
+same-boot anchor with no metadata exceptions, so their original preparation
+remains immutable through an exact forward-to-rollback sequence. Their output
+rows, rather than the preparation's old measurements, become the input for a
+later qualified boot. Schema-1 enrollments gain no new exceptions; changing
+enrollment schema, vendor writer pins or effective tmpfiles policy requires a
+separately qualified migration.
+
+The retained ancestry includes full snapshots only for the current ordinary
+boot generation. Large snapshots use bounded gzip/base64 encoding inside the
+existing private record limit, with their original canonical JSON hashes
+preserved. Historical validation rejects duplicate keys, changed references,
+extra gzip members, trailing data and excessive expansion. It performs no
+live measurements or recursive acceptance queries. The resulting AIDE database
+is checked against the authorized rows, and the boot identity and current
+database are checked again after replacement and before publishing completion.
+
+These source changes are undergoing integration and native testing. They do
+not resolve the installed vendor kernel's FIPS HKDF self-test failure or
+authorize maintenance release without the existing complete health checks.
 
 ### Failed candidate recovery
 
