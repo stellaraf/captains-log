@@ -282,7 +282,11 @@ class ReducerTests(Fixtures):
                     'removed': removed, 'preserved': {core.native.ENV: self.observed['grub']['description']},
                     'mutable_directories': ['/boot', '/usr/lib/modules']}
         checksum = 'd' * 64
-        self.patch(retain, 'load_historical_plan', return_value=(original, checksum))
+        def retained_plan(owner, wanted):
+            self.assertEqual(owner, stage)
+            self.assertEqual(wanted, checksum)
+            return original, checksum
+        self.patch(retain, 'load_plan_by_checksum', side_effect=retained_plan)
         plan = retain.integrity_plan(original, checksum)
         self.append(self.accepted_row(stage, plan, number=3))
         for path in removed: del self.observed['artifacts'][path]

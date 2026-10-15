@@ -308,8 +308,9 @@ class OrchestrationTests(Fixtures):
         self.installed = headers()
         self.inventory = self.patch(integration.rpm, 'inventory', side_effect=lambda runner: ('xml', self.installed, ['before'] if len(self.installed) == 16 else ['after']))
         self.provenance = self.patch(integration, 'retained_packages', return_value=['signed-rpm'] * 4)
-        self.plan = {'acceptance': self.approved, 'after_inventory': ['after'], 'retained_kernels': VERSIONS[1:]}
+        self.plan = {'boot_id': BOOT, 'acceptance': self.approved, 'after_inventory': ['after'], 'retained_kernels': VERSIONS[1:]}
         self.patch(integration.retain, 'load_plan', return_value=(self.plan, SHA))
+        self.patch(integration.retain, 'load_historical_plan', return_value=(self.plan, SHA))
         self.plan_cached = self.patch(integration.retain, 'plan_cached', side_effect=self.make_plan)
         self.execute = self.patch(integration.retain, 'execute_cached', side_effect=self.erase)
         self.recover = self.patch(integration.retain, 'recover_cached', side_effect=self.observe)
@@ -338,7 +339,7 @@ class OrchestrationTests(Fixtures):
         return value
 
     def erase(self, *args, **kwargs):
-        (self.stage / integration.retain.INTENT).write_bytes(b'intent')
+        self.write(self.stage / integration.retain.INTENT, {'schema': 1, 'plan_sha256': SHA, 'authorization': {}})
         self.installed = headers(VERSIONS[1:])
         return self.observe()
 
@@ -381,7 +382,8 @@ class OrchestrationTests(Fixtures):
         self.recover.assert_called_once()
 
     def test_interrupted_erase_refuses_complete_until_actual_inventory_proven(self):
-        self.make_plan(); (self.stage / integration.retain.INTENT).touch()
+        self.make_plan()
+        self.write(self.stage / integration.retain.INTENT, {'schema': 1, 'plan_sha256': SHA, 'authorization': {}})
         self.recover.side_effect = Refused('partial_erase_requires_recovery')
         with self.assertRaisesRegex(Refused, 'partial_erase'): self.run_retention()
         self.execute.assert_not_called()

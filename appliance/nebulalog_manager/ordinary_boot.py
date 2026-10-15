@@ -541,7 +541,11 @@ def _fold(initial, history, identity):
         elif kind in {'rocky-kernel-retention-v1', 'rocky-kernel-retention-resume-v1'}:
             from . import kernel_retention as retain
             _os_stage(stage, identity)
-            original, checksum = retain.load_historical_plan(stage)
+            # An execution after a later accepted boot has its own immutable
+            # GRUB preimage and AIDE preparation. Resolve the plan this entry
+            # actually accepted, never whichever generation is current now.
+            wanted = plan['manifest_sha256'] if kind == retain.KIND else plan['retention_plan_sha256']
+            original, checksum = retain.load_plan_by_checksum(stage, wanted)
             if kind == retain.KIND:
                 if plan != retain.integrity_plan(original, checksum):
                     refuse('accepted_retention_plan_changed')

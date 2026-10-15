@@ -287,12 +287,82 @@ def plan_cached(stage, packages, *, accepted, runner=run):
 
 
 def load_plan(stage):
+    from . import kernel_retention_generation as generation
+    reference = generation.selected(stage)
+    if reference is not None:
+        plan, checksum = generation.load(stage, reference)
+        erase_intent(stage, plan, checksum)
+        return plan, checksum
     return _load_plan(stage, historical=False)
 
 
 def load_historical_plan(stage):
     """Validate frozen scope and accepted ancestry without granting authority."""
+    from . import kernel_retention_generation as generation
+    reference = generation.selected(stage)
+    if reference is not None:
+        plan, checksum = generation.load(stage, reference, historical=True)
+        erase_intent(stage, plan, checksum)
+        return plan, checksum
     return _load_plan(stage, historical=True)
+
+
+def load_original_plan(stage, *, historical=True):
+    """Read the immutable root recipe, even after a later generation attempts."""
+    return _load_plan(stage, historical=historical)
+
+
+def load_plan_by_checksum(stage, checksum):
+    from . import kernel_retention_generation as generation
+    original, original_sha = load_original_plan(stage, historical=True)
+    if checksum == original_sha:
+        return original, original_sha
+    reference = generation.selected(stage)
+    if reference is None:
+        refuse('execution_history_requires_global_attempt')
+    plan, actual = generation.load(stage, reference, historical=True)
+    if actual != checksum:
+        refuse('execution_history_checksum_changed')
+    erase_intent(stage, plan, checksum)
+    return plan, checksum
+
+
+def execution_integrity_path(stage, checksum):
+    """Resolve the exact preimage/preparation for the actual erase recipe."""
+    from . import kernel_retention_generation as generation
+    _, original_sha = load_original_plan(stage, historical=True)
+    if checksum == original_sha:
+        return Path(stage) / INTEGRITY
+    reference = generation.selected(stage)
+    if reference is None:
+        refuse('execution_integrity_requires_global_attempt')
+    _, actual = generation.load(stage, reference, historical=True)
+    if actual != checksum:
+        refuse('execution_integrity_checksum_changed')
+    return generation.integrity_path(stage, reference)
+
+
+def verify_unattempted(stage, *, runner=run):
+    """Prove a later execution may be planned; never authorizes a command."""
+    stage = Path(stage)
+    if any(os.path.lexists(stage / name) for name in (INTENT, RESULT, 'kernel-retention-complete.json')):
+        refuse('already_attempted_use_recovery')
+    plan, checksum = load_original_plan(stage, historical=True)
+    verify_signed_history(stage, plan, runner=runner)
+    xml, _, inventory = rpm.inventory(runner)
+    classify_inventory(plan, inventory, attempted=False)
+    if rpm.sha(xml.encode()) != plan['inventory_sha256']:
+        refuse('unattempted_header_inventory_changed')
+    for path, expected in plan['preserved'].items():
+        if path != kernel.GRUBENV and preserved_description(path) != expected:
+            refuse('unattempted_protected_state_changed')
+    for path, expected in plan['removed'].items():
+        if kernel.describe(path) != expected:
+            refuse('unattempted_target_changed')
+    if (runner(['/usr/bin/uname', '-r']) != plan['acceptance']['kernel']
+            or runner(['/usr/sbin/grubby', '--default-kernel']) != '/boot/vmlinuz-' + plan['acceptance']['kernel']):
+        refuse('unattempted_running_default_changed')
+    return plan, checksum
 
 
 def _load_plan(stage, *, historical):
@@ -379,12 +449,16 @@ def authorize_execution(stage, plan, checksum, authorize):
     return result
 
 
-def execute_cached(stage, *, authorize, accepted, runner=run):
+def execute_cached(stage, *, authorize, accepted, runner=run, generation=None):
     require_linux_root()
     stage = Path(stage)
-    plan, checksum = load_plan(stage)
     if os.path.lexists(stage / INTENT):
         refuse('already_attempted_use_recovery')
+    if generation is None:
+        plan, checksum = load_plan(stage)
+    else:
+        from . import kernel_retention_generation
+        plan, checksum = kernel_retention_generation.load(stage, generation, runner=runner)
     authorization = authorize_execution(stage, plan, checksum, authorize)
     if acceptance(stage, accepted, runner) != plan['acceptance']:
         refuse('accepted_context_changed')
@@ -409,7 +483,10 @@ def execute_cached(stage, *, authorize, accepted, runner=run):
     if rpm.inventory(runner)[0] != xml:
         refuse('inventory_changed_after_preflight')
     verify_files(plan, 'prepare', runner=runner)
-    kernel.record(stage, INTENT, {'schema': 1, 'plan_sha256': checksum, 'authorization': authorization})
+    intent = {'schema': 1, 'plan_sha256': checksum, 'authorization': authorization}
+    if generation is not None:
+        intent.update(schema=2, generation=generation)
+    kernel.record(stage, INTENT, intent)
     runner(command(plan), timeout=1800)
     return recover_cached(stage, authorize=authorize, accepted=accepted, runner=runner)
 
@@ -419,12 +496,11 @@ def recover_cached(stage, *, authorize, accepted, runner=run):
     require_linux_root()
     stage = Path(stage)
     plan, checksum = load_plan(stage)
-    intent = strict_json(rpm.read(stage / INTENT, 8192))
-    exact(intent, {'schema', 'plan_sha256', 'authorization'})
+    intent, _ = erase_intent(stage, plan, checksum)
     original = intent['authorization']
     exact(original, {'ok', 'plan_sha256', 'backup_sha256', 'aide_preparation_sha256', 'boot_id'})
     current = authorize_execution(stage, plan, checksum, authorize)
-    if (intent['schema'] != 1 or intent['plan_sha256'] != checksum or original['ok'] is not True
+    if (intent['plan_sha256'] != checksum or original['ok'] is not True
             or original['plan_sha256'] != checksum or original['boot_id'] != plan['boot_id']
             or not kernel.SHA.fullmatch(str(original['backup_sha256']))
             or original['aide_preparation_sha256'] != current['aide_preparation_sha256']
@@ -467,7 +543,21 @@ def bound_integrity_plan(manager, stage, path, *, preparing):
             or journal.get('state') not in {'complete', 'retaining', 'retention_postcheck', 'retention_recovery_required'}
             or preparing and os.path.lexists(stage / INTENT)):
         refuse('integrity_operation_binding_changed')
+    if not preparing:
+        verify_integrity_attempt(manager, identity, stage, plan, checksum, parsed, rpm.sha(raw))
     return parsed, rpm.sha(raw)
+
+
+def verify_integrity_attempt(manager, identity, stage, plan, checksum, integrity, integrity_sha):
+    """A forward baseline change requires the actual once-only erase owner."""
+    from . import aide_updates
+    if not os.path.lexists(Path(stage) / INTENT):
+        refuse('integrity_acceptance_requires_erase_intent')
+    intent, _ = erase_intent(stage, plan, checksum)
+    _, prepared = aide_updates._prepared(manager, identity.root / 'manager/aide', identity,
+                                         stage, integrity, integrity_sha)
+    if prepared is None or digest(prepared) != intent['authorization']['aide_preparation_sha256']:
+        refuse('integrity_attempt_preparation_changed')
 
 
 def integrity_snapshot(manager, plan, phase, retained=None):
@@ -507,10 +597,15 @@ def erase_intent(stage, plan, checksum):
     """Validate the one global attempt sentinel without authorizing its replay."""
     raw = rpm.read(Path(stage) / INTENT, 8192)
     intent = strict_json(raw)
-    exact(intent, {'schema', 'plan_sha256', 'authorization'})
+    from . import kernel_retention_generation as generation
+    exact(intent, {'schema', 'plan_sha256', 'authorization'} | ({'generation'} if intent.get('schema') == 2 else set()))
+    if intent.get('schema') == 2:
+        effective, effective_sha = generation.load(stage, intent['generation'], historical=True)
+        if effective != plan or effective_sha != checksum:
+            refuse('execution_intent_plan_changed')
     value = intent['authorization']
     exact(value, {'ok', 'plan_sha256', 'backup_sha256', 'aide_preparation_sha256', 'boot_id'})
-    if (type(intent['schema']) is not int or intent['schema'] != 1 or raw != kernel.encode(intent)
+    if (type(intent['schema']) is not int or intent['schema'] not in (1, 2) or raw != kernel.encode(intent)
             or intent['plan_sha256'] != checksum or value['ok'] is not True
             or value['plan_sha256'] != checksum or value['boot_id'] != plan['boot_id']
             or any(not kernel.SHA.fullmatch(str(value[key])) for key in ('backup_sha256', 'aide_preparation_sha256'))):
@@ -675,7 +770,7 @@ def resume_origin(stage, path):
     value = strict_json(rpm.read(path, rpm.MAX_XML))
     original, checksum = load_historical_plan(stage)
     intent, intent_sha = erase_intent(stage, original, checksum)
-    integrity_raw = rpm.read(stage / INTEGRITY, rpm.MAX_XML)
+    integrity_raw = rpm.read(execution_integrity_path(stage, checksum), rpm.MAX_XML)
     integrity = strict_json(integrity_raw)
     if (integrity_raw != kernel.encode(integrity) or integrity != integrity_plan(original, checksum)
             or value.get('retention_plan_sha256') != checksum
@@ -730,7 +825,7 @@ def prepare_resume(stage, authority_ref, boot_ref, *, authorize, runner=run):
             return stage / previous['filename'], parsed
     original, checksum = load_historical_plan(stage)
     intent, intent_sha = erase_intent(stage, original, checksum)
-    integrity_raw = rpm.read(stage / INTEGRITY, rpm.MAX_XML)
+    integrity_raw = rpm.read(execution_integrity_path(stage, checksum), rpm.MAX_XML)
     if strict_json(integrity_raw) != integrity_plan(original, checksum):
         refuse('original_integrity_plan_changed')
     if (boot['plan_sha256'] != boot_ref['sha256'] or boot['boot_id'] != observed['boot_id']

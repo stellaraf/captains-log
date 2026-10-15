@@ -118,6 +118,7 @@ class KernelAideIntegrationTests(TestCase):
                 patch.object(retention, 'validate_boot_authority', side_effect=authority),
                 patch.object(retention, 'load_plan', return_value=(self.original_retention, self.original_sha)),
                 patch.object(retention, 'load_historical_plan', return_value=(self.original_retention, self.original_sha)),
+                patch.object(retention, 'load_original_plan', return_value=(self.original_retention, self.original_sha)),
                 patch.object(retention, 'require_linux_root'),
                 patch.object(retention, 'run', side_effect=self.runner),
                 patch.object(updates.aide, 'Aide', return_value=self.manager)):

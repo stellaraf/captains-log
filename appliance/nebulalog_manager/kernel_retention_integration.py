@@ -139,14 +139,17 @@ def context(manager, stage):
     return identity, latest, journal
 
 
-def authorization(stage, checksum, *, manager, recovery=False):
+def authorization(stage, checksum, *, manager, recovery=False, integrity_path=None):
     from . import aide_updates, kernel_integrity
     stage = Path(stage)
     with aide_updates._locked(manager) as (state, identity):
         bound_identity, latest, journal = context(manager, stage)
         if bound_identity != identity:
             retain.refuse('retention_storage_identity_changed')
-        integrity, integrity_sha = retain.bound_integrity_plan(manager, stage, stage / retain.INTEGRITY, preparing=False)
+        if integrity_path is None:
+            integrity, integrity_sha = retain.bound_integrity_plan(manager, stage, stage / retain.INTEGRITY, preparing=not recovery)
+        else:
+            integrity, integrity_sha = aide_updates._bound_plan(manager, stage, Path(integrity_path), preparing=not recovery)
         if integrity['manifest_sha256'] != checksum:
             retain.refuse('authorization_plan_changed')
         backup_stage = stage
@@ -172,7 +175,7 @@ def authorization(stage, checksum, *, manager, recovery=False):
 
 
 def retain_three(stage, *, accepted, runner=run):
-    from . import aide
+    from . import aide, kernel_retention_generation as generation
     require_linux_root()
     stage = Path(stage)
     manager = aide.Aide()
@@ -192,16 +195,21 @@ def retain_three(stage, *, accepted, runner=run):
                                       'kernel': oldest, 'before_inventory': inventory})
         packages = retained_packages(stage, oldest, runner=runner)
         retain.plan_cached(stage, packages, accepted=accepted, runner=runner)
-    plan, checksum = retain.load_plan(stage)
+    attempted = os.path.lexists(stage / retain.INTENT)
+    reference = generation.selected(stage) if attempted else None
+    historical, _ = retain.load_historical_plan(stage)
+    if not attempted and historical['boot_id'] != approved['boot_id']:
+        reference, plan, checksum = generation.prepare(stage, accepted=accepted, runner=runner)
+    else:
+        plan, checksum = retain.load_plan(stage)
     if plan['acceptance'] != approved:
         retain.refuse('retention_acceptance_changed')
-    integrity_path = stage / retain.INTEGRITY
+    integrity_path = stage / retain.INTEGRITY if reference is None else generation.integrity_path(stage, reference)
     if not os.path.lexists(integrity_path):
         # The immutable erase plan is published first. Reconstruct only its
         # deterministic integrity projection after a crash between the writes.
-        kernel.record(stage, retain.INTEGRITY, retain.integrity_plan(plan, checksum))
+        kernel.record(stage, integrity_path.name, retain.integrity_plan(plan, checksum))
     integrity_sha = rpm.sha(rpm.read(integrity_path, rpm.MAX_XML))
-    attempted = os.path.lexists(stage / retain.INTENT)
     if not attempted:
         result = manager.authorized_update_prepare(stage, integrity_path)
         if result.get('ok') is not True or result.get('plan_sha256') != integrity_sha:
@@ -209,11 +217,13 @@ def retain_three(stage, *, accepted, runner=run):
     # The callback's mode is evaluated afresh: execute_cached creates INTENT
     # before calling its own recovery inspector after successful RPM erasure.
     authorize = lambda current, sha: authorization(current, sha, manager=manager,
-                                                    recovery=os.path.lexists(current / retain.INTENT))
+                           recovery=os.path.lexists(current / retain.INTENT),
+                           **({'integrity_path': integrity_path} if reference is not None else {}))
     if attempted:
         result = retain.recover_cached(stage, authorize=authorize, accepted=accepted, runner=runner)
     else:
-        result = retain.execute_cached(stage, authorize=authorize, accepted=accepted, runner=runner)
+        result = retain.execute_cached(stage, authorize=authorize, accepted=accepted, runner=runner,
+                                       **({'generation': reference} if reference is not None else {}))
     if result.get('status') != 'erased_pending_integrity' or result.get('plan_sha256') != checksum:
         retain.refuse('erase_result_changed')
     integrity = manager.authorized_update_accept(stage, integrity_path)

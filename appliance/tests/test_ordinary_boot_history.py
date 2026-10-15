@@ -147,6 +147,15 @@ class OrdinaryBootHistoryTests(TestCase):
         self.original_retention['after_inventory'] = ['retained-exact']
         self.initial_snapshot['artifacts'][str(self.retired)] = copy.deepcopy(
             self.original_retention['removed'][str(self.retired)])
+        def retained_plan(stage, checksum):
+            self.assertEqual(stage, self.stage)
+            if checksum != self.original_sha:
+                raise Refused('fixture_retention_manifest_changed')
+            return self.original_retention, self.original_sha
+        from nebulalog_manager import kernel_retention
+        context = patch.object(kernel_retention, 'load_plan_by_checksum', side_effect=retained_plan)
+        context.start()
+        self.addCleanup(context.stop)
         context = patch.object(core.native, 'ROOTS', (*core.native.ROOTS, str(self.retired)))
         context.start()
         self.addCleanup(context.stop)

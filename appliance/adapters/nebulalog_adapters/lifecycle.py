@@ -1055,6 +1055,56 @@ class Lifecycle:
         atomic_json(journal, {**transaction, "kernel_retention": "complete", "finalization": "complete"})
         return result
 
+    def _kernel_retention_unattempted(self, stage, latest, transaction, current_boot):
+        """Accept the later boot before creating a new, once-only erase plan."""
+        journal = self.data / "manager/os-transaction.json"
+        latest_path = self.data / "manager/os-latest.json"
+        transaction = {**transaction, "kernel_retention": "pending", "finalization": "pending"}
+        atomic_json(journal, transaction)
+        self.maintenance(True, stage)
+        try:
+            # An erase intent is global to the operation, across all execution
+            # generations. Observed unchanged packages cannot permit replay.
+            if os.path.lexists(stage / kernel_retention.INTENT):
+                raise Refused("Attempted retention cannot start another execution generation")
+            kernel_retention.verify_unattempted(stage, runner=self.cmd)
+            original, _ = kernel_retention.load_historical_plan(stage)
+            if original["boot_id"] == current_boot or self.boot_id() != current_boot:
+                raise Refused("Unattempted retention requires the exact later boot")
+            latest, transaction, _ = self._os_recovery_backup(stage, latest, transaction)
+            candidate = self._kernel_candidate(stage)
+            if candidate is None:
+                raise Refused("Unattempted retention has no owned kernel candidate")
+            boot = kernel_boot.verify_postboot(stage, **self._kernel_callbacks())
+            if (boot.get("outcome") != "candidate" or boot.get("phase") != "resume"
+                    or boot.get("boot_id") != current_boot or boot.get("kernel") != candidate[1]["kernel"]
+                    or boot.get("release_accepted") is not False):
+                raise Refused("Kernel retention requires the accepted candidate to be running")
+            health = self.health(stage, os_health=True)
+            if health.get("ok") is not True or any(health.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS):
+                raise Refused("Unattempted retention requires all current runtime checks")
+            if self.boot_id() != current_boot:
+                raise Refused("Retention boot changed before current acceptance")
+            kernel_boot.commit_candidate(stage, health={"ok": True, "stage": str(stage), "boot_id": current_boot,
+                "kernel": candidate[1]["kernel"], "checks": health["checks"]}, **self._kernel_callbacks())
+            self._kernel_finalize(stage, health["checks"])
+            latest = {**latest, "state": "reboot_completed", "observed_boot_id": current_boot}
+            atomic_json(latest_path, latest)
+            transaction = {**transaction, "state": "complete", "kernel_finalization": "complete",
+                           "observed_boot_id": current_boot, "reboot_pending": False}
+            atomic_json(journal, transaction)
+            # Retention now derives a current-boot execution generation from
+            # the immutable old plan. Its own fresh health/backup/AIDE checks
+            # still precede the single durable erase intent.
+            result = self._kernel_retain(stage, latest, transaction)
+        except Exception as exc:
+            self.maintenance(True, stage)
+            atomic_json(journal, {**transaction, "kernel_retention": "failed", "finalization": "failed",
+                                 "retention_error": type(exc).__name__})
+            raise Refused("Unattempted later-boot retention requires recovery; maintenance remains active") from exc
+        return self.receipt(stage, "reboot-complete", boot_id=current_boot, checks=health["checks"],
+                            status="complete", reboot_pending=False, retention=result)
+
     def _kernel_retention_resume(self, stage, latest, transaction, current_boot):
         """Reconcile proven erasure after reboot, with no package execution."""
         journal = self.data / "manager/os-transaction.json"
@@ -1321,6 +1371,8 @@ class Lifecycle:
                 if os.path.lexists(stage / kernel_retention.PLAN):
                     retained_plan, _ = kernel_retention.load_historical_plan(stage)
                     if retained_plan["boot_id"] != current_boot:
+                        if not os.path.lexists(stage / kernel_retention.INTENT):
+                            return self._kernel_retention_unattempted(stage, latest, transaction, current_boot)
                         return self._kernel_retention_resume(stage, latest, transaction, current_boot)
                 acceptance, _, _ = kernel_updates.read_acceptance(stage)
                 if acceptance["boot_id"] == current_boot and transaction.get("kernel_finalization") == "complete":

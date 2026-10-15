@@ -520,6 +520,7 @@ class CompoundResumeTests(unittest.TestCase):
         self.patch(retain, 'require_linux_root')
         self.patch(retain, 'boot_id', return_value=self.new_boot)
         self.patch(retain, 'load_historical_plan', return_value=(self.original, self.original_sha))
+        self.patch(retain, 'load_original_plan', return_value=(self.original, self.original_sha))
         self.patch(retain.rpm, 'read', side_effect=lambda path, *args: Path(path).read_bytes())
         self.patch(retain.kernel, 'record', side_effect=self.record)
         self.patch(retain, 'atomic_json', side_effect=lambda path, value: Path(path).write_bytes(retain.kernel.encode(value)))

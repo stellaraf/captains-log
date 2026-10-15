@@ -506,15 +506,132 @@ class KernelLifecycleTests(TestCase):
         self.finish_later.assert_not_called()
         self.assertFalse(self.acceptance_path(stage).exists())
 
-    def test_unattempted_old_boot_retention_plan_is_held_without_erase_or_recovery(self):
+    def unattempted_retention_fixture(self):
         stage = self.later_retention_fixture()
         from nebulalog_manager import kernel_retention as retain
         (stage / retain.INTENT).unlink()
-        with self.assertRaisesRegex(Refused, 'Later-boot kernel retention') as caught:
-            self.manager.reboot_complete()
-        self.assertIn('new execution generation', str(caught.exception.__cause__))
+        self.proof['retention_integrity_sha256'] = None
+        from nebulalog_manager import kernel_boot
+        def resumed(*args, **kwargs):
+            self.calls.append('postboot')
+            # Use the real result contract: a boot proof has no top-level ok.
+            value = kernel_boot._result_fields({'phase': 'resume', 'boot_id': self.manager.boot_id(),
+                'kernel': self.kernel, 'old_kernel': self.old, 'running_kernel': self.kernel,
+                'operation_sha256': '1' * 64, 'candidate_plan_sha256': '2' * 64, 'installed_sha256': '3' * 64})
+            return {**value, 'aide': {'ok': True, 'plan_sha256': value['transition_sha256']}}
+        self.boot['verify_postboot'].side_effect = resumed
+        context = patch('nebulalog_adapters.lifecycle.kernel_retention.verify_unattempted',
+                        side_effect=lambda *args, **kwargs: self.calls.append('verify-unattempted'), create=True)
+        self.verify_unattempted = context.start(); self.addCleanup(context.stop)
+        def execute(directory, *, accepted, runner):
+            self.assertEqual(directory, stage)
+            self.assertEqual(accepted(directory)['boot_id'], self.manager.boot_id())
+            self.assertTrue(self.acceptance_path(stage).exists())
+            self.assertEqual(self.original_acceptance[0].read_bytes(), self.original_acceptance[1])
+            journal = json.loads((self.root / 'manager/os-transaction.json').read_text())
+            self.assertEqual(journal['kernel_finalization'], 'complete')
+            self.assertEqual(journal['kernel_retention'], 'pending')
+            self.assertEqual(journal['finalization'], 'pending')
+            self.calls.append('generation-erase')
+            return {'ok': True, 'status': 'complete'}
+        context = patch('nebulalog_adapters.lifecycle.kernel_integrity.retain_three', side_effect=execute)
+        self.execute_generation = context.start(); self.addCleanup(context.stop)
+        return stage
+
+    def test_unattempted_later_boot_accepts_boot_and_health_before_new_execution(self):
+        stage = self.unattempted_retention_fixture()
+        def gate(active, directory):
+            if not active:
+                self.assertEqual(directory, stage)
+                self.calls.append('release-gate')
+        self.manager.maintenance.side_effect = gate
+        result = self.manager.reboot_complete()
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(self.calls, ['verify-unattempted', 'postboot', 'health', 'promote',
+                                     'clear-pending', 'health', 'generation-erase', 'health', 'release-gate'])
         self.recover_later.assert_not_called()
         self.finish_later.assert_not_called()
+        current, _, _ = self.read_acceptance(stage)
+        self.assertEqual(current['previous_acceptance_sha256'], self.old_acceptance_sha)
+        self.assertEqual(self.original_acceptance[0].read_bytes(), self.original_acceptance[1])
+        for filename in ('os-latest.json', 'os-transaction.json'):
+            value = json.loads((self.root / 'manager' / filename).read_text())
+            self.assertEqual(value['boot_id'], 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')
+            self.assertEqual(value['observed_boot_id'], self.manager.boot_id())
+
+    def test_unattempted_changed_inventory_is_held_before_boot_or_erase(self):
+        stage = self.unattempted_retention_fixture()
+        self.verify_unattempted.side_effect = Refused('installed inventory changed')
+        with self.assertRaisesRegex(Refused, 'Unattempted later-boot retention') as caught:
+            self.manager.reboot_complete()
+        self.assertIn('installed inventory changed', str(caught.exception.__cause__))
+        self.boot['verify_postboot'].assert_not_called()
+        self.execute_generation.assert_not_called()
+        self.recover_later.assert_not_called()
+        self.finish_later.assert_not_called()
+        self.assertTrue(all(call.args == (True, stage) for call in self.manager.maintenance.call_args_list))
+
+    def test_unattempted_later_boot_failed_health_cannot_accept_or_execute(self):
+        stage = self.unattempted_retention_fixture()
+        self.manager.health.side_effect = None
+        self.manager.health.return_value = {'ok': True, 'checks': {name: name != 'local_auth' for name in REQUIRED_CHECKS}}
+        with self.assertRaisesRegex(Refused, 'Unattempted later-boot retention'):
+            self.manager.reboot_complete()
+        self.boot['commit_candidate'].assert_not_called()
+        self.execute_generation.assert_not_called()
+        self.assertFalse(self.acceptance_path(stage).exists())
+        self.assertTrue(all(call.args == (True, stage) for call in self.manager.maintenance.call_args_list))
+
+    def test_unattempted_fallback_kernel_never_starts_new_erasure(self):
+        stage = self.unattempted_retention_fixture()
+        self.boot['verify_postboot'].side_effect = None
+        self.boot['verify_postboot'].return_value = {'ok': True, 'outcome': 'recovery'}
+        with self.assertRaisesRegex(Refused, 'Unattempted later-boot retention'):
+            self.manager.reboot_complete()
+        self.manager.health.assert_not_called()
+        self.boot['commit_candidate'].assert_not_called()
+        self.execute_generation.assert_not_called()
+        self.assertFalse(self.acceptance_path(stage).exists())
+
+    def test_unattempted_foreign_boot_proof_never_starts_new_erasure(self):
+        stage = self.unattempted_retention_fixture()
+        verified = self.boot['verify_postboot'].side_effect
+        self.boot['verify_postboot'].side_effect = lambda *args, **kwargs: {
+            **verified(*args, **kwargs), 'boot_id': 'ffffffff-ffff-ffff-ffff-ffffffffffff'}
+        with self.assertRaisesRegex(Refused, 'Unattempted later-boot retention'):
+            self.manager.reboot_complete()
+        self.manager.health.assert_not_called()
+        self.execute_generation.assert_not_called()
+        self.assertFalse(self.acceptance_path(stage).exists())
+
+    def test_unattempted_acceptance_pointer_interruption_preserves_both_generations(self):
+        stage = self.unattempted_retention_fixture()
+        pointer = stage / 'kernel-acceptance-current.json'
+        original_atomic = atomic_json
+        def crash(path, value):
+            if path == pointer and value['boot_id'] == self.manager.boot_id():
+                raise SystemExit('interruption before current acceptance pointer')
+            return original_atomic(path, value)
+        with patch('nebulalog_adapters.lifecycle.atomic_json', side_effect=crash):
+            with self.assertRaises(SystemExit): self.manager.reboot_complete()
+        retained = self.acceptance_path(stage).read_bytes()
+        self.execute_generation.assert_not_called()
+        self.assertEqual(self.manager.reboot_complete()['status'], 'complete')
+        self.assertEqual(self.acceptance_path(stage).read_bytes(), retained)
+        self.assertEqual(self.original_acceptance[0].read_bytes(), self.original_acceptance[1])
+
+    def test_unattempted_boot_identity_race_never_promotes_or_executes(self):
+        stage = self.unattempted_retention_fixture()
+        original_health = self.manager.health.side_effect
+        def moved(*args, **kwargs):
+            value = original_health(*args, **kwargs)
+            self.manager.boot_id.return_value = 'dddddddd-dddd-dddd-dddd-dddddddddddd'
+            return value
+        self.manager.health.side_effect = moved
+        with self.assertRaisesRegex(Refused, 'Unattempted later-boot retention'):
+            self.manager.reboot_complete()
+        self.boot['commit_candidate'].assert_not_called()
+        self.execute_generation.assert_not_called()
         self.assertTrue(all(call.args == (True, stage) for call in self.manager.maintenance.call_args_list))
 
     def test_legacy_current_acceptance_preserves_its_missing_optional_field(self):

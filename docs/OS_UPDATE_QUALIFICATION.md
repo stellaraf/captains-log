@@ -93,10 +93,24 @@ they do not establish appliance-wide finalization. The operation journal and
 maintenance gate remain pending until retention and its postcheck complete,
 including when a crash leaves a new kernel acceptance already published.
 Source tests cover the real AIDE report/database chain and lifecycle ordering;
-native interrupted-erase recovery remains unqualified. A retained plan with no
-erase intent from an earlier boot requires a new execution-generation workflow,
-which is not yet implemented. An attempted but unchanged or partial inventory
-remains held rather than automatically repeating the erase.
+native interrupted-erase recovery remains unqualified.
+
+A retained plan from an earlier boot with no erase intent now has a separate
+execution-generation workflow. It first verifies that the signed package set,
+full inventory, removal targets and protected artifacts remain unchanged. The
+normal boot integrity path reconciles the qualified GRUB change, and fresh
+runtime checks publish a current-boot kernel acceptance. Only then can a new
+immutable plan bind that acceptance and the accepted GRUB state. The original
+plan and integrity records remain unchanged, as do the kernel removal scope
+and signed RPM evidence.
+
+One durable erase intent governs the entire operation, including all later
+execution generations. Recovery uses the exact generation referenced by that
+intent and its own AIDE preparation. A reboot before intent can create another
+generation after fresh checks; a reboot after erasure follows the compound
+integrity recovery path. An attempted but unchanged or partial inventory
+remains held rather than automatically repeating the erase. Native acceptance
+of the execution-generation workflow is still required.
 
 Factory builds now capture the exact installed four-package kernel set, its
 signed RPM bytes and installed inventory. Sealing and initial AIDE enrollment

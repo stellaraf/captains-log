@@ -179,11 +179,13 @@ def _bound_plan(manager, stage, path, *, preparing):
     if path == stage / 'ordinary-boot-plan.json':
         from . import ordinary_boot
         return ordinary_boot.bound_integrity_plan(manager, stage, path, preparing=preparing)
-    from . import kernel_boot, kernel_retention
+    from . import kernel_boot, kernel_retention, kernel_retention_generation
     if path.parent == stage and kernel_boot.NAME.fullmatch(path.name):
         return kernel_boot.bound_integrity_plan(manager, stage, path, preparing=preparing)
     if path == stage / kernel_retention.INTEGRITY:
         return kernel_retention.bound_integrity_plan(manager, stage, path, preparing=preparing)
+    if path.parent == stage and kernel_retention_generation.INTEGRITY_NAME.fullmatch(path.name):
+        return kernel_retention_generation.bound_integrity_plan(manager, stage, path, preparing=preparing)
     if path.parent == stage and kernel_retention.RESUME_NAME.fullmatch(path.name):
         return kernel_retention.bound_resume_integrity_plan(manager, stage, path, preparing=preparing)
     if path == stage / "os-integrity-plan.json":

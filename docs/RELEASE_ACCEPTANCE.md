@@ -2,6 +2,31 @@
 
 This is the release contract for the full request in [SPECIFICATION.md](SPECIFICATION.md), including the later Stellar branding/UI standards, Okta/Entra defaults with in-app instructions, and adjustable/pauseable refresh. It does not replace or narrow that request. Snapshot: **2026-09-07 local date, source checkpoint `44e2eb1`**. Concurrent Rocky image and first-boot implementation work is not accepted here until its actual results are recorded. **Version 1 is not complete; user sign-off has not occurred.**
 
+## Current source and native evidence — October 15, 2026
+
+Source checkpoint `b4e40401a44b240b2c157eb9357189502ef5906a` and public
+checkpoint `82772678992e443e66cfec1f2ae0e66865c12437` have the same Git tree,
+`191c57c287cfb91682f331789ace4d80990ade70`. The frozen Rocky x86_64 suites
+passed **1,315 appliance tests and 129 lifecycle-adapter tests**, with no
+skips. The source is published in [draft PR 1](https://github.com/stellaraf/captains-log/pull/1);
+it is not a merged or released appliance.
+
+This checkpoint adds ordinary-boot integrity reconciliation, immutable initial
+boot snapshots, recovery after interrupted integrity verification, and a
+periodic boot-verification timer. It also includes the preceding kernel update,
+boot promotion and interrupted-retention implementation. See
+[OS update qualification](OS_UPDATE_QUALIFICATION.md) for the transaction
+boundaries and remaining native tests. The source suite controls some host,
+scanner and runtime inputs; passing it does not establish a healthy guest.
+
+A separate read-only measurement of the Rocky qualification guest captured
+456 installed package identities and 6,253 protected boot/module artifacts,
+with matching repeated observations. It did not enroll production AIDE or
+accept a boot or update. The signed vendor kernel still fails the required
+FIPS crypto self-test. A sealed OVA, native VMware/Nutanix acceptance and final
+sign-off remain outstanding. **No requirement row is closed by this source
+checkpoint.** Earlier counts and results below are historical evidence.
+
 ## Subsequent implementation checkpoint — September 8, 2026
 
 The working tree now implements split collector status, a bounded read-only appliance status feed, first-boot console/bootstrap, offline OCI loading, lifecycle adapters, baseline review, initial release/source enrollment, publisher-key trust and measured inventory/storage windows. These changes are still uncommitted; `44e2eb1` identifies their base, not the built candidate's complete source. Exact source snapshots and OCI configuration labels are being captured for appliance images.
