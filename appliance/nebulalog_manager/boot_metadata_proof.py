@@ -53,9 +53,15 @@ def _head(value):
 
 def mode(plan):
     """Only these already-bound plan kinds can observe a different boot."""
-    if not isinstance(plan, dict) or type(plan.get('schema')) is not int or plan['schema'] != 1:
+    if not isinstance(plan, dict) or type(plan.get('schema')) is not int:
         refuse('invalid_plan')
     kind = plan.get('kind')
+    if kind is None:
+        from .boot_metadata_lineage import validate_host_schema
+        validate_host_schema(plan)
+        return 'mutation'
+    if plan['schema'] != 1:
+        refuse('invalid_plan')
     if kind == 'ordinary-boot-v1':
         result = 'observation'
     elif kind == 'kernel-boot-v1':
@@ -66,7 +72,7 @@ def mode(plan):
         result = 'observation'
     elif kind == 'rocky-kernel-rollback-v1':
         result = 'observation' if 'rollback_plan_sha256' in plan else 'mutation'
-    elif kind in {None, 'os-payload-v1', 'kernel-install-v1', 'rocky-kernel-retention-v1'}:
+    elif kind in {'os-payload-v1', 'kernel-install-v1', 'rocky-kernel-retention-v1'}:
         result = 'mutation'
     else:
         refuse('unsupported_plan_kind')

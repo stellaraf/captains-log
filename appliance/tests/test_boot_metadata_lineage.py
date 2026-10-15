@@ -15,6 +15,7 @@ import struct
 import zlib
 
 from nebulalog_manager import boot_metadata_lineage as lineage, kernel_boot as boot
+from nebulalog_manager import boot_metadata_proof as metadata_proof
 from nebulalog_manager import kernel_rollback as rollback, aide_updates as updates
 from nebulalog_manager.common import Refused
 from nebulalog_manager.host_job_storage import digest
@@ -135,6 +136,41 @@ class PureLineageTests(TestCase):
                 validate(evidence(stage, 'host-runtime-plan.json', {'schema': 1}), OLD, OLD)
         value = self.ordinary(stage='/fixture/manager/updates/releases/1-release')
         with self.assertRaises(Refused): validate(value)
+
+    def content_host(self):
+        return {'schema': 2, 'sequence': 12, 'manifest_sha256': 'a' * 64,
+                'coordinator_generation': 'b' * 64, 'candidate_generation': 'c' * 64,
+                'files': [], 'generation_additions': [], 'selection': {}, 'preserved': [],
+                'migration_only': [], 'content': {'schema': 1}, 'content_additions': []}
+
+    def test_content_host_schema2_retains_exact_body_and_cannot_advance_boot(self):
+        plan = self.content_host()
+        value = evidence('/fixture/manager/updates/releases/12-content', 'host-runtime-plan.json', plan)
+        self.assertEqual(validate(value, OLD, OLD), value)
+        self.assertEqual(metadata_proof.mode(plan), 'mutation')
+        with self.assertRaisesRegex(Refused, 'cannot_advance'): validate(value)
+        with self.assertRaisesRegex(Refused, 'current_plan_changed'):
+            lineage.validate(value, {**plan, 'manifest_sha256': 'd' * 64}, value['plan']['sha256'], OLD, OLD)
+        pending = {'release': value['stage'], 'plan_sha256': value['plan']['sha256'], 'plan': plan}
+        self.assertEqual(lineage.validate_pending(value, pending), pending)
+        with self.assertRaises(Refused):
+            lineage.validate_pending(value, {**pending, 'release': '/foreign/manager/updates/releases/12-content'})
+
+    def test_content_schema2_is_not_a_generic_plan_schema_extension(self):
+        stage = '/fixture/manager/updates/releases/12-content'
+        for change in ({'schema': 3}, {'schema': True}, {'kind': 'ordinary-boot-v1'},
+                       {'content': []}, {'content_additions': {}}, {'unexpected': True}):
+            with self.subTest(change=change), self.assertRaises(Refused):
+                validate(evidence(stage, 'host-runtime-plan.json', {**self.content_host(), **change}), OLD, OLD)
+            with self.subTest(proof_change=change), self.assertRaises(Refused):
+                metadata_proof.mode({**self.content_host(), **change})
+        for name in ('foreign-plan.json', 'os-integrity-plan.json'):
+            with self.subTest(name=name), self.assertRaises(Refused):
+                validate(evidence(stage, name, self.content_host()), OLD, OLD)
+        plan = self.content_host(); del plan['content']
+        with self.assertRaises(Refused): validate(evidence(stage, 'host-runtime-plan.json', plan), OLD, OLD)
+        ordinary = self.ordinary(); ordinary['records'][0]['body']['schema'] = 2; rehash_current(ordinary)
+        with self.assertRaisesRegex(Refused, 'invalid_plan_schema'): validate(ordinary)
 
     def test_mutation_does_not_accept_arbitrary_json_serialization(self):
         plan = {'schema': 1, 'kind': 'os-payload-v1'}

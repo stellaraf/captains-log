@@ -421,16 +421,33 @@ def _rollback_edge(current, before_raw, before_boot, before, original):
         refuse('rollback_environment_edge_changed')
 
 
+def validate_host_schema(plan):
+    """Pure shape only: signed recipe/path authority remains with the AIDE owner."""
+    if type(plan.get('schema')) is not int or plan['schema'] not in (1, 2):
+        refuse('invalid_plan_schema')
+    if plan['schema'] == 2:
+        exact(plan, {'schema', 'sequence', 'manifest_sha256', 'coordinator_generation',
+                     'candidate_generation', 'files', 'generation_additions', 'selection',
+                     'preserved', 'migration_only', 'content', 'content_additions'})
+        if not isinstance(plan['content'], dict) or not isinstance(plan['content_additions'], list):
+            refuse('invalid_host_content_shape')
+
+
 def _walk(stage, reference, plan, get, *, pending_origin=False):
     kind, name = plan.get('kind'), reference['filename']
-    if type(plan.get('schema')) is not int or plan['schema'] != 1:
+    if type(plan.get('schema')) is not int:
         refuse('invalid_plan_schema')
-    if kind == 'ordinary-boot-v1':
-        return 'observation', *_ordinary(stage, name, plan, get)
     if kind is None:
         if name != 'host-runtime-plan.json' or Path(stage).parent.name != 'releases':
             refuse('host_owner_changed')
+        # Keep the exact already-bound host body. Content changes still cannot
+        # advance or excuse a boot transition.
+        validate_host_schema(plan)
         return 'mutation', set(), None
+    if plan['schema'] != 1:
+        refuse('invalid_plan_schema')
+    if kind == 'ordinary-boot-v1':
+        return 'observation', *_ordinary(stage, name, plan, get)
     if Path(stage).parent.name != 'os-updates':
         # Host plans use their separate enrolled update stage family. The
         # caller supplies that exact private stage; it cannot observe a boot.
