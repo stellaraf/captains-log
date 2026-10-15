@@ -229,7 +229,8 @@ class OSStorageLifecycleTests(TestCase):
     def test_fresh_preflight_publishes_owner_before_backup_failure(self):
         self.manager.boot_id = Mock(return_value=BOOT)
         self.manager.trusted_repositories = Mock(return_value=["baseos"])
-        atomic_json(self.root / "manager/os-transaction.json", {"state": "preflight"})
+        self.manager._os_preflight_context = Mock(return_value={"boot_id": BOOT})
+        atomic_json(self.root / "manager/os-transaction.json", {"state": "preflight", "payload_started": False})
         def backup(stage, **flags):
             self.assertEqual(self.read()["stage"], str(stage))
             self.assertEqual(self.read()["storage_maintenance"], "held")
@@ -243,6 +244,7 @@ class OSStorageLifecycleTests(TestCase):
     def test_scheduler_no_updates_runs_real_adapter_finalization(self):
         self.manager.boot_id = Mock(return_value=BOOT)
         self.manager.trusted_repositories = Mock(return_value=["baseos"])
+        self.manager._os_preflight_context = Mock(return_value={"boot_id": BOOT})
         self.manager.health = Mock(return_value={"ok": True, "checks": CHECKS})
         state = self.root / "manager"
         atomic_json(state / "updates/transaction.json", {"state": "preflight_failed"})

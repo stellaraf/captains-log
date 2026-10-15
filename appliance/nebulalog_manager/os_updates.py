@@ -59,7 +59,8 @@ def maintain(config: Path, state: Path=Path("/var/lib/nebulalog/manager"), runne
             component = json.loads(component_record.read_text())
             if component.get("state") not in ("preflight_failed", "committed", "rolled_back") or (component.get("state") in ("committed", "rolled_back") and component.get("finalization") != "complete"):
                 raise Refused("Component maintenance must finish before OS maintenance")
-        transaction = dict(previous) if resume else {"state": "preflight", "started_at": datetime.now(timezone.utc).isoformat()}
+        transaction = dict(previous) if resume else {"state": "preflight", "payload_started": False,
+                                                     "started_at": datetime.now(timezone.utc).isoformat()}
         if previous and previous.get("reboot_pending") is True and not resume:
             # Planning/network failures must not erase an earlier deferred reboot.
             transaction.update(reboot_pending=True, prior_reboot_stage=previous.get("stage"))
@@ -126,7 +127,7 @@ def maintain(config: Path, state: Path=Path("/var/lib/nebulalog/manager"), runne
                 if no_updates:
                     record("postcheck", no_updates=True, plan_sha256=None)
                 else:
-                    record("updating", plan_sha256=plan["plan_sha256"])
+                    record("updating", plan_sha256=plan["plan_sha256"], payload_started=True)
                     os_payload.apply(Path(stage), runner=runner)
                     record("postcheck")
             if not status(runner)["host_controls_ok"]:

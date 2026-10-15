@@ -1702,18 +1702,234 @@ END $fence$; SELECT 'fenced';"""
         boot_id = self.boot_id()
         journal = self.data / "manager/os-transaction.json"
         transaction = json.loads(trusted_file(journal).read_text())
-        if transaction.get("state") != "preflight" or transaction.get("stage") is not None:
+        if (transaction.get("state") != "preflight" or transaction.get("stage") is not None
+                or transaction.get("payload_started") is not False):
             raise Refused("OS backup requires a new scheduler-owned preflight")
-        # Publish ownership before backup acquires either persistent hold. A
-        # crash in backup is retained recovery work, never an anonymous gate.
-        atomic_json(journal, {**transaction, "stage": str(stage), "boot_id": boot_id,
-                             "storage_maintenance": "held", "finalization": "pending"})
-        atomic_json(self.data / "manager/os-latest.json", {"stage": str(stage), "state": "backup_preparing",
-                    "boot_id": boot_id, "observed_at": datetime.now(timezone.utc).isoformat()})
-        result = self.backup(stage, os_backup=True)
-        atomic_json(self.data / "manager/os-latest.json", {"stage": str(stage), "state": "prepared",
-                    "boot_id": boot_id, "observed_at": datetime.now(timezone.utc).isoformat()})
+        with self._os_preflight_lease(stage):
+            latest = self.data / "manager/os-latest.json"
+            proof = {"schema": 1, "stage": str(stage), "boot_id": boot_id,
+                     "scheduler": transaction,
+                     "previous_latest_sha256": digest_file(trusted_file(latest)) if os.path.lexists(latest) else None,
+                     "context": self._os_preflight_context()}
+            if proof["context"]["boot_id"] != boot_id:
+                raise Refused("OS preflight boot changed while capturing cancellation evidence")
+            # Immutable evidence precedes both owner publication and any hold.
+            checksum = self._schema_record(stage / "os-preflight-intent.json", proof)
+            atomic_json(journal, {**transaction, "stage": str(stage), "boot_id": boot_id,
+                                 "preflight_sha256": checksum, "storage_maintenance": "held", "finalization": "pending"})
+            latest_value = {"stage": str(stage), "state": "backup_preparing", "boot_id": boot_id,
+                            "preflight_sha256": checksum, "observed_at": datetime.now(timezone.utc).isoformat()}
+            atomic_json(latest, latest_value)
+            result = self.backup(stage, os_backup=True)
+            atomic_json(latest, {**latest_value, "state": "prepared"})
         return {**result, "repositories": repositories, "stage": str(stage), "boot_id": boot_id}
+
+    def _os_preflight_lease(self, stage):
+        """Keep the hook and any surviving native command behind one fence."""
+        import contextlib
+        @contextlib.contextmanager
+        def lease():
+            path = stage / "os-preflight.lock"
+            with locked(path) as descriptor:
+                self._os_command_records(stage)
+                original = self.cmd
+                if type(original) is Commands:
+                    self.cmd = Commands(inherited_locks=((descriptor, path),),
+                        observer=lambda phase, kind, **details: self._os_command_event(stage, phase, kind, **details))
+                try:
+                    yield descriptor
+                finally:
+                    self.cmd = original
+        return lease()
+
+    def _os_command_records(self, stage):
+        """Client exit/FD absence is not acknowledgement of delegated effects."""
+        tokens = set()
+        for path in stage.glob("os-command-*"):
+            match = re.fullmatch(r"os-command-([0-9a-f]{32})-(intent|complete)\.json", path.name)
+            if match is None:
+                raise Refused("Unknown OS command evidence")
+            tokens.add(match[1])
+        if len(tokens) > 1024:
+            raise Refused("OS command evidence limit reached")
+        for token in sorted(tokens):
+            intent_path = stage / ("os-command-" + token + "-intent.json")
+            raw = trusted_file(intent_path).read_bytes()
+            intent = strict_json(raw)
+            if (not isinstance(intent, dict) or set(intent) != {"schema", "id", "stage", "boot_id", "kind", "command_sha256"}
+                    or type(intent["schema"]) is not int or intent["schema"] != 1
+                    or intent["id"] != token or intent["stage"] != str(stage) or intent["boot_id"] != self.boot_id()
+                    or intent["kind"] not in {"call", "capture", "feed"}
+                    or not isinstance(intent["command_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", intent["command_sha256"])
+                    or raw != (json.dumps(intent, sort_keys=True, separators=(",", ":")) + "\n").encode()):
+                raise Refused("OS command intent changed")
+            complete = stage / ("os-command-" + token + "-complete.json")
+            if not os.path.lexists(complete):
+                raise Refused("An OS command has no successful completion acknowledgement; recovery remains held")
+            expected = {"schema": 1, "id": token, "intent_sha256": hashlib.sha256(raw).hexdigest(), "success": True}
+            if trusted_file(complete).read_bytes() != (json.dumps(expected, sort_keys=True, separators=(",", ":")) + "\n").encode():
+                raise Refused("OS command completion evidence changed")
+        return len(tokens)
+
+    def _os_command_event(self, stage, phase, kind, *, argv=None, ticket=None):
+        if kind not in {"call", "capture", "feed"}:
+            raise Refused("Unknown OS command boundary")
+        if phase == "dispatch":
+            if self._os_command_records(stage) >= 1024:
+                raise Refused("OS command evidence limit reached")
+            token = uuid.uuid4().hex
+            value = {"schema": 1, "id": token, "stage": str(stage), "boot_id": self.boot_id(), "kind": kind,
+                     "command_sha256": hashlib.sha256(json.dumps(argv, separators=(",", ":"), allow_nan=False).encode()).hexdigest()}
+            checksum = self._schema_record(stage / ("os-command-" + token + "-intent.json"), value)
+            return {"id": token, "intent_sha256": checksum}
+        if phase != "complete" or not isinstance(ticket, dict) or set(ticket) != {"id", "intent_sha256"}:
+            raise Refused("Unknown OS command acknowledgement")
+        token = ticket["id"]
+        if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
+            raise Refused("Invalid OS command acknowledgement")
+        path = trusted_file(stage / ("os-command-" + token + "-intent.json"))
+        intent = strict_json(path.read_bytes())
+        if (digest_file(path) != ticket["intent_sha256"] or intent.get("stage") != str(stage)
+                or intent.get("boot_id") != self.boot_id() or intent.get("kind") != kind):
+            raise Refused("OS command acknowledgement belongs to another invocation")
+        self._schema_record(stage / ("os-command-" + token + "-complete.json"), {"schema": 1, **ticket, "success": True})
+
+    def _os_preflight_context(self):
+        """Measure unchanged-runtime authority without accepting an AIDE change."""
+        from nebulalog_manager import aide_updates
+        def snapshot(directory):
+            files = inventory(directory)
+            paths = [directory, *sorted(directory.rglob("*"))]
+            details = []
+            for path in paths:
+                info = path.lstat()
+                details.append({"path": path.relative_to(directory).as_posix(),
+                    "mode": info.st_mode, "uid": info.st_uid, "gid": info.st_gid,
+                    "inode": info.st_ino, "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns,
+                    "metadata": aide_updates._metadata(path)})
+            return {"files": files, "details": details}
+        manager = aide.Aide()
+        if manager.guard().root != self.data:
+            raise Refused("OS cancellation integrity belongs to another appliance")
+        history = aide_updates.accepted_plan_history(manager=manager)
+        xml, _, packages = os_payload.inventory(self.cmd)
+        pending = self.data / "manager/kernel-pending.json"
+        return {"boot_id": self.boot_id(), "kernel": self.cmd(["/usr/bin/uname", "-r"]),
+                "default_kernel": self.cmd(["/usr/sbin/grubby", "--default-kernel"]),
+                "grubenv": kernel_updates.describe(Path(kernel_boot.ENV)),
+                "rpm_xml_sha256": hashlib.sha256(xml.encode()).hexdigest(), "packages": packages,
+                "configuration": snapshot(self.configuration), "quadlets": snapshot(self.quadlets),
+                "application_schema": self.application_schema_current(),
+                "kernel_pending_sha256": digest_file(trusted_file(pending)) if os.path.lexists(pending) else None,
+                "integrity": {"head": history["head"], "database_sha256": history["database_sha256"],
+                    "original_enrollment_sha256": hashlib.sha256(json.dumps(history["original_enrollment"],
+                        sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()}}
+
+    def _os_cancellation_planning(self, stage):
+        """Freeze inert preparation; any execution or deferred owner refuses."""
+        allowed = {"kernel-plan.json", "kernel-inventory-before.xml", "rpm-inventory-before.xml"}
+        directories = {"kernel-packages", "kernel-keydb"}
+        for path in stage.iterdir():
+            if path.name.startswith(("kernel-", "rpm-")):
+                if path.name in directories and path.is_dir() and not path.is_symlink():
+                    inventory(path)  # Private planning trees may contain no links or special files.
+                elif path.name not in allowed or path.is_symlink() or not path.is_file():
+                    raise Refused("OS cancellation cannot abandon package or kernel execution evidence")
+            if path.name.startswith(("adapter-activate", "adapter-reboot", "adapter-database-restore",
+                                     "adapter-application-schema-intent")):
+                raise Refused("OS cancellation cannot abandon lifecycle effects")
+        names = allowed | {"operation.json", "os-payload-plan.json", "os-integrity-plan.json", "os-no-updates.json"}
+        return {name: digest_file(trusted_file(stage / name)) for name in sorted(names) if os.path.lexists(stage / name)}
+
+    def _os_cancel_preapply(self, transaction, manager_lock_fd):
+        """Cancel only an unchanged original boot, never restore a partial dump."""
+        journal = self.data / "manager/os-transaction.json"
+        latest_path = self.data / "manager/os-latest.json"
+        stage = Path(transaction.get("stage", ""))
+        if (not stage.is_absolute() or stage.is_symlink() or stage.resolve() != stage
+                or stage.parent != self.data / "manager/os-updates" or not re.fullmatch(r"[0-9a-f]{32}", stage.name)
+                or transaction.get("payload_started") is not False
+                or transaction.get("storage_maintenance") not in {"held", "release_pending"}
+                or any(transaction.get(field) is not None for field in ("kernel_finalization", "kernel_retention", "kernel_rollback", "kernel_retry"))):
+            raise Refused("OS cancellation requires exact retained same-boot unattempted preflight ownership")
+        with self._os_preflight_lease(stage):
+            proof_path = trusted_file(stage / "os-preflight-intent.json")
+            raw = proof_path.read_bytes()
+            proof = strict_json(raw)
+            if (not isinstance(proof, dict)
+                    or set(proof) != {"schema", "stage", "boot_id", "scheduler", "previous_latest_sha256", "context"}
+                    or type(proof["schema"]) is not int or proof["schema"] != 1
+                    or not isinstance(proof["scheduler"], dict) or not isinstance(proof["context"], dict)
+                    or proof["stage"] != str(stage) or proof["boot_id"] != transaction.get("boot_id")
+                    or self.boot_id() != proof["boot_id"]
+                    or hashlib.sha256(raw).hexdigest() != transaction.get("preflight_sha256")
+                    or raw != (json.dumps(proof, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                    or proof["scheduler"].get("state") != "preflight"
+                    or proof["scheduler"].get("payload_started") is not False
+                    or proof["scheduler"].get("reboot_pending") is True
+                    or proof["context"].get("kernel_pending_sha256") is not None):
+                raise Refused("OS cancellation preflight evidence changed or owns a pending reboot")
+            latest = strict_json(trusted_file(latest_path).read_bytes()) if os.path.lexists(latest_path) else None
+            if latest is None or latest.get("stage") != str(stage):
+                predecessor = digest_file(trusted_file(latest_path)) if latest is not None else None
+                if predecessor != proof["previous_latest_sha256"]:
+                    raise Refused("OS cancellation latest journal has a foreign owner")
+                latest = {"stage": str(stage), "boot_id": proof["boot_id"], "state": "backup_preparing",
+                          "preflight_sha256": transaction["preflight_sha256"]}
+            if (latest.get("preflight_sha256") != transaction["preflight_sha256"]
+                    or latest.get("state") not in {"backup_preparing", "prepared", "preapply_cancel_failed", "postcheck_passed"}):
+                raise Refused("OS cancellation latest journal passed the preparation boundary")
+            self._reboot_binding(latest, transaction)
+            planning = self._os_cancellation_planning(stage)
+            if transaction.get("reboot_pending") is True and not (
+                    transaction.get("kernel_reboot_required") is True and "kernel-plan.json" in planning):
+                raise Refused("OS cancellation cannot abandon an existing reboot obligation")
+            if proof["context"] != self._os_preflight_context():
+                raise Refused("OS runtime changed since the immutable preflight evidence")
+            intent = {"schema": 1, "stage": str(stage), "boot_id": proof["boot_id"],
+                      "preflight_sha256": transaction["preflight_sha256"], "planning": planning}
+            intent_sha = self._schema_record(stage / "os-cancellation-intent.json", intent)
+            transaction = {**transaction, "state": "recovery_required", "recovery_phase": "cancel_preapply",
+                           "finalization": "pending", "cancellation_sha256": intent_sha}
+            atomic_json(journal, transaction)
+            atomic_json(latest_path, latest)
+            try:
+                self.storage_maintenance(stage, held=True, delivery_held=True, host_only=True)
+                self.maintenance(True, stage)
+                self.service("stop", tuple(name for name in reversed(self.services) if name != "postgresql"))
+                self.service("start", ("postgresql",))
+                self.pg_ready()
+                self.storage_maintenance(stage, held=True, delivery_held=True)
+                self.application_schema_check(stage, proof["context"]["application_schema"])
+                if proof["context"] != self._os_preflight_context():
+                    raise Refused("OS context changed while settling preflight recovery")
+                self.service("start", tuple(name for name in self.services if name != "postgresql"))
+                integrity = aide.Aide().check_for_transaction(manager_lock_fd)
+                if integrity.get("state") != "clean" or integrity.get("exit_code") != 0:
+                    raise Refused("Unchanged OS cancellation requires a fresh clean integrity check")
+                result = self.health(stage, os_health=True)
+                if (result.get("ok") is not True or any(result.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS)
+                        or proof["context"] != self._os_preflight_context()
+                        or planning != self._os_cancellation_planning(stage)):
+                    raise Refused("OS cancellation requires unchanged current runtime and complete health")
+                completion = {"schema": 1, "stage": str(stage), "boot_id": proof["boot_id"],
+                              "intent_sha256": intent_sha, "preflight_sha256": transaction["preflight_sha256"]}
+                self._schema_record(stage / "os-cancellation-complete.json", completion)
+                atomic_json(latest_path, {**latest, "state": "postcheck_passed"})
+                transaction = {**transaction, "state": "complete", "status": "cancelled", "reboot_pending": False,
+                               "health": result["checks"], "health_boot_id": proof["boot_id"], "finalization": "pending"}
+                atomic_json(journal, transaction)
+                completed = self._os_finalize(stage, transaction, result["checks"], proof["boot_id"])
+            except Exception as exc:
+                retained = strict_json(trusted_file(journal).read_bytes())
+                if retained.get("state") != "complete":
+                    atomic_json(latest_path, {**latest, "state": "preapply_cancel_failed"})
+                    atomic_json(journal, {**retained, "state": "recovery_required", "recovery_phase": "cancel_preapply",
+                                         "error": type(exc).__name__})
+                raise Refused("OS cancellation remains held; retry exact recovery after resolving the failure") from exc
+            audit(self.data / "manager/audit.jsonl", "os.preapply_cancelled", stage=str(stage))
+            return self.receipt(stage, "os-recover", checks=result["checks"], status="cancelled", reboot_pending=False,
+                                finalized=completed["finalization"] == "complete", storage_released=completed["storage_maintenance"] == "released")
 
     def _os_finalize(self, stage, transaction, checks, current_boot):
         """Release destructive storage authority only after durable OS acceptance.
@@ -1808,11 +2024,17 @@ END $fence$; SELECT 'fenced';"""
         """Recover retained OS work, including a verified old-kernel recovery boot."""
         self.guard()
         self.encrypted()
-        with locked(self.data / "manager/transaction.lock"), locked(self.data / "manager/updates/transaction.lock"):
+        with locked(self.data / "manager/transaction.lock") as manager_lock_fd, locked(self.data / "manager/updates/transaction.lock"):
             path = self.data / "manager/os-latest.json"
             journal = self.data / "manager/os-transaction.json"
-            latest = json.loads(trusted_file(path).read_text())
             transaction = json.loads(trusted_file(journal).read_text())
+            cancelling = (transaction.get("state") in {"preflight", "planning"}
+                or transaction.get("state") == "recovery_required" and transaction.get("recovery_phase") in {"preflight", "planning", "cancel_preapply"}
+                or transaction.get("state") == "complete" and transaction.get("status") == "cancelled"
+                    and transaction.get("finalization") in {"pending", "failed"})
+            if cancelling:
+                return self._os_cancel_preapply(transaction, manager_lock_fd)
+            latest = json.loads(trusted_file(path).read_text())
             stage = Path(latest["stage"])
             current_boot = self.boot_id()
             preparing = transaction.get("state") == "reboot_preparing" or transaction.get("recovery_phase") == "reboot_preparing"

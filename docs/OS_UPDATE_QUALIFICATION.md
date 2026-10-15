@@ -29,6 +29,29 @@ health and completed acceptance, rollback and retention obligations. A deferred
 retry keeps the original stage owner and refreshes its backup; it does not begin
 a second package transaction or transfer authority to a different operation.
 
+`os-recover` can cancel a failed backup or planning attempt on its original boot
+when the scheduler explicitly recorded that payload application never started.
+An immutable record published before backup binds the exact packages, boot
+selection, configuration, Quadlets, schema provenance and authenticated AIDE
+head/database. Recovery rejects drift, prior reboot obligations, pending or
+adopted candidates, and any package/kernel execution evidence. Inert plans and
+partial backup bytes are retained; cancellation neither restores a dump nor
+accepts an AIDE change. It settles the owned storage barrier, starts the unchanged
+runtime, runs a plain integrity check and full health checks, then records
+cancellation before releasing the hold. A fresh kernel plan's reboot hint alone
+does not prevent cancellation when no candidate was installed or adopted.
+
+Native preflight and cancellation commands retain a per-stage lock and private
+dispatch/completion records containing command digests, never raw arguments,
+input or output. A successful foreground return is required for acknowledgement.
+Missing acknowledgements remain held and are never replayed, even when the
+client has exited or its inherited lock is available. The lock is supplementary;
+it does not prove that systemd or Podman retained an inherited descriptor or
+finished delegated work. Legacy stages without the immutable preflight proof
+also remain held. Source tests include actual Python subprocess/flock survival
+and lost-acknowledgement cases; native delegated-command recovery still needs
+separate qualification.
+
 ## Measured native result
 
 On the disposable Rocky 9.8 x86_64 VMware guest, the signed `linux-firmware-whence` package was set to `20260707-161.1.el9_8` as an explicit test fixture, then upgraded by the exact executor to `20260804-161.2.el9_8`. The latter was the original installed version. This changes the real `/usr/share/licenses/linux-firmware-whence/WHENCE` payload. Both versions were downloaded from the official Rocky 9 BaseOS repository and verified against the enrolled Rocky key.
@@ -339,9 +362,10 @@ The following cases remain explicit qualification or implementation gaps:
   its once-only RPM-command boundary.
 - Native retry/rollback qualification after verified fallback, including the
   armed success-timer interruption described above.
-- Safe automatic cancellation after an incomplete OS backup or planning failure
-  still needs immutable evidence that no package mutation began. Its exact
-  operation-owned storage hold remains in place until qualified recovery.
+- Recovery of an interrupted native command without a successful completion
+  acknowledgement, or an older backup/planning attempt without immutable
+  preflight proof, remains held. A missing client process or available lock does
+  not resolve delegated effects or authorize release.
 - A later unrelated boot after an initial kernel arm was aborted remains held;
   it is not classified as a candidate fallback. Same-stage rearm requires the
   original boot, and this later-boot cancellation observation needs a separate

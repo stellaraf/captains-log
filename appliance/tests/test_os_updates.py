@@ -86,7 +86,21 @@ class OSMaintenanceTests(unittest.TestCase):
             with self.assertRaisesRegex(Refused, "unsupported scriptlet"):self.run_maintenance()
             apply.assert_not_called()
         self.assertEqual(json.loads((self.root/"os-transaction.json").read_text())["state"], "recovery_required")
+        self.assertIs(json.loads((self.root/"os-transaction.json").read_text())["payload_started"], False)
         self.assertNotIn(["systemctl", "reboot"], self.calls)
+
+    def test_payload_attempt_is_durable_before_apply_and_never_reset_after_failure(self):
+        def apply(stage, **kwargs):
+            transaction = json.loads((self.root / "os-transaction.json").read_text())
+            self.assertEqual(transaction["state"], "updating")
+            self.assertIs(transaction["payload_started"], True)
+            raise Refused("application result unknown")
+        with patch("nebulalog_manager.os_payload.apply", side_effect=apply):
+            with self.assertRaisesRegex(Refused, "result unknown"):
+                self.run_maintenance()
+        transaction = json.loads((self.root / "os-transaction.json").read_text())
+        self.assertEqual(transaction["recovery_phase"], "updating")
+        self.assertIs(transaction["payload_started"], True)
 
     def test_no_updates_does_not_apply_packages_or_request_reboot(self):
         self.reboot_needed=False
