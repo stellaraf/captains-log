@@ -121,3 +121,32 @@ class RetainedAcceptanceTests(TestCase):
         with updates._locked(self.manager):
             with self.assertRaisesRegex(Refused, 'lock_owner_changed'):
                 updates.retained_plan_acceptance(self.stage, self.plan_path, manager=self.fresh(), expected=proof)
+
+    def test_verified_history_is_chronological_and_read_only(self):
+        proof = self.accept()
+        before = {str(path): path.read_bytes() for path in self.state.rglob('*') if path.is_file()}
+        history = updates.accepted_plan_history(manager=self.manager)
+        self.assertEqual(history['head'], proof['entry'])
+        self.assertEqual(history['database_sha256'], proof['database_sha256'])
+        self.assertEqual(history['current_database_sha256'], proof['database_sha256'])
+        self.assertEqual(len(history['history']), 1)
+        row = history['history'][0]
+        self.assertEqual(row['entry_ref'], proof['entry'])
+        self.assertEqual(row['plan'], self.plan)
+        self.assertEqual(row['prepared']['release'], str(self.stage))
+        self.assertEqual(before, {str(path): path.read_bytes() for path in self.state.rglob('*') if path.is_file()})
+
+    def test_verified_history_does_not_adopt_unknown_current_database(self):
+        self.accept()
+        self.write_private(self.state / 'aide.db.gz', gzip.compress(b'unknown', mtime=0))
+        with self.assertRaisesRegex(Refused, 'current_database_changed'):
+            updates.accepted_plan_history(manager=self.manager)
+
+    def test_pending_update_cannot_be_read_as_an_ordinary_boot_owner(self):
+        self.prepare_update()
+        self.activate()
+        with patch.object(updates, '_complete', side_effect=OSError('interrupted update')):
+            with self.assertRaises(OSError): self.accept_update()
+        for owner in (None, self.stage):
+            with self.subTest(owner=owner), self.assertRaisesRegex(Refused, 'history_pending_owner_required'):
+                updates.accepted_plan_history(manager=self.manager, allow_pending_owner=owner)

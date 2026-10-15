@@ -34,6 +34,50 @@ class RpmPolicyTests(unittest.TestCase):
         self.assertEqual(rpm.identity(rpm.headers(data)[0])['nevra'], 'passt-0:0^20251210.gd04c480-6.el9_8.x86_64')
         self.assertEqual(rpm.payload(header())['files'][1]['sha256'], hashlib.sha256(b'license').hexdigest())
 
+    def test_native_missing_arch_key_record_is_preserved_in_complete_inventory(self):
+        # Exact scalar shape observed on the Rocky qualification guest. RPM
+        # renders its missing Arch as (none) in queryformat, but omits the XML tag.
+        key = '<rpmHeader><rpmTag name="Name"><string>gpg-pubkey</string></rpmTag><rpmTag name="Version"><string>350d275d</string></rpmTag><rpmTag name="Release"><string>6279464b</string></rpmTag></rpmHeader>'
+        package = '<rpmHeader><rpmTag name="Name"><string>passt</string></rpmTag><rpmTag name="Version"><string>0^20251210.gd04c480</string></rpmTag><rpmTag name="Release"><string>6.el9_8</string></rpmTag><rpmTag name="Arch"><string>x86_64</string></rpmTag></rpmHeader>'
+        xml = key + package
+        runner = Mock(return_value=xml)
+        retained, headers, inventory = rpm.inventory(runner)
+        self.assertEqual(retained, xml)
+        self.assertEqual(len(headers), 2)
+        self.assertNotIn('Arch', headers[0])
+        self.assertEqual(rpm.identity(headers[0]), {'name': 'gpg-pubkey', 'arch': 'none',
+                         'nevra': 'gpg-pubkey-0:350d275d-6279464b.none'})
+        self.assertEqual(inventory, ['gpg-pubkey-0:350d275d-6279464b.none', 'passt-0:0^20251210.gd04c480-6.el9_8.x86_64'])
+        self.assertNotEqual(inventory, rpm.inventory(Mock(return_value=package))[2])
+        rotated = key.replace('350d275d', 'deadbeef') + package
+        self.assertNotEqual(inventory, rpm.inventory(Mock(return_value=rotated))[2])
+        runner.assert_called_once_with(['/usr/bin/rpm', '--query', '--all', '--xml'], timeout=180)
+
+    def test_absent_arch_exception_rejects_malformed_or_ambiguous_key_records(self):
+        key = {'Name': ['gpg-pubkey'], 'Version': ['350d275d'], 'Release': ['6279464b']}
+        for change in ({'Arch': []}, {'Arch': ['none']}, {'Arch': ['noarch']}, {'Arch': ['x86_64']},
+                       {'Arch': ['noarch', 'x86_64']}, {'Epoch': [1]}, {'Epoch': [False]},
+                       {'Version': ['350d275']}, {'Version': ['350D275D']}, {'Version': ['invalid!']},
+                       {'Release': ['not-time']}, {'Release': ['6279464b', '6279464c']},
+                       {'Name': ['gpg-pubkey', 'other']}):
+            with self.subTest(change=change), self.assertRaises(Refused):
+                rpm.identity({**key, **change})
+        self.assertEqual(rpm.identity({**key, 'Epoch': [0]})['arch'], 'none')
+
+    def test_normal_package_missing_arch_does_not_acquire_pseudo_architecture(self):
+        for name in ('kernel-core', 'linux-firmware-whence', 'gpg-pubkey-extra', 'GPG-pubkey'):
+            for arch in (None, [], ['']):
+                value = {'Name': [name], 'Version': ['350d275d'], 'Release': ['6279464b']}
+                if arch is not None: value['Arch'] = arch
+                with self.subTest(name=name, arch=arch), self.assertRaises(Refused): rpm.identity(value)
+
+    def test_inventory_pseudo_package_cannot_enter_inert_payload_installer(self):
+        value = {**header(), 'Name': ['gpg-pubkey'], 'Version': ['350d275d'], 'Release': ['6279464b']}
+        del value['Arch']
+        self.assertEqual(rpm.identity(value)['arch'], 'none')
+        with self.assertRaisesRegex(Refused, 'package_requires_migration_recipe'):
+            rpm.payload(value)
+
     def test_header_parser_refuses_entities_duplicates_and_unexpected_types(self):
         for data in ('<!DOCTYPE rpmHeader><rpmHeader/>', '<rpmHeader><rpmTag name="Name"/><rpmTag name="Name"/></rpmHeader>', '<rpmHeader><rpmTag name="Name"><file>bad</file></rpmTag></rpmHeader>'):
             with self.subTest(data=data), self.assertRaises(Refused):rpm.headers(data)

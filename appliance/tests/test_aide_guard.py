@@ -36,6 +36,7 @@ class AideGuardTests(unittest.TestCase):
         enrolled = {"installation_id": INSTALLATION, "initial_release_sha256": "b" * 64, "provenance": self.descriptor, "current": current}
         self.enrolled, self.current = enrolled, current
         patches = [patch.object(aide, "protected_bytes", side_effect=lambda path, **_: self.files.get(str(path), self.content)),
+                   patch.object(aide, 'initial_boot_snapshot', return_value={'ordinary_boot_snapshot_sha256': 'f' * 64}),
                    patch.object(aide.pwd, "getpwnam", side_effect=KeyError("no build user")),
                    patch.object(Path, "exists", return_value=False), patch.object(Path, "is_symlink", return_value=False),
                    patch("nebulalog_manager.update_enrollment.UpdateEnrollment._descriptor", return_value=(self.descriptor, "b" * 64, "c" * 64)),
@@ -71,6 +72,7 @@ class AideGuardTests(unittest.TestCase):
         self.assertEqual(self.runner.call_count, 4)
         self.assertEqual(value['factory_kernel_manifest_sha256'], aide.sha(self.content))
         self.assertEqual(value['factory_kernel_inventory_sha256'], aide.sha(self.content))
+        self.assertEqual(value['ordinary_boot_snapshot_sha256'], 'f' * 64)
 
     def test_initial_factory_provenance_missing_changed_or_unverified_refuses(self):
         self.files['/usr/libexec/nebulalog/factory-kernel'] = b'changed helper'

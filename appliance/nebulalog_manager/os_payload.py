@@ -115,8 +115,19 @@ def one(header, name, default=None):
 
 
 def identity(header):
-    name, version, release, arch = (one(header, field) for field in ('Name', 'Version', 'Release', 'Arch'))
+    name, version, release = (one(header, field) for field in ('Name', 'Version', 'Release'))
     epoch = one(header, 'Epoch', 0)
+    if name == 'gpg-pubkey':
+        # RPM's installed-key pseudo-package has no Arch tag. Preserve its key
+        # ID and creation time in the complete inventory instead of dropping it
+        # or treating every package with a missing architecture as equivalent.
+        if ('Arch' in header or type(epoch) is not int or epoch != 0
+                or any(not isinstance(item, str) or not re.fullmatch(r'[a-f0-9]{8}', item)
+                       for item in (version, release))):
+            refuse('invalid_gpg_key_identity')
+        arch = 'none'
+    else:
+        arch = one(header, 'Arch')
     if any(not isinstance(item, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9+_.~^-]{0,127}', item) for item in (name, version, release, arch)) or type(epoch) is not int or epoch < 0:
         refuse('invalid_package_identity')
     return {'name': name, 'nevra': f'{name}-{epoch}:{version}-{release}.{arch}', 'arch': arch}

@@ -13,7 +13,7 @@ import shutil
 import stat
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from nebulalog_manager import aide, host_job_storage
 from nebulalog_manager.common import Refused, atomic_json, locked
@@ -44,6 +44,7 @@ class AideLifecycleTests(unittest.TestCase):
         self.stderr = ""
         self.on_check = None
         self.now = "2026-09-07T10:00:00+00:00"
+        self.boot_snapshot = Mock(return_value={})
         for module in (aide, host_job_storage):
             patcher = patch.object(module, "ROOT_UID", os.getuid())
             patcher.start()
@@ -77,7 +78,7 @@ class AideLifecycleTests(unittest.TestCase):
     def fresh(self):
         return aide.Aide(storage_guard=lambda: self.identity, facts=self.facts, monitor=self.monitor,
                          policy=self.policy, runner=self.run_fixture, reader=self.reader,
-                         clock=lambda: self.now, lock_paths=lambda _: ())
+                         clock=lambda: self.now, lock_paths=lambda _: (), boot_snapshot=self.boot_snapshot)
 
     def run_fixture(self, argv, *, tmpdir, **_):
         self.calls.append(tuple(argv))
@@ -352,6 +353,51 @@ class AideLifecycleTests(unittest.TestCase):
         with self.assertRaises(Refused):
             self.manager.enroll(candidate["confirmation"])
         self.assert_inactive()
+
+    def test_boot_snapshot_change_during_candidate_check_preserves_unenrolled_evidence(self):
+        original = self.values['ordinary_boot_snapshot_sha256']
+        self.on_check = lambda _: self.values.update(ordinary_boot_snapshot_sha256='f' * 64)
+        with self.assertRaisesRegex(Refused, 'candidate_not_clean'):
+            self.manager.prepare()
+        self.assertEqual(self.record('candidate.json')['facts']['ordinary_boot_snapshot_sha256'], original)
+        self.assertEqual(self.record('candidate.json')['state'], 'initializing')
+        self.assert_inactive()
+
+    def test_late_boot_writer_before_enrollment_or_review_does_not_reinitialize(self):
+        candidate = self.manager.prepare()
+        initializations, checks = self.count_calls('init'), self.count_calls('check')
+        self.values['ordinary_boot_snapshot_sha256'] = 'f' * 64
+        for action in (self.manager.prepare, self.manager.review,
+                       lambda: self.manager.enroll(candidate['confirmation'])):
+            with self.assertRaisesRegex(Refused, 'context_changed'):
+                action()
+        self.assertEqual((self.count_calls('init'), self.count_calls('check')), (initializations, checks))
+        self.assertEqual(self.record('candidate.json'), candidate)
+        self.assert_inactive()
+
+    def test_enrolled_checks_verify_retained_initial_snapshot_without_refreshing_facts(self):
+        _, receipt = self.enrolled()
+        expected = receipt['facts']['ordinary_boot_snapshot_sha256']
+        self.values['ordinary_boot_snapshot_sha256'] = 'f' * 64
+        self.boot_snapshot.reset_mock()
+        self.manager.check()
+        self.boot_snapshot.assert_called_once_with(self.identity, expected)
+        checks = self.count_calls('check')
+        self.boot_snapshot.side_effect = Refused('retained snapshot missing')
+        with self.assertRaisesRegex(Refused, 'retained snapshot missing'):
+            self.manager.check()
+        self.assertEqual(self.count_calls('check'), checks)
+        self.assertEqual(self.record('commit-pending.json'), receipt)
+
+    def test_legacy_enrollment_without_boot_snapshot_fact_requires_migration(self):
+        _, receipt = self.enrolled()
+        del receipt['facts']['ordinary_boot_snapshot_sha256']
+        self.write_private(self.marker, json.dumps(receipt).encode())
+        checks = self.count_calls('check')
+        with self.assertRaises(Refused):
+            self.manager.check()
+        self.assertEqual(self.count_calls('check'), checks)
+        self.assertNotIn('ordinary_boot_snapshot_sha256', json.loads(self.marker.read_text())['facts'])
 
     def test_prepared_retry_flushes_candidate_and_its_evidence_before_acknowledgment(self):
         candidate = self.manager.prepare()

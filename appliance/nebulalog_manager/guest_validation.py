@@ -37,7 +37,8 @@ PACKAGES = ("rocky-release", "kernel-core", "kernel-modules-core", "kernel-modul
             "container-selinux", "systemd", "podman", "skopeo", "cryptsetup", "cryptsetup-libs", "lvm2", "xfsprogs",
             "dracut", "dracut-fips", "audit", "firewalld", "httpd", "mod_ssl", "python3", "openscap-scanner", "scap-security-guide", "aide")
 CORE_UNITS = ("nebulalog-firstboot.service", "nebulalog-console.service", "nebulalog-edge.service",
-              "nebulalog-maintenance-gate.service", "nebulalog-reboot-verify.service", "nebulalog-status.service", "nebulalog-status.timer")
+              "nebulalog-maintenance-gate.service", "nebulalog-reboot-verify.service", "nebulalog-reboot-verify.timer",
+              "nebulalog-status.service", "nebulalog-status.timer")
 CONTAINERS = ("postgresql", "clickhouse", "keycloak", "api", "ingest")
 LABELS = {"/var/lib/nebulalog": "var_lib_t", "/var/lib/nebulalog/configuration": "var_lib_t",
           "/var/lib/nebulalog/configuration/tls": "container_file_t", "/var/lib/nebulalog/configuration/edge-tls": "httpd_config_t",

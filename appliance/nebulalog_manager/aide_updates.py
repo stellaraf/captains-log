@@ -176,6 +176,9 @@ def _description(value, *, directory=False, preserved=False):
 
 def _bound_plan(manager, stage, path, *, preparing):
     stage, path = Path(stage), Path(path)
+    if path == stage / 'ordinary-boot-plan.json':
+        from . import ordinary_boot
+        return ordinary_boot.bound_integrity_plan(manager, stage, path, preparing=preparing)
     from . import kernel_boot, kernel_retention
     if path.parent == stage and kernel_boot.NAME.fullmatch(path.name):
         return kernel_boot.bound_integrity_plan(manager, stage, path, preparing=preparing)
@@ -255,6 +258,9 @@ def _bound_plan(manager, stage, path, *, preparing):
 
 
 def _snapshot(manager, plan, phase, retained=None):
+    if plan.get('kind') == 'ordinary-boot-v1':
+        from . import ordinary_boot
+        return ordinary_boot.integrity_snapshot(manager, plan, phase, retained)
     if plan.get('kind') == 'rocky-kernel-retention-resume-v1':
         from . import kernel_retention
         return kernel_retention.resume_integrity_snapshot(manager, plan, phase, retained)
@@ -301,6 +307,9 @@ def _parse_update(result, database_in, database_out):
 
 
 def _allowed_report(report, plan, phase):
+    if plan.get('kind') == 'ordinary-boot-v1':
+        from . import ordinary_boot
+        return ordinary_boot.allowed_integrity_report(report, plan, phase)
     if plan.get('kind') == 'rocky-kernel-retention-resume-v1':
         from . import kernel_retention
         return kernel_retention.allowed_resume_integrity_report(report, plan, phase)
@@ -498,13 +507,17 @@ def retained_plan_acceptance(stage, plan_path, *, manager=None, expected=None, h
         for key in ('original_enrollment_sha256', 'plan_sha256', 'prepared_sha256', 'database_sha256'):
             digest_value(expected[key])
     with _evidence_locked(manager) as (owner, state, identity):
-        if (not stage.is_absolute() or stage.parent != identity.root / 'manager/os-updates'
+        ordinary = stage.parent == identity.root / 'manager/boot-integrity'
+        if (not stage.is_absolute() or stage.parent not in (identity.root / 'manager/os-updates', identity.root / 'manager/boot-integrity')
                 or not re.fullmatch(r'[a-f0-9]{32}', stage.name) or stage.resolve() != stage
                 or plan_path.parent != stage or plan_path.is_symlink()):
             _refuse('retained_acceptance_stage_changed')
         owner.records.directory(stage, identity)
         raw = owner._bytes(plan_path, identity)
         plan, plan_sha = strict_json(raw), _sha(raw)
+        if ordinary and (plan_path.name != 'ordinary-boot-plan.json' or plan.get('kind') != 'ordinary-boot-v1'
+                         or plan.get('stage') != str(stage)):
+            _refuse('retained_acceptance_ordinary_owner_changed')
         base = owner._initial_enrollment(state, identity)
         root = state / 'authorized'
         if historical:
@@ -541,6 +554,74 @@ def retained_plan_acceptance(stage, plan_path, *, manager=None, expected=None, h
                 break
             pointer = entry['previous']
         _refuse('retained_plan_acceptance_missing')
+
+
+def accepted_plan_history(*, manager=None, allow_pending_owner=None):
+    """Read verified published ancestry without converting pending work to proof.
+
+    A normal read requires the live DB to match the completed published chain.
+    An explicit ordinary-boot owner may inspect its own interrupted forward
+    CAS, including a copied output, but receives the pending state separately.
+    The caller must establish that owner's place in its immutable ancestry.
+    This function never writes, copies a database, or reports the host clean.
+    """
+    with _evidence_locked(manager) as (owner, state, identity):
+        base = owner._initial_enrollment(state, identity)
+        pending = _pending(owner, state, identity)
+        pending_prepared = None
+        if pending is None or pending['state'] == 'complete':
+            active_enrollment(owner, state, identity, base)
+        else:
+            stage = Path(allow_pending_owner) if allow_pending_owner is not None else None
+            if (stage is None or not stage.is_absolute() or stage.resolve() != stage
+                    or stage.parent != identity.root / 'manager/boot-integrity'
+                    or not re.fullmatch(r'[a-f0-9]{32}', stage.name)):
+                _refuse('history_pending_owner_required')
+            owner.records.directory(stage, identity)
+            prepared = _read_bound(owner, state / 'authorized/prepared', pending['prepared'], identity)
+            pending_prepared = prepared
+            if (prepared['release'] != str(stage) or pending['direction'] != 'forward'
+                    or prepared['plan'].get('kind') != 'ordinary-boot-v1'
+                    or prepared['original_enrollment_sha256'] != digest(base)
+                    or pending['previous_database_sha256'] != prepared['database_sha256']):
+                _refuse('history_pending_owner_changed')
+            raw = owner._bytes(stage / 'ordinary-boot-plan.json', identity)
+            if strict_json(raw) != prepared['plan'] or _sha(raw) != prepared['plan_sha256']:
+                _refuse('history_pending_plan_changed')
+            head, checksum, _ = _chain(owner, state, identity, base)
+            current = owner._database(state / 'aide.db.gz', identity)[1]
+            if pending['state'] == 'scanning':
+                if head != pending['previous'] or checksum != pending['previous_database_sha256'] or current != checksum:
+                    _refuse('history_pending_database_changed')
+            elif pending['state'] == 'ready':
+                entry = pending['proposed_entry']
+                if (_pointer(entry) != pending['entry'] or entry['id'] != pending['id']
+                        or entry['prepared'] != pending['prepared'] or entry['direction'] != 'forward'
+                        or entry['previous'] != pending['previous']
+                        or entry['previous_database_sha256'] != pending['previous_database_sha256']
+                        or entry['database_sha256'] != pending['database_sha256']):
+                    _refuse('history_pending_entry_changed')
+                _chain(owner, state, identity, base, head_override=pending['entry'], proposed=entry)
+                if (head not in (pending['previous'], pending['entry'])
+                        or current not in (entry['previous_database_sha256'], entry['database_sha256'])
+                        or head == pending['entry'] and current != entry['database_sha256']):
+                    _refuse('history_pending_database_changed')
+            else:
+                _refuse('history_pending_state_changed')
+        pointer, checksum, _ = _chain(owner, state, identity, base)
+        head, rows, seen = pointer, [], set()
+        while pointer is not None:
+            token = uuid_value(pointer['id'])
+            if token in seen or len(seen) >= MAX_CHAIN:
+                _refuse('history_chain_limit')
+            seen.add(token)
+            entry = _read_bound(owner, state / 'authorized/entries', pointer, identity)
+            prepared = _read_bound(owner, state / 'authorized/prepared', entry['prepared'], identity)
+            rows.append({'entry_ref': pointer, 'entry': entry, 'prepared': prepared, 'plan': prepared['plan']})
+            pointer = entry['previous']
+        return {'original_enrollment': base, 'head': head, 'database_sha256': checksum,
+                'current_database_sha256': owner._database(state / 'aide.db.gz', identity)[1],
+                'pending': pending, 'pending_prepared': pending_prepared, 'history': list(reversed(rows))}
 
 
 def _directories(manager, state, identity):
@@ -657,6 +738,53 @@ def _resume_retention_pending(manager, state, identity, base, stage, plan_path, 
     manager._sync(root / 'pending.json', root, state)
 
 
+def _resume_ordinary_pending(manager, state, identity, base, stage, plan_path, plan, plan_sha):
+    """Resolve only this generation or an exact ordinary ancestor's old CAS."""
+    from . import ordinary_boot
+    if plan.get('kind') != ordinary_boot.KIND or plan.get('original_enrollment_sha256') != digest(base):
+        _refuse('ordinary_boot_enrollment_changed')
+    pending = _pending(manager, state, identity)
+    if pending is None or pending['state'] == 'complete':
+        return
+    prior, prior_sha, prior_stage, prior_path = plan, plan_sha, Path(stage), Path(plan_path)
+    seen = set()
+    while True:
+        if prior_sha in seen or len(seen) >= MAX_CHAIN:
+            _refuse('ordinary_boot_ancestry_limit')
+        seen.add(prior_sha)
+        if prior.get('kind') != ordinary_boot.KIND or prior.get('original_enrollment_sha256') != digest(base):
+            _refuse('ordinary_boot_ancestor_changed')
+        _, prepared = _prepared(manager, state, identity, prior_stage, prior, prior_sha)
+        if prepared is not None:
+            if prepared['original_enrollment_sha256'] != digest(base):
+                _refuse('ordinary_boot_preparation_changed')
+            if pending.get('prepared') == _pointer(prepared):
+                break
+        predecessor = ordinary_boot.integrity_predecessor(prior_stage, prior_path)
+        if predecessor is None:
+            _refuse('ordinary_boot_different_acceptance_pending')
+        prior, prior_sha = predecessor
+        prior_stage = Path(prior['stage'])
+        prior_path = prior_stage / ordinary_boot.PLAN
+    if (pending.get('direction') != 'forward'
+            or pending.get('previous_database_sha256') != prepared['database_sha256']):
+        _refuse('ordinary_boot_different_acceptance_pending')
+    metadata = _snapshot(manager, plan, 'prepare')
+    root = state / 'authorized'
+    archive = {'schema': 1, 'resume_stage': str(stage), 'resume_plan_sha256': plan_sha,
+               'prior_stage': str(prior_stage), 'prior_plan_sha256': prior_sha, 'pending': pending}
+    _immutable(manager, root / 'artifacts' / (pending['id'] + '.' + plan_sha + '.ordinary-boot-resume.json'), archive, identity)
+    if pending['state'] == 'ready':
+        _retain_interrupted_forward(manager, state, identity, base, pending)
+    head, checksum, _ = _chain(manager, state, identity, base)
+    if (manager._database(state / 'aide.db.gz', identity)[1] != checksum
+            or pending['state'] == 'scanning' and (head != pending['previous'] or checksum != pending['previous_database_sha256'])
+            or _snapshot(manager, plan, 'prepare', metadata) != metadata):
+        _refuse('ordinary_boot_historical_database_changed')
+    manager.records.write(root / 'pending.json', {'schema': 1, 'state': 'complete', 'entry': head, 'database_sha256': checksum}, identity)
+    manager._sync(root / 'pending.json', root, state)
+
+
 def prepare(manager, stage, plan_path):
     with _locked(manager) as (state, identity):
         plan, plan_sha = _bound_plan(manager, stage, plan_path, preparing=True)
@@ -667,6 +795,9 @@ def prepare(manager, stage, plan_path):
         if plan.get('kind') == 'rocky-kernel-retention-resume-v1':
             manager._monitor(identity, state, base)
             _resume_retention_pending(manager, state, identity, base, stage, plan_path, plan, plan_sha)
+        if plan.get('kind') == 'ordinary-boot-v1':
+            manager._monitor(identity, state, base)
+            _resume_ordinary_pending(manager, state, identity, base, stage, plan_path, plan, plan_sha)
         enrolled = active_enrollment(manager, state, identity, base)
         policy = manager._monitor(identity, state, enrolled)
         metadata = _snapshot(manager, plan, "prepare")

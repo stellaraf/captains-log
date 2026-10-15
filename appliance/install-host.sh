@@ -152,7 +152,7 @@ with p.open("w") as f:c.write(f)
 PYCONFIG
 # The OS timer's service requires enrolled maintenance policy; its adapter then
 # verifies encrypted storage, healthy services/authentication and backups before DNF.
-systemctl enable nebulalog-firstboot.service nebulalog-storage.timer nebulalog-aide.timer nebulalog-os-update.timer nebulalog-app-update.timer nebulalog-reboot-verify.service nebulalog-status.timer
+systemctl enable nebulalog-firstboot.service nebulalog-storage.timer nebulalog-aide.timer nebulalog-os-update.timer nebulalog-app-update.timer nebulalog-reboot-verify.service nebulalog-reboot-verify.timer nebulalog-status.timer
 if [ -f /etc/systemd/system/nebulalog-console.service ]; then
   systemctl enable nebulalog-console.service
 fi

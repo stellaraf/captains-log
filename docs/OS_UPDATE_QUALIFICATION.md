@@ -125,6 +125,54 @@ required; the native fixture did not authorize those changes through AIDE.
 The original qualification VM and recovery disks were unchanged. None of these
 results establishes a complete installed-appliance kernel update.
 
+## Ordinary boots and late boot-success flags
+
+Source now includes a separate ordinary-boot integrity owner. Initial AIDE
+enrollment binds an immutable snapshot of the installed RPM inventory, boot
+artifacts, kernel modules, GRUB configuration and qualified vendor flag writers.
+Later observations are compared with that root plus the verified chronological
+AIDE change chain. Capturing the running machine never grants authority to
+replace the baseline. Existing enrollments without this root require explicit
+migration; they are not silently re-enrolled.
+
+An ordinary reboot or the vendor user-session success timer can create a new,
+immutable integrity generation. It permits only the qualified GRUB flag-byte
+transition, preserving the kernel/default selection, other environment entries,
+boot artifacts and security metadata. An accepted package/kernel/retention
+transaction is reduced through its retained typed evidence before comparison.
+Metadata not recorded in an older payload receipt requires a full AIDE check
+against the already accepted database before a new checkpoint can be published.
+
+The boot maintenance gate runs before the public edge. Reconciliation,
+full runtime/security checks and current-boot finalization precede gate release.
+Interrupted ordinary generations retain exact ancestry; recovery can retain an
+already copied database but cannot copy an unpublished historical result. An
+unrelated pending update or unexplained drift remains held. No OS update journal
+is invented or reopened to represent an ordinary boot.
+
+If periodic observation fails before a valid generation exists, a separate
+installation-bound failure receipt can retain maintenance without granting any
+baseline authority. Recovery requires valid original evidence, a fresh full
+AIDE check and all runtime checks, including retries after gate-release failure.
+Incomplete or mismatched OS journal pairs cannot be claimed by this owner.
+
+New installations enable `nebulalog-reboot-verify.timer`: an initial check after
+three minutes and another fifteen minutes after the previous verification ends.
+This covers a vendor success flag written after a later user login and retries
+interrupted verification. Source tests exercise these boundaries; production
+enrollment, native reboot/timer recovery and hypervisor acceptance remain open.
+
+On October 15, a read-only capture on the original Rocky x86_64 qualification
+guest measured all 456 installed package identities, 6,253 protected artifacts
+and the 1,024-byte GRUB environment twice with matching results. Native testing
+found and corrected two source assumptions: RPM's `gpg-pubkey` pseudo-package
+omits its architecture tag, and the qualified GRUB packages have epoch `1`.
+Key records remain in the inventory using an explicit `none` pseudo-architecture;
+ordinary packages still require a valid architecture. The same ten writer-file
+hashes passed with the corrected exact package identities. This verifies capture
+and layout compatibility, not AIDE enrollment, reboot recovery or a healthy
+appliance. The guest and its existing baseline were not changed.
+
 The following cases remain explicit qualification or implementation gaps:
 
 - Interruption between the GRUB temporary-file creation and replacement, and
@@ -132,12 +180,10 @@ The following cases remain explicit qualification or implementation gaps:
 - Native qualification of later-boot exact-erasure recovery and its earlier
   acceptance generations; supported recovery for partial erasure and an
   unattempted plan from an earlier boot remains unfinished.
-- A late vendor boot-success timer change after a measured phase snapshot.
-- Ordinary-reboot integrity reconciliation before the first kernel update and
-  after a fully completed update/retention. The current reboot-completion path
-  returns `not_pending` in these states, while the AIDE policy still monitors
-  GRUB environment changes. No separate ordinary-boot transition currently
-  accepts legitimate flag changes into the retained integrity chain.
+- Native qualification of ordinary-reboot integrity reconciliation before the
+  first kernel update, after completed update/retention, and after a late vendor
+  boot-success timer change. Drift during a measured phase must retain its
+  maintenance gate and recover through a new qualified generation.
 - Native interruption qualification of atomic kernel-default protection and
   its once-only RPM-command boundary.
 - Retry or rollback of an unaccepted candidate after a verified fallback boot.

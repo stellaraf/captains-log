@@ -27,6 +27,7 @@ def words(value, section, key):
 class StartupContracts(unittest.TestCase):
     def setUp(self):
         self.units = {path.name: unit(path) for path in (APPLIANCE / "systemd").glob("*.service")}
+        self.units.update({path.name: unit(path) for path in (APPLIANCE / "systemd").glob("*.timer")})
         self.units.update({path.name.removesuffix(".container.in") + ".service": unit(path) for path in (APPLIANCE / "quadlet").glob("*.container.in")})
 
     def test_declared_startup_order_is_acyclic(self):
@@ -70,6 +71,15 @@ class StartupContracts(unittest.TestCase):
             self.assertIn(name, words(verify, "Unit", "After"))
             self.assertIn(name, words(verify, "Unit", "Wants"))
         self.assertFalse(words(verify, "Unit", "Conflicts"))
+
+    def test_boot_verification_rechecks_late_vendor_flags_and_interrupted_work(self):
+        timer = self.units['nebulalog-reboot-verify.timer']
+        self.assertEqual(words(timer, 'Timer', 'Unit'), {'nebulalog-reboot-verify.service'})
+        self.assertEqual(words(timer, 'Timer', 'OnBootSec'), {'3min'})
+        self.assertEqual(words(timer, 'Timer', 'OnUnitInactiveSec'), {'15min'})
+        enabled = [line for line in (APPLIANCE / 'install-host.sh').read_text().splitlines()
+                   if line.startswith('systemctl enable ')]
+        self.assertTrue(any('nebulalog-reboot-verify.timer' in line.split() for line in enabled))
 
     def test_console_can_enroll_before_runtime_gate_is_ready(self):
         value = self.units["nebulalog-console.service"]

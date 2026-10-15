@@ -48,6 +48,15 @@ Component completion is durable before `update-finalize` releases maintenance. I
 
 ## OS and maintenance
 
+Ordinary reboots also require integrity reconciliation. Newly enrolled images
+retain an immutable boot-state root; the maintenance gate compares each boot
+with that root and accepted update history, then requires AIDE and all runtime
+checks before reopening access. The boot verifier also runs periodically to
+handle the vendor's later boot-success flag and interrupted verification.
+Unknown changes and foreign pending operations remain held. This workflow is
+implemented in source and still requires native appliance qualification; see
+[ordinary boot recovery](OS_UPDATE_QUALIFICATION.md#ordinary-boots-and-late-boot-success-flags).
+
 The image configures RPM signature checks and retains the current kernel plus two prior kernels (`installonly_limit=3`). The OS manager runs only inside the configured timezone/day/time window, with default intent Sunday 03:00–05:00 local. It downloads Rocky 9 update candidates and requires an exact supported RPM/file plan before any package mutation. The current executor supports a narrow scriptless payload replacement; unsupported scripts, triggers, kernel/checker transitions and generated files are refused. It checks security postconditions, asks `dnf needs-restarting`, and rechecks the window before requesting a reboot. Complete automatic Rocky security/minor/kernel support remains unfinished; see [OS update qualification](OS_UPDATE_QUALIFICATION.md). It never changes image-pinned ClickHouse/Keycloak versions independently.
 
 The local OS adapters enforce enrolled Rocky repository keys, healthy databases, encrypted backups, durable ingestion preparation and explicit unlock readiness. Console-only unlock cannot claim unattended reboot readiness: updated packages retain a pending reboot. A rejected reboot request invokes the fixed abort adapter and requires real service/API/local-MFA recovery evidence. The boot gate restores the nonsecret Apache maintenance marker from encrypted state before external mutations are accepted. Reboot completion requires a changed boot ID and full runtime/security checks, and can be retried with `nebulalog update reboot-complete`. A request accepted by systemd is not successful reboot evidence. These paths require actual guest qualification before unattended operation is claimed.

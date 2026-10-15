@@ -633,11 +633,17 @@ class Lifecycle:
         self.encrypted()
         return self.health(stage, livepatch_health=True)
 
-    def health(self, stage, *, os_health=False, livepatch_health=False):
+    def health(self, stage, *, os_health=False, livepatch_health=False, boot_health=False):
         release = {}
-        if os_health and livepatch_health:
+        if sum(bool(value) for value in (os_health, livepatch_health, boot_health)) > 1:
             raise Refused("Health operation must have one owner")
-        if livepatch_health:
+        if boot_health:
+            self.guard()
+            if (not stage.is_absolute() or stage.is_symlink() or stage.resolve() != stage
+                    or stage.parent != self.data / "manager/boot-integrity"
+                    or not re.fullmatch(r"[a-f0-9]{32}", stage.name)):
+                raise Refused("Boot health stage is not an owned integrity generation")
+        elif livepatch_health:
             self.guard()
             if stage.is_symlink() or stage.resolve().parent != (self.state / "livepatch-health").resolve():
                 raise Refused("Livepatch health stage is outside protected retained storage")
@@ -1206,11 +1212,68 @@ class Lifecycle:
             raise Refused("Current boot identity is unavailable")
         return value
 
+    def _ordinary_boot_stage(self):
+        # Initial setup owns its pre-enrollment configuration. An existing
+        # enrollment must provide its immutable boot root; legacy facts cannot
+        # be silently recaptured from the running machine.
+        if not os.path.lexists(self.data / "manager/aide-enrollment.json"):
+            return None
+        from nebulalog_manager import ordinary_boot
+        try:
+            return ordinary_boot.pending_stage(self.data, runner=self.cmd)
+        except Exception as exc:
+            # A periodic verification can fail before it has a valid plan.
+            # Record only a failure owner; this provides no baseline or
+            # acceptance authority and cannot take another operation's gate.
+            hold = ordinary_boot.observation_hold(self.data, boot_id=self.boot_id())
+            if hold is None:
+                raise Refused("Ordinary boot observation failed without an owned recovery hold") from exc
+            self.maintenance(True, hold)
+            raise Refused("Ordinary boot observation requires recovery; maintenance remains active") from exc
+
+    def _ordinary_boot_owner(self, stage):
+        from nebulalog_manager import ordinary_boot
+        marker = self.data / "manager/maintenance.json"
+        if os.path.lexists(marker):
+            value = json.loads(trusted_file(marker).read_text())
+            if (value.get("active") is not True or not isinstance(value.get("release"), str)
+                    or not ordinary_boot.owns_maintenance(stage, value["release"])):
+                raise Refused("Another operation owns maintenance during ordinary boot verification")
+
+    def _ordinary_boot_complete(self):
+        from nebulalog_manager import ordinary_boot
+        stage = self._ordinary_boot_stage()
+        if stage is None:
+            return {"ok": True, "status": "not_pending"}
+        self._ordinary_boot_owner(stage)
+        self.maintenance(True, stage)
+        try:
+            observed_boot = self.boot_id()
+            integrity = ordinary_boot.reconcile(stage, **self._kernel_callbacks())
+            if integrity.get("ok") is not True:
+                raise Refused("Ordinary boot integrity reconciliation did not pass")
+            health = self.health(stage, boot_health=True)
+            if (health.get("ok") is not True
+                    or any(health.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS)
+                    or self.boot_id() != observed_boot):
+                raise Refused("Ordinary boot requires every current runtime check")
+            complete = ordinary_boot.finalize(stage, health={"ok": True, "stage": str(stage),
+                "boot_id": observed_boot, "checks": health["checks"]}, runner=self.cmd)
+            if complete.get("ok") is not True or complete.get("boot_id") != observed_boot:
+                raise Refused("Ordinary boot finalization did not verify the current boot")
+            self._ordinary_boot_owner(stage)
+            self.maintenance(False, stage)
+        except Exception as exc:
+            self.maintenance(True, stage)
+            raise Refused("Ordinary boot verification requires recovery; maintenance remains active") from exc
+        return self.receipt(stage, "boot-complete", boot_id=observed_boot, checks=health["checks"],
+                            status="complete", integrity=integrity, ordinary_boot=complete)
+
     def boot_gate(self):
         """Runs after encrypted mounts and BEFORE the public HTTPS edge starts."""
         self.guard()
         self.encrypted()
-        with locked(self.data / "manager/transaction.lock"):
+        with locked(self.data / "manager/transaction.lock"), locked(self.data / "manager/updates/transaction.lock"):
             private = self.data / "manager/maintenance.json"
             if private.exists():
                 marker = json.loads(trusted_file(private).read_text())
@@ -1229,6 +1292,11 @@ class Lifecycle:
                 if pending:
                     self.maintenance(True, Path(record.get(owner_key, str(self.data / "manager"))))
                     return {"ok": True, "maintenance": True, "source": "interrupted transaction"}
+            ordinary = self._ordinary_boot_stage()
+            if ordinary is not None:
+                self._ordinary_boot_owner(ordinary)
+                self.maintenance(True, ordinary)
+                return {"ok": True, "maintenance": True, "source": "ordinary boot integrity"}
             return {"ok": True, "maintenance": False, "source": "no pending transaction"}
 
     def reboot_complete(self):
@@ -1239,13 +1307,13 @@ class Lifecycle:
             path = self.data / "manager/os-latest.json"
             journal = self.data / "manager/os-transaction.json"
             if not path.exists() or not journal.exists():
-                return {"ok": True, "status": "not_pending"}
+                return self._ordinary_boot_complete()
             latest = json.loads(trusted_file(path).read_text())
             transaction = json.loads(trusted_file(journal).read_text())
             if (transaction.get("state") == "complete" and transaction.get("finalization", "complete") == "complete"
                     and transaction.get("kernel_finalization") not in ("pending", "failed")
                     and transaction.get("kernel_retention") not in ("pending", "failed")):
-                return {"ok": True, "status": "not_pending"}
+                return self._ordinary_boot_complete()
             stage, current_boot = self._reboot_binding(latest, transaction, new_boot=True)
             if (transaction.get("kernel_retention") in ("pending", "failed")
                     and os.path.lexists(stage / "kernel-acceptance-current.json")):
