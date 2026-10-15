@@ -401,6 +401,10 @@ def prepare(stage, policy, *, runner=run):
         refuse('operation_binding_required')
     operation = {'schema': 1, 'id': str(uuid.uuid4()), 'stage': str(stage), 'boot_id': journal.get('boot_id')}
     immutable(stage / 'operation.json', (json.dumps(operation, sort_keys=True) + '\n').encode())
+    from . import kernel_updates, kernel_integrity
+    pending = kernel_updates.adopt_pending(stage)
+    if pending is not None:
+        return pending
     download = stage / 'download'
     download.mkdir(mode=0o700)
     _, _, before = inventory(runner)
@@ -414,6 +418,12 @@ def prepare(stage, policy, *, runner=run):
                        'inventory_sha256': digest(before)}
         immutable(stage / 'os-no-updates.json', (json.dumps(observation, sort_keys=True) + '\n').encode())
         return {'ok': True, 'status': 'no_updates', 'plan_sha256': None}
+    names = [one(header, 'Name') for path in packages
+             for header in headers(runner(['/usr/bin/rpm', '--query', '--package', '--xml', str(path)]))]
+    if len(names) == 4 and set(names) == kernel_updates.NAMES:
+        result = kernel_updates.plan_cached(stage, packages, runner=runner)
+        kernel_integrity.prepare(stage)
+        return result
     result = plan_cached(stage, packages, runner=runner)
     plan, plan_sha = load_plan(stage)
     integrity = integrity_plan(plan, plan_sha)
@@ -439,6 +449,9 @@ def bound_integrity_plan(manager, stage, path, *, preparing):
         refuse('unowned_integrity_stage')
     raw = manager.reader(path, maximum=MAX_XML, private=True)
     parsed = strict_json(raw)
+    if parsed.get('kind') == 'kernel-install-v1':
+        from . import kernel_integrity
+        return kernel_integrity.bound_integrity_plan(manager, stage, path, preparing=preparing)
     plan, plan_sha = load_plan(stage)
     if parsed != integrity_plan(plan, plan_sha):
         refuse('integrity_plan_changed')
@@ -520,7 +533,8 @@ def _verify_no_updates(stage, identity, runner):
             or operation['boot_id'] != journal.get('boot_id') or operation['boot_id'] != latest.get('boot_id')
             or operation['boot_id'] != Path('/proc/sys/kernel/random/boot_id').read_text().strip()):
         refuse('no_updates_operation_binding_changed')
-    if any(os.path.lexists(stage / name) for name in ('os-payload-plan.json', 'os-integrity-plan.json', 'rpm-apply-intent.json')):
+    if any(os.path.lexists(stage / name) for name in ('os-payload-plan.json', 'os-integrity-plan.json', 'rpm-apply-intent.json',
+                                                    'kernel-plan.json', 'kernel-deferred.json', 'kernel-apply-intent.json')):
         refuse('no_updates_conflicts_with_package_transaction')
     if digest(inventory(runner)[2]) != observation['inventory_sha256']:
         refuse('no_updates_package_inventory_changed')
@@ -532,6 +546,11 @@ def accept_integrity(stage, *, runner=run):
     # RPM or treats dnf history undo as a scriptlet/data rollback guarantee.
     stage = Path(stage)
     from . import aide, aide_updates
+    from . import kernel_integrity
+    if os.path.lexists(stage / 'kernel-deferred.json'):
+        return kernel_integrity.accept_deferred(stage, runner=runner)
+    if os.path.lexists(stage / 'kernel-plan.json'):
+        return kernel_integrity.accept(stage, runner=runner)
     if os.path.lexists(stage / 'os-no-updates.json'):
         # The lifecycle caller owns manager/update locks. The existing update
         # coordination takes the remaining locks for a fresh ordinary AIDE check.
@@ -553,6 +572,11 @@ def accept_integrity(stage, *, runner=run):
 
 def apply(stage, *, runner=run):
     stage = Path(stage)
+    from . import kernel_integrity
+    if os.path.lexists(stage / 'kernel-deferred.json'):
+        return kernel_integrity.accept_deferred(stage, runner=runner)
+    if os.path.lexists(stage / 'kernel-plan.json'):
+        return kernel_integrity.apply(stage, runner=runner)
     # Revalidate both the operation and the prepared AIDE context immediately
     # before the exact signed RPM transaction. The manager lock excludes scans.
     from . import aide

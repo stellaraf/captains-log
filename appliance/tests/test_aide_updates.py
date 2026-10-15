@@ -171,7 +171,9 @@ class AuthorizedAideTests(unittest.TestCase):
         self.authorized_fixture()
         # A same-byte rewrite changes inode/ctime evidence. Preflight must not
         # authorize it merely because that filename is an eventual target.
-        self.runtime.write_bytes(self.runtime.read_bytes())
+        replacement = self.runtime.with_suffix('.replacement')
+        self.write_private(replacement, self.runtime.read_bytes())
+        replacement.replace(self.runtime)
         with self.assertRaisesRegex(Refused, "unrelated_integrity_change"):
             self.prepare_update()
         self.assertEqual((self.state / "aide.db.gz").read_bytes(), self.initial_db)
@@ -262,6 +264,83 @@ class AuthorizedAideTests(unittest.TestCase):
         self.assertEqual(self.scan_calls.count("init"), 1)
         self.assertEqual(self.scan_calls.count("update"), 2)
 
+    def resume_interrupted_boot(self, *, phase='resume', prior_phase='commit'):
+        """Exercise real retained DB/report CAS; boot semantics have their own suite."""
+        checksum = hashlib.sha256(self.plan_path.read_bytes()).hexdigest()
+        pointer, prepared = updates._prepared(self.manager, self.state, self.identity, self.stage, self.plan, checksum)
+        prior = {**self.plan, 'kind': 'kernel-boot-v1', 'phase': prior_phase}
+        resumed = {'kind': 'kernel-boot-v1', 'phase': phase}
+        from nebulalog_manager import kernel_boot
+        with patch.object(kernel_boot, 'integrity_predecessor', return_value=(prior, checksum)), \
+             patch.object(updates, '_prepared', return_value=(pointer, prepared)), \
+             patch.object(updates, '_snapshot', return_value={'fixture': 'validated exact resume bytes'}), \
+             patch.object(updates, '_replace_current') as replace:
+            updates._resume_kernel_pending(self.manager, self.state, self.identity, self.base,
+                                           self.stage, self.plan_path, resumed, 'e' * 64)
+            replace.assert_not_called()
+
+    def test_kernel_resume_preserves_interrupted_scan_without_copying_or_accepting_database(self):
+        self.authorized_fixture()
+        self.prepare_update()
+        self.activate()
+        def crash(action, *_):
+            if action == 'update':
+                raise OSError('interrupted scan before proposed database')
+        self.scan_hook = crash
+        with self.assertRaises(OSError):
+            self.accept_update()
+        self.scan_hook = None
+        calls = list(self.scan_calls)
+        self.resume_interrupted_boot()
+        self.assertEqual((self.state / 'aide.db.gz').read_bytes(), self.initial_db)
+        self.assertEqual(self.scan_calls, calls)
+        pending = json.loads((self.state / 'authorized/pending.json').read_text())
+        self.assertEqual(pending['state'], 'complete')
+        self.assertIsNone(pending['entry'])
+        self.assertEqual(len(list((self.state / 'authorized/artifacts').glob('*.kernel-resume.json'))), 1)
+        self.assert_original()
+
+    def test_kernel_pending_recovery_refuses_unqualified_phase_relationship(self):
+        self.authorized_fixture()
+        self.prepare_update()
+        with self.assertRaisesRegex(Refused, 'commit_required'):
+            self.resume_interrupted_boot(phase='postboot', prior_phase='commit')
+
+    def test_kernel_resume_retains_only_already_copied_verified_historical_database(self):
+        self.authorized_fixture()
+        self.prepare_update()
+        self.activate()
+        replace = updates._replace_current
+        def crash(*args):
+            replace(*args)
+            raise OSError('interrupted after database before head')
+        with patch.object(updates, '_replace_current', side_effect=crash), self.assertRaises(OSError):
+            self.accept_update()
+        database = (self.state / 'aide.db.gz').read_bytes()
+        calls = list(self.scan_calls)
+        self.resume_interrupted_boot()
+        self.assertEqual((self.state / 'aide.db.gz').read_bytes(), database)
+        self.assertEqual(self.scan_calls, calls)
+        self.assertEqual(len(list((self.state / 'authorized/entries').glob('*.json'))), 1)
+        self.assertEqual(json.loads((self.state / 'authorized/pending.json').read_text())['state'], 'complete')
+        self.assert_original()
+
+    def test_kernel_resume_refuses_corrupted_historical_check_report(self):
+        self.authorized_fixture()
+        self.prepare_update()
+        self.activate()
+        with patch.object(updates, '_replace_current', side_effect=OSError('before CAS')), self.assertRaises(OSError):
+            self.accept_update()
+        pending = json.loads((self.state / 'authorized/pending.json').read_text())
+        report = self.state / 'reports' / (pending['proposed_entry']['check_report']['id'] + '.json')
+        value = json.loads(report.read_text())
+        value['stdout'] = 'corrupted evidence'
+        self.write_private(report, json.dumps(value).encode())
+        with self.assertRaisesRegex(Refused, 'retained_record_changed'):
+            self.resume_interrupted_boot()
+        self.assertEqual(json.loads((self.state / 'authorized/pending.json').read_text()), pending)
+        self.assertEqual((self.state / 'aide.db.gz').read_bytes(), self.initial_db)
+
     def test_authorized_chain_corruption_and_current_db_replacement_refuse_monitoring(self):
         self.authorized_fixture()
         self.prepare_update()
@@ -285,7 +364,9 @@ class AuthorizedAideTests(unittest.TestCase):
         self.prepare_update()
         self.activate()
         self.accept_update()
-        self.runtime.write_bytes(self.runtime.read_bytes())
+        replacement = self.runtime.with_suffix('.replacement')
+        self.write_private(replacement, self.runtime.read_bytes())
+        replacement.replace(self.runtime)
         with self.assertRaisesRegex(Refused, "no_longer_clean"):
             self.accept_update()
         self.assertEqual(self.scan_calls.count("update"), 1)

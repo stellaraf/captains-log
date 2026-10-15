@@ -103,3 +103,33 @@ must never be treated as crash-consistent snapshots or opened by a second VM
 while the original writer runs. After exit, verify image consistency before use.
 They are recovery evidence and must be preserved independently of Packer output
 cleanup. This does not protect against physical filesystem/drive failure.
+
+## Retain factory kernel provenance
+
+`install-host.sh` invokes the captured `factory_kernel.py` helper during guarded
+private image provisioning. It requires exactly one complete installed Rocky
+9.8 x86_64 kernel set, equal to the running kernel and persistent boot default.
+It downloads the exact installed NEVRAs for `kernel`, `kernel-core`,
+`kernel-modules`, and `kernel-modules-core` from the fixed Rocky BaseOS HTTPS
+repository. This step downloads bytes only: it cannot install an update or
+substitute a newer package when the exact vendor version is unavailable.
+
+The helper checks installed payloads, downloaded payload/script headers, and signatures
+against an isolated keyring containing only the pinned Rocky key. It preserves
+four SHA256-named RPMs, `installed-inventory.xml`, `capture.json`, and the
+completion marker `manifest.json` under
+`/usr/share/nebulalog/kernel-provenance`. Protected files are retained unchanged
+across exact retries; partial or conflicting evidence is never silently replaced.
+The sealer verifies the bundle offline. Initial AIDE enrollment verifies the
+source-measured helper and retains the manifest and installed-inventory digests.
+The existing `/usr` policy covers all seven files; there is no provenance
+exclusion. Later checks preserve the original enrollment facts, including after
+the factory kernel is eventually pruned by an accepted retention transaction.
+
+Missing exact vendor RPMs, extra installed kernel versions, changed signatures
+or payloads, and incomplete provenance stop the build/enrollment. Existing
+appliances whose AIDE enrollment lacks these factory facts require an explicitly
+qualified migration; the helper does not create a replacement baseline. Source
+tests cover capture, refusal, and retry boundaries. The actual download command,
+SELinux labels, offline seal/first-enrollment verification, and later native
+four-to-three retention still require a rebuilt Rocky guest qualification.

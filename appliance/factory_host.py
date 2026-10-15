@@ -21,7 +21,8 @@ ETC = Path("/etc/nebulalog")
 SHARE = Path("/usr/share/nebulalog")
 DATA = Path("/var/lib/nebulalog")
 FIXED = {"appliance/host_boot.py": Path("/usr/libexec/nebulalog/host-boot"),
-         "appliance/factory_host.py": Path("/usr/libexec/nebulalog/factory-host")}
+         "appliance/factory_host.py": Path("/usr/libexec/nebulalog/factory-host"),
+         "appliance/factory_kernel.py": Path("/usr/libexec/nebulalog/factory-kernel")}
 
 
 def guard():

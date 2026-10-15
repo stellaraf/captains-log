@@ -22,6 +22,7 @@ install -o root -g root -m 0600 "$APPLIANCE_SOURCE/security/github-updates.json"
 install -m 0755 "$APPLIANCE_SOURCE/provision_guard.py" /usr/libexec/nebulalog/provision-guard
 install -m 0755 "$APPLIANCE_SOURCE/host_boot.py" /usr/libexec/nebulalog/host-boot
 install -m 0755 "$APPLIANCE_SOURCE/factory_host.py" /usr/libexec/nebulalog/factory-host
+install -m 0755 "$APPLIANCE_SOURCE/factory_kernel.py" /usr/libexec/nebulalog/factory-kernel
 install -m 0644 "$APPLIANCE_SOURCE"/nebulalog_manager/*.py /usr/lib/nebulalog/nebulalog_manager/
 install -d -m 0755 /usr/lib/nebulalog/nebulalog_adapters
 install -m 0644 "$APPLIANCE_SOURCE"/adapters/nebulalog_adapters/*.py /usr/lib/nebulalog/nebulalog_adapters/
@@ -75,6 +76,9 @@ key=Path('/etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9').read_bytes()
 if trust['schema'] != 1 or hashlib.sha256(key).hexdigest() != trust['rocky_key_sha256']:
     raise SystemExit('Installed Rocky release key differs from the independently reviewed key')
 PYTRUST
+# Capture the exact installed vendor kernel before factory provenance is sealed.
+# This downloads signed RPM bytes only; it never replaces an installed kernel.
+PYTHONPATH=/usr/lib/nebulalog python3 "$APPLIANCE_SOURCE/factory_kernel.py"
 if [ -f /tmp/nebulalog-image-bundle/manifest.json ]; then
   install -d -m 0755 /usr/share/nebulalog/images
   install -m 0644 /tmp/nebulalog-image-bundle/*.oci.tar /usr/share/nebulalog/images/

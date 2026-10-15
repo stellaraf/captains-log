@@ -59,6 +59,15 @@ class OSMaintenanceTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.assertFalse((self.root / 'os-transaction.json').exists())
 
+    def test_kernel_finalization_or_retention_blocks_new_maintenance(self):
+        for field in ('kernel_finalization', 'kernel_retention'):
+            for status in ('pending', 'failed'):
+                with self.subTest(field=field, status=status):
+                    atomic_json(self.root / 'os-transaction.json', {'state': 'complete', 'finalization': 'complete', field: status})
+                    with self.assertRaisesRegex(Refused, 'requires recovery'):
+                        self.run_maintenance()
+        self.assertEqual(self.calls, [])
+
     def test_unqualified_package_plan_refuses_before_any_package_application(self):
         with patch("nebulalog_manager.os_payload.prepare", side_effect=Refused("unsupported scriptlet")), \
              patch("nebulalog_manager.os_payload.apply") as apply:
@@ -75,6 +84,28 @@ class OSMaintenanceTests(unittest.TestCase):
             apply.assert_not_called()
         self.assertEqual(json.loads((self.root/"os-transaction.json").read_text())["state"], "complete")
         self.assertNotIn(["systemctl", "reboot"], self.calls)
+
+    def test_kernel_candidate_forces_reboot_despite_negative_generic_hint(self):
+        self.reboot_needed = False
+        for status in ('planned', 'kernel_pending'):
+            with self.subTest(status=status):
+                (self.root / 'os-transaction.json').unlink(missing_ok=True)
+                self.calls.clear()
+                with patch('nebulalog_manager.os_payload.prepare', return_value={
+                        'ok': True, 'status': status, 'plan_sha256': 'a' * 64, 'reboot_required': True}):
+                    self.assertEqual(self.run_maintenance(), {'status': 'reboot_requested'})
+                journal = json.loads((self.root / 'os-transaction.json').read_text())
+                self.assertTrue(journal['reboot_pending'])
+                self.assertTrue(journal['kernel_reboot_required'])
+                self.assertIn(['systemctl', 'reboot'], self.calls)
+
+    def test_kernel_candidate_stays_pending_when_window_closes(self):
+        self.reboot_needed = False
+        with patch('nebulalog_manager.os_payload.prepare', return_value={
+                'ok': True, 'status': 'kernel_pending', 'plan_sha256': 'a' * 64, 'reboot_required': True}), \
+             patch('nebulalog_manager.os_updates.in_maintenance_window', side_effect=[True, False]):
+            self.assertEqual(self.run_maintenance(), {'status': 'updated', 'reboot_pending': True})
+        self.assertNotIn(['systemctl', 'reboot'], self.calls)
 
     def test_next_window_retries_deferred_reboot_without_reinstalling_packages(self):
         with patch("nebulalog_manager.os_updates.in_maintenance_window", side_effect=[True, False]):

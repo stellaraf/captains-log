@@ -152,6 +152,11 @@ def _description(value, *, directory=False, preserved=False):
 
 def _bound_plan(manager, stage, path, *, preparing):
     stage, path = Path(stage), Path(path)
+    from . import kernel_boot, kernel_retention
+    if path.parent == stage and kernel_boot.NAME.fullmatch(path.name):
+        return kernel_boot.bound_integrity_plan(manager, stage, path, preparing=preparing)
+    if path == stage / kernel_retention.INTEGRITY:
+        return kernel_retention.bound_integrity_plan(manager, stage, path, preparing=preparing)
     if path == stage / "os-integrity-plan.json":
         from . import os_payload
         return os_payload.bound_integrity_plan(manager, stage, path, preparing=preparing)
@@ -224,6 +229,15 @@ def _bound_plan(manager, stage, path, *, preparing):
 
 
 def _snapshot(manager, plan, phase, retained=None):
+    if plan.get('kind') == 'kernel-boot-v1':
+        from . import kernel_boot
+        return kernel_boot.integrity_snapshot(manager, plan, phase, retained)
+    if plan.get('kind') == 'rocky-kernel-retention-v1':
+        from . import kernel_retention
+        return kernel_retention.integrity_snapshot(manager, plan, phase, retained)
+    if plan.get('kind') == 'kernel-install-v1':
+        from . import kernel_integrity
+        return kernel_integrity.snapshot(manager, plan, phase, retained)
     if plan.get("kind") == "os-payload-v1":
         from . import os_payload
         return os_payload.integrity_snapshot(manager, plan, phase, retained)
@@ -258,6 +272,15 @@ def _parse_update(result, database_in, database_out):
 
 
 def _allowed_report(report, plan, phase):
+    if plan.get('kind') == 'kernel-boot-v1':
+        from . import kernel_boot
+        return kernel_boot.allowed_integrity_report(report, plan, phase)
+    if plan.get('kind') == 'rocky-kernel-retention-v1':
+        from . import kernel_retention
+        return kernel_retention.allowed_integrity_report(report, plan, phase)
+    if plan.get('kind') == 'kernel-install-v1':
+        from . import kernel_integrity
+        return kernel_integrity.allowed_report(report, plan, phase)
     if plan.get("kind") == "os-payload-v1":
         from . import os_payload
         return os_payload.allowed_integrity_report(report, plan, phase)
@@ -441,10 +464,54 @@ def _prepared(manager, state, identity, stage, plan, plan_sha):
     return pointer_path, record
 
 
+def _resume_kernel_pending(manager, state, identity, base, stage, plan_path, plan, plan_sha):
+    """Resolve only historical CAS evidence owned by an exact boot resume.
+
+    This does not copy or update a database, nor publish a clean scan. The
+    following ordinary preparation and acceptance must measure the new boot's
+    exact qualified GRUB change and reject all unrelated filesystem drift.
+    """
+    if plan.get('kind') != 'kernel-boot-v1' or plan.get('phase') not in {'postboot', 'resume'}:
+        _refuse('kernel_resume_plan_required')
+    from . import kernel_boot
+    prior, prior_sha = kernel_boot.integrity_predecessor(stage, plan_path)
+    allowed = {'postboot': {'arm'}, 'resume': {'commit', 'resume'}}
+    if prior.get('kind') != 'kernel-boot-v1' or prior.get('phase') not in allowed[plan['phase']]:
+        _refuse('kernel_resume_commit_required')
+    _, prepared = _prepared(manager, state, identity, stage, prior, prior_sha)
+    if prepared is None or prepared['original_enrollment_sha256'] != digest(base):
+        _refuse('kernel_resume_preparation_required')
+    pending = _pending(manager, state, identity)
+    if pending is None or pending['state'] == 'complete':
+        return
+    if (pending.get('prepared') != _pointer(prepared) or pending.get('direction') != 'forward'
+            or pending.get('previous_database_sha256') != prepared['database_sha256']):
+        _refuse('kernel_resume_different_acceptance_pending')
+    metadata = _snapshot(manager, plan, 'prepare')
+    root = state / 'authorized'
+    archive = {'schema': 1, 'resume_plan_sha256': plan_sha, 'prior_plan_sha256': prior_sha, 'pending': pending}
+    _immutable(manager, root / 'artifacts' / (pending['id'] + '.' + plan_sha + '.kernel-resume.json'), archive, identity)
+    if pending['state'] == 'ready':
+        # The existing historical-retention helper validates every old report,
+        # proposed chain link and preserved input/output database. It may only
+        # retain a head for a database that was already copied before reboot.
+        _retain_interrupted_forward(manager, state, identity, base, pending)
+    head, checksum, _ = _chain(manager, state, identity, base)
+    if (manager._database(state / 'aide.db.gz', identity)[1] != checksum
+            or pending['state'] == 'scanning' and (head != pending['previous'] or checksum != pending['previous_database_sha256'])
+            or _snapshot(manager, plan, 'prepare', metadata) != metadata):
+        _refuse('kernel_resume_historical_database_changed')
+    manager.records.write(root / 'pending.json', {'schema': 1, 'state': 'complete', 'entry': head, 'database_sha256': checksum}, identity)
+    manager._sync(root / 'pending.json', root, state)
+
+
 def prepare(manager, stage, plan_path):
     with _locked(manager) as (state, identity):
         plan, plan_sha = _bound_plan(manager, stage, plan_path, preparing=True)
         base = manager._initial_enrollment(state, identity)
+        if plan.get('kind') == 'kernel-boot-v1' and plan.get('phase') in {'postboot', 'resume'}:
+            manager._monitor(identity, state, base)
+            _resume_kernel_pending(manager, state, identity, base, stage, plan_path, plan, plan_sha)
         enrolled = active_enrollment(manager, state, identity, base)
         policy = manager._monitor(identity, state, enrolled)
         metadata = _snapshot(manager, plan, "prepare")

@@ -43,7 +43,8 @@ BINARY = Path("/usr/sbin/aide")
 DATA = Path("/var/lib/nebulalog")
 RUNTIME_STAGES = {"directories", "certificates", "images", "environment", "realm", "postgresql", "migrations", "identity", "lifecycle", "edge", "installed-release"}
 FACTS = {"installation_id", "aide_version", "aide_package", "aide_binary_sha256", "policy_sha256",
-         "default_config_sha256", "source_snapshot_sha256", "source_dirty", "installed_release_sha256", "runtime_ready_sha256", "runtime_configuration_sha256"}
+         "default_config_sha256", "source_snapshot_sha256", "source_dirty", "installed_release_sha256", "runtime_ready_sha256", "runtime_configuration_sha256",
+         "factory_kernel_manifest_sha256", "factory_kernel_inventory_sha256"}
 MONITOR_FACTS = {"installation_id", "aide_version", "aide_package", "aide_binary_sha256", "policy_sha256", "default_config_sha256"}
 
 
@@ -171,6 +172,26 @@ def default_monitor(identity, policy, runner, tmpdir):
             "default_config_sha256": sha(protected_bytes(DEFAULT_CONFIG, maximum=65536, private=True))}
 
 
+def factory_kernel_facts(source, runner, tmpdir):
+    """Initial enrollment only; later pruning cannot rewrite factory facts."""
+    helper = Path('/usr/libexec/nebulalog/factory-kernel')
+    if source['files'].get('appliance/factory_kernel.py') != sha(protected_bytes(helper, maximum=2 * 1024 * 1024)):
+        raise Refused('aide_factory_kernel_helper_changed')
+    result = runner(['/usr/bin/python3', '-I', '-B', str(helper), '--verify'], tmpdir=tmpdir, timeout=600)
+    if result.code != 0 or result.stderr.strip():
+        raise Refused('aide_factory_kernel_provenance_not_verified')
+    value = strict_json(result.stdout)
+    exact(value, {'schema', 'verified', 'kernel', 'manifest_sha256', 'inventory_sha256'})
+    root = Path('/usr/share/nebulalog/kernel-provenance')
+    if (type(value['schema']) is not int or value['schema'] != 1 or value['verified'] is not True
+            or not re.fullmatch(r'5\.14\.0-[0-9.]+\.el9_8\.x86_64', str(value['kernel']))
+            or value['manifest_sha256'] != sha(protected_bytes(root / 'manifest.json', maximum=65536, private=True))
+            or value['inventory_sha256'] != sha(protected_bytes(root / 'installed-inventory.xml', maximum=MAX_DATABASE, private=True))):
+        raise Refused('aide_factory_kernel_provenance_changed')
+    return {'factory_kernel_manifest_sha256': value['manifest_sha256'],
+            'factory_kernel_inventory_sha256': value['inventory_sha256']}
+
+
 def default_facts(identity, policy, runner, tmpdir):
     """Bind the first baseline to sealed setup, measured AIDE and captured code."""
     base = Path("/etc/nebulalog")
@@ -230,7 +251,7 @@ def default_facts(identity, policy, runner, tmpdir):
     selected = strict_json(protected_bytes(identity.root / "configuration/security-policy.json", maximum=1024 * 1024, private=True, device=identity.device))
     if selected.get("installation_id") != identity.installation_id or selected.get("baseline") != strict_json(setup).get("baseline"):
         raise Refused("aide_baseline_policy_not_selected")
-    return {**monitor,
+    return {**monitor, **factory_kernel_facts(source, runner, tmpdir),
             "source_snapshot_sha256": descriptor["source_snapshot_sha256"], "source_dirty": descriptor["source_dirty"],
             "installed_release_sha256": descriptor_hash, "runtime_ready_sha256": sha(ready),
             "runtime_configuration_sha256": digest({"setup": sha(setup), "state": sha(state)})}

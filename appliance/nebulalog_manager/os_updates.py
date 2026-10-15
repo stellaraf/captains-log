@@ -46,7 +46,10 @@ def maintain(config: Path, state: Path=Path("/var/lib/nebulalog/manager"), runne
         livepatch.require_settled(state / "updates")
         journal = state / "os-transaction.json"
         previous = json.loads(journal.read_text()) if journal.exists() else None
-        if previous and (previous.get("state") not in ("complete", "failed", "reboot_aborted") or previous.get("finalization", "complete") != "complete"):
+        if previous and (previous.get("state") not in ("complete", "failed", "reboot_aborted")
+                         or previous.get("finalization", "complete") != "complete"
+                         or previous.get("kernel_finalization", "complete") not in (None, "complete")
+                         or previous.get("kernel_retention", "complete") not in (None, "complete")):
             raise Refused("An interrupted OS transaction or pending reboot requires recovery before another update")
         component_record = state / "updates/transaction.json"
         if component_record.exists():
@@ -80,6 +83,9 @@ def maintain(config: Path, state: Path=Path("/var/lib/nebulalog/manager"), runne
                 raise Refused("OS maintenance requires the backup boot identity")
             record("planning", stage=stage, boot_id=boot_id)
             plan = os_payload.prepare(Path(stage), policy, runner=runner)
+            candidate_reboot = plan.get("reboot_required") is True
+            if candidate_reboot:
+                record("planning", reboot_pending=True, kernel_reboot_required=True)
             no_updates = plan.get("status") == "no_updates"
             if no_updates:
                 record("planning", no_updates=True, plan_sha256=None)
@@ -99,7 +105,7 @@ def maintain(config: Path, state: Path=Path("/var/lib/nebulalog/manager"), runne
                 raise Refused("OS update security postcondition failed; reboot blocked")
             accepted = _runtime_postcheck(runner, stage)
             record("postcheck", health=accepted["checks"])
-            reboot = _reboot_required(runner)
+            reboot = _reboot_required(runner) or candidate_reboot
             record("postcheck", reboot_pending=reboot)
         except Exception as exc:
             record("recovery_required" if transaction["state"] in ("updating", "postcheck") or (state / "maintenance.json").exists() else "failed",

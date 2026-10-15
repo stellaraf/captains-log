@@ -19,7 +19,8 @@ SHARE = Path("/usr/share/nebulalog")
 GENERATIONS = Path("/usr/lib/nebulalog/generations")
 STATE = Path("/var/lib/nebulalog/manager/updates")
 FIXED = {"appliance/host_boot.py": Path("/usr/libexec/nebulalog/host-boot"),
-         "appliance/factory_host.py": Path("/usr/libexec/nebulalog/factory-host")}
+         "appliance/factory_host.py": Path("/usr/libexec/nebulalog/factory-host"),
+         "appliance/factory_kernel.py": Path("/usr/libexec/nebulalog/factory-kernel")}
 SHA = re.compile(r"[a-f0-9]{64}")
 COMMANDS = {"nebulalog": ("cli", ()), "bootstrap-runtime": ("bootstrap", ()),
             "github-updates": ("github_updates", ()), "os-updates": ("os_updates", ()),

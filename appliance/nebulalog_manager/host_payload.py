@@ -41,6 +41,7 @@ MANAGER_MODULES = (
     "bootloader.py", "common.py", "console.py", "enrollment.py", "firstboot.py", "github_updates.py", "guest_validation.py",
     "host_activation.py", "host_dispatch.py", "host_identity.py", "host_job_storage.py", "host_jobs.py", "host_operations.py", "host_payload.py",
     "host_plan_socket.py", "host_plans.py", "image_bundle.py", "image_seal_network.py", "livepatch.py", "os_payload.py", "os_updates.py",
+    "kernel_boot.py", "kernel_integrity.py", "kernel_retention.py", "kernel_retention_integration.py", "kernel_updates.py",
     "publisher_inputs.py", "security.py", "setup_integrity.py", "sizing.py", "status_snapshot.py", "storage.py", "update_enrollment.py", "updates.py",
 )
 ADAPTER_MODULES = ("__init__.py", "auth.py", "cli.py", "commands.py", "host_runtime.py", "lifecycle.py")

@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 from urllib.request import build_opener, HTTPSHandler, ProxyHandler, Request
 import uuid
 
-from nebulalog_manager import os_payload
+from nebulalog_manager import aide, kernel_boot, kernel_integrity, kernel_updates, os_payload
 from nebulalog_manager.backup import _encrypted_staging
 from nebulalog_manager.baseline import Baseline, _json as baseline_json, rule_results
 from nebulalog_manager.common import CommandFailed, Refused, atomic_json, audit, locked, require_linux_root, trusted_file
@@ -301,14 +301,22 @@ class Lifecycle:
                 raise Refused("Required prerelease identity browser evidence is missing: " + gate)
         return {"artifact": name, "checks": sorted(IDENTITY_GATES), "kind": "signed prerelease browser qualification"}
 
-    def backup(self, stage, *, os_backup=False):
+    def backup(self, stage, *, os_backup=False, retain_maintenance=False, maintenance_owner=None):
         release = {}
         if not os_backup:
             release, _ = self.release(stage)
+        owner = maintenance_owner or stage
+        if retain_maintenance:
+            marker = json.loads(trusted_file(self.data / "manager/maintenance.json").read_text())
+            if (not os_backup or owner.is_symlink() or owner.resolve().parent != (self.data / "manager/os-updates").resolve()
+                    or marker.get("active") is not True or marker.get("release") != str(owner)):
+                raise Refused("Recovery backup requires the existing operation-owned maintenance gate")
+        elif maintenance_owner is not None:
+            raise Refused("Backup maintenance owner requires retained maintenance")
         self.encrypted()
         destination = stage / "recovery"
         destination.mkdir(mode=0o700, exist_ok=False)
-        self.maintenance(True, stage)
+        self.maintenance(True, owner)
         try:
             self.service("stop", ("api", "keycloak"))
             owners = json.loads(self.sql("SELECT json_object_agg(datname,pg_get_userbyid(datdba)) FROM pg_database WHERE datname IN ('nebulalog','keycloak')"))
@@ -351,7 +359,8 @@ class Lifecycle:
             if os_backup:
                 self.service("start", ("keycloak", "api"))
                 self.api_ready()
-                self.maintenance(False, stage)
+                if not retain_maintenance:
+                    self.maintenance(False, owner)
             return result
         except BaseException as failure:
             # The manager does not invoke rollback for preflight/backup failures.
@@ -359,8 +368,9 @@ class Lifecycle:
             try:
                 self.service("start", ("keycloak", "api"))
                 self.api_ready()
-                self.maintenance(False, stage)
-                self.receipt(stage, "backup-recovery", recovered=True, services=["keycloak", "api"])
+                if not retain_maintenance:
+                    self.maintenance(False, owner)
+                self.receipt(stage, "backup-recovery", recovered=True, services=["keycloak", "api"], maintenance_retained=retain_maintenance)
             except BaseException as recovery_error:
                 self.receipt(stage, "backup-recovery", ok=False, recovered=False,
                              error=type(recovery_error).__name__, original_error=type(failure).__name__)
@@ -789,7 +799,7 @@ class Lifecycle:
         return {**self.receipt(stage, "os-postcheck", checks=result["checks"]), "stage": str(stage)}
 
     def os_recover(self):
-        """Recover same-boot acceptance or interrupted pre-reboot service stops."""
+        """Recover retained OS work, including a verified old-kernel recovery boot."""
         self.guard()
         self.encrypted()
         with locked(self.data / "manager/transaction.lock"), locked(self.data / "manager/updates/transaction.lock"):
@@ -798,6 +808,7 @@ class Lifecycle:
             latest = json.loads(trusted_file(path).read_text())
             transaction = json.loads(trusted_file(journal).read_text())
             stage = Path(latest["stage"])
+            current_boot = self.boot_id()
             preparing = transaction.get("state") == "reboot_preparing" or transaction.get("recovery_phase") == "reboot_preparing"
             retry = transaction.get("state") in ("recovery_required", "reboot_preparing") or (
                 transaction.get("state") == "complete" and transaction.get("finalization") in ("pending", "failed"))
@@ -808,7 +819,8 @@ class Lifecycle:
                                                   ("prepared", "postcheck_failed", "postcheck_passed"))
                     or preparing and (transaction.get("reboot_pending") is not True or
                                       any(transaction.get("health", {}).get(name) is not True for name in REQUIRED_CHECKS))
-                    or not latest.get("boot_id") or latest["boot_id"] != transaction.get("boot_id") or latest["boot_id"] != self.boot_id()):
+                    or not latest.get("boot_id") or latest["boot_id"] != transaction.get("boot_id")
+                    or current_boot != latest["boot_id"] and not any(os.path.lexists(stage / name) for name in ("kernel-plan.json", "kernel-deferred.json"))):
                 raise Refused("OS recovery requires the exact retained same-boot postcheck transaction")
             marker = self.data / "manager/maintenance.json"
             if marker.exists() and json.loads(trusted_file(marker).read_text()).get("release") != str(stage):
@@ -822,13 +834,34 @@ class Lifecycle:
             self.maintenance(True, stage)
             try:
                 self.checked_backup(stage)
+                if current_boot != latest["boot_id"]:
+                    # Armed boots use their exact GRUB/AIDE reconciliation path.
+                    if os.path.lexists(stage / "kernel-boot-current.json"):
+                        raise Refused("Owned kernel boot transition requires reboot-complete")
+                    if os.path.lexists(stage / "kernel-deferred.json"):
+                        _, plan, _, _ = kernel_updates.load_candidate(stage)
+                    else:
+                        plan, _ = kernel_updates.load_plan(stage)
+                    if self.cmd(["/usr/bin/uname", "-r"]) != plan["old_kernel"] or security_status(self.cmd).get("host_controls_ok") is not True:
+                        raise Refused("Cross-boot recovery requires the verified old kernel and healthy host controls")
+                    kernel_updates.verify_preserved(plan)
+                    self.service("start", self.services)
+                    latest, transaction, _ = self._os_recovery_backup(stage, latest, transaction)
+                    observation = {"recovery_boot_id": current_boot, "recovery_observed_at": datetime.now(timezone.utc).isoformat()}
+                    latest = {**latest, **observation}
+                    transaction = {**transaction, **observation, "state": "recovery_required"}
+                    atomic_json(path, latest)
+                    atomic_json(journal, transaction)
+                if preparing and self._kernel_candidate(stage) is not None:
+                    kernel_boot.abort_candidate(stage, **self._kernel_callbacks())
                 os_payload.accept_integrity(stage, runner=self.cmd)
+                candidate = self._kernel_candidate(stage)
                 if preparing:
                     self.service("start", self.services)
                 result = self.health(stage, os_health=True)
                 if result.get("ok") is not True or any(result.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS):
                     raise Refused("OS runtime, security or compliance acceptance failed")
-                reboot = False
+                reboot = candidate is not None
                 try:
                     self.cmd(["dnf", "needs-restarting", "--reboothint"], timeout=120)
                 except CommandFailed as exc:
@@ -854,6 +887,68 @@ class Lifecycle:
             audit(self.data / "manager/audit.jsonl", "os.recovery_verified", reboot_pending=reboot)
             return self.receipt(stage, "os-recover", checks=result["checks"], status=completed["status"], reboot_pending=reboot)
 
+    def _os_recovery_backup(self, stage, latest, transaction):
+        """Refresh a stale backup without releasing the owning operation's gate."""
+        pointer = stage / "recovery-backup-current.json"
+        if os.path.lexists(pointer):
+            reference = json.loads(trusted_file(pointer).read_text())
+            name = reference.get("filename")
+            if set(reference) != {"filename", "sha256"} or not isinstance(name, str) or not re.fullmatch(r"recovery-backup-[0-9a-f]{32}\.json", name):
+                raise Refused("Recovery backup reference is invalid")
+            intent_path = trusted_file(stage / name)
+            intent = json.loads(intent_path.read_text())
+            if (digest_file(intent_path) != reference["sha256"]
+                    or set(intent) != {"schema", "owner_stage", "boot_id", "previous", "backup", "inventory_sha256"}
+                    or intent["schema"] != 1 or intent["owner_stage"] != str(stage)
+                    or intent["boot_id"] != transaction.get("boot_id") or latest.get("boot_id") != transaction.get("boot_id")):
+                raise Refused("Recovery backup intent no longer matches its operation")
+            restored = Path(intent["backup"])
+            prior = Path(intent["previous"])
+            if (restored.parent != stage.parent or restored.is_symlink() or not re.fullmatch(r"[0-9a-f]{32}", restored.name)
+                    or name != "recovery-backup-" + restored.name + ".json"
+                    or prior.parent != stage.parent or prior.is_symlink()
+                    or any(record.get("recovery_backup_stage", str(stage)) not in (str(prior), str(restored)) for record in (latest, transaction))):
+                raise Refused("Recovery backup reference belongs to another operation")
+            self.checked_backup(restored)
+            receipt = json.loads(trusted_file(restored / "adapter-backup.json").read_text())
+            if receipt["inventory_sha256"] != intent["inventory_sha256"]:
+                raise Refused("Refreshed recovery backup inventory has changed")
+            # The immutable intent makes a crash between these two journal
+            # writes resumable without adopting an unrelated recovery backup.
+            latest = {**latest, "recovery_backup_stage": str(restored)}
+            transaction = {**transaction, "recovery_backup_stage": str(restored)}
+            atomic_json(self.data / "manager/os-latest.json", latest)
+            atomic_json(self.data / "manager/os-transaction.json", transaction)
+        backup_stage = Path(latest.get("recovery_backup_stage", str(stage)))
+        if (backup_stage.is_symlink() or backup_stage.parent != stage.parent or not backup_stage.is_dir()
+                or latest.get("recovery_backup_stage") != transaction.get("recovery_backup_stage")):
+            raise Refused("Recovery backup directory is not bound to the active operation")
+        self.checked_backup(backup_stage)
+        receipt = json.loads(trusted_file(backup_stage / "adapter-backup.json").read_text())
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(receipt["observed_at"])).total_seconds()
+        except (KeyError, TypeError, ValueError):
+            raise Refused("Recovery backup timestamp is invalid") from None
+        if age < 0:
+            raise Refused("Recovery backup timestamp is dated in the future")
+        if age > 7200:
+            previous = backup_stage
+            backup_stage = stage.parent / uuid.uuid4().hex
+            backup_stage.mkdir(mode=0o700)
+            self.backup(backup_stage, os_backup=True, retain_maintenance=True, maintenance_owner=stage)
+            self.checked_backup(backup_stage)
+            receipt = json.loads(trusted_file(backup_stage / "adapter-backup.json").read_text())
+            intent = {"schema": 1, "owner_stage": str(stage), "boot_id": transaction["boot_id"],
+                      "previous": str(previous), "backup": str(backup_stage), "inventory_sha256": receipt["inventory_sha256"]}
+            name = "recovery-backup-" + backup_stage.name + ".json"
+            kernel_updates.record(stage, name, intent)
+            atomic_json(pointer, {"filename": name, "sha256": hashlib.sha256(kernel_updates.encode(intent)).hexdigest()})
+            latest = {**latest, "recovery_backup_stage": str(backup_stage)}
+            transaction = {**transaction, "recovery_backup_stage": str(backup_stage)}
+            atomic_json(self.data / "manager/os-latest.json", latest)
+            atomic_json(self.data / "manager/os-transaction.json", transaction)
+        return latest, transaction, backup_stage
+
     def _reboot_binding(self, latest, transaction, *, new_boot=False):
         """Bind a reboot action to its recovery directory and original boot."""
         try:
@@ -878,6 +973,74 @@ class Lifecycle:
             if owner.get("active") is not True or owner.get("release") != str(stage):
                 raise Refused("Another transaction owns appliance maintenance")
         return stage, current_boot
+
+    @staticmethod
+    def _kernel_candidate(stage):
+        # A pending pointer may belong to a prior, explicitly adopted stage.
+        # Never discover a candidate merely because a global pointer exists.
+        if not any(os.path.lexists(stage / name) for name in ("kernel-plan.json", "kernel-deferred.json", "kernel-completed.json")):
+            return None
+        return kernel_updates.load_candidate(stage)
+
+    def _kernel_callbacks(self):
+        return {"prepare": aide.authorized_update_prepare, "accept": aide.authorized_update_accept, "runner": self.cmd}
+
+    def _kernel_finalize(self, stage, checks):
+        if any(checks.get(name) is not True for name in REQUIRED_CHECKS):
+            raise Refused("Kernel acceptance requires every runtime check")
+        proof = kernel_boot.accepted_transitions(stage, runner=self.cmd)
+        if proof["boot_id"] != self.boot_id():
+            raise Refused("Kernel acceptance requires the verified current boot")
+        if str(uuid.UUID(proof["boot_id"])) != proof["boot_id"]:
+            raise Refused("Kernel acceptance boot identity is invalid")
+        acceptance = {"schema": 1, **proof, "checks": {name: True for name in REQUIRED_CHECKS}, "finalization": "complete"}
+        previous = None
+        pointer = stage / "kernel-acceptance-current.json"
+        if os.path.lexists(pointer):
+            retained, previous, _ = kernel_updates.read_acceptance(stage)
+            if retained["boot_id"] == proof["boot_id"]:
+                if {key: value for key, value in retained.items() if key != "previous_acceptance_sha256"} != acceptance:
+                    raise Refused("Current kernel acceptance differs from its retained proof")
+                previous = retained["previous_acceptance_sha256"]
+        acceptance["previous_acceptance_sha256"] = previous
+        name = "kernel-acceptance-" + proof["boot_id"] + ".json"
+        kernel_updates.record(stage, name, acceptance)
+        atomic_json(pointer, {"boot_id": proof["boot_id"], "sha256": hashlib.sha256(kernel_updates.encode(acceptance)).hexdigest()})
+        return kernel_updates.mark_complete(stage, acceptance, runner=self.cmd)
+
+    def _kernel_retain(self, stage, latest, transaction):
+        journal = self.data / "manager/os-transaction.json"
+        transaction = {**transaction, "kernel_retention": "pending", "finalization": "pending"}
+        atomic_json(journal, transaction)
+        self.maintenance(True, stage)
+        try:
+            latest, transaction, backup_stage = self._os_recovery_backup(stage, latest, transaction)
+            def accepted(directory):
+                if directory != stage:
+                    raise Refused("Kernel retention acceptance belongs to another operation")
+                value, checksum, _ = kernel_updates.read_acceptance(stage)
+                proof = kernel_boot.accepted_transitions(stage, runner=self.cmd)
+                if any(value.get(key) != item for key, item in proof.items()) or value["boot_id"] != self.boot_id():
+                    raise Refused("Kernel retention requires the exact current accepted boot")
+                kernel_integrity.checked_backup(backup_stage)
+                health = self.health(stage, os_health=True)
+                if health.get("ok") is not True or any(health.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS):
+                    raise Refused("Kernel retention requires fresh complete runtime acceptance")
+                return {"ok": True, "kernel": value["kernel"], "recovery_kernel": value["recovery_kernel"],
+                        "boot_id": value["boot_id"], "receipt_sha256": checksum, "install_plan_sha256": value["kernel_plan_sha256"]}
+            result = kernel_integrity.retain_three(stage, accepted=accepted, runner=self.cmd)
+            if result.get("ok") is not True:
+                raise Refused("Kernel retention did not verify its final inventory")
+            health = self.health(stage, os_health=True)
+            if health.get("ok") is not True or any(health.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS):
+                raise Refused("Kernel retention runtime postcheck failed")
+            self.maintenance(False, stage)
+        except Exception as exc:
+            self.maintenance(True, stage)
+            atomic_json(journal, {**transaction, "kernel_retention": "failed", "finalization": "failed", "retention_error": type(exc).__name__})
+            raise Refused("Kernel retention requires recovery; maintenance and retained kernels are preserved") from exc
+        atomic_json(journal, {**transaction, "kernel_retention": "complete", "finalization": "complete"})
+        return result
 
     def unlock_readiness(self, candidate_kernel=None):
         if self.config.get("unattended_reboot") is not True:
@@ -938,12 +1101,15 @@ class Lifecycle:
         if not 0 <= age <= 7200:
             raise Refused("OS recovery backup is stale or dated in the future")
         self.checked_backup(stage)
-        unlock = self.unlock_readiness()
+        candidate = self._kernel_candidate(stage)
+        unlock = self.unlock_readiness("/boot/vmlinuz-" + candidate[1]["kernel"]) if candidate is not None else self.unlock_readiness()
         local_auth(self.config)
         self.maintenance(True, stage)
         try:
             self.service("stop", tuple(reversed(self.services)))
             self.cmd(["sync", "-f", str(self.data)], timeout=120)
+            if candidate is not None:
+                kernel_boot.arm_candidate(stage, **self._kernel_callbacks())
         except BaseException:
             # A successful restart alone is not runtime/security acceptance.
             # Keep the durable gate for os_recover, which checks every required
@@ -965,6 +1131,8 @@ class Lifecycle:
         if latest.get("state") != "reboot_prepared" or transaction.get("state") != "reboot_requested":
             raise Refused("No operation-owned prepared reboot can be aborted")
         self.checked_backup(stage)
+        if self._kernel_candidate(stage) is not None:
+            kernel_boot.abort_candidate(stage, **self._kernel_callbacks())
         self.service("start", self.services)
         result = self.health(stage, os_health=True)
         if result.get("ok") is not True or any(result.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS):
@@ -998,7 +1166,9 @@ class Lifecycle:
                 if not path.exists():
                     continue
                 record = json.loads(trusted_file(path).read_text())
-                pending = record.get("state") not in terminal or record.get("finalization", "complete") != "complete"
+                pending = (record.get("state") not in terminal or record.get("finalization", "complete") != "complete"
+                           or record.get("kernel_finalization") in ("pending", "failed")
+                           or record.get("kernel_retention") in ("pending", "failed"))
                 if pending:
                     self.maintenance(True, Path(record.get(owner_key, str(self.data / "manager"))))
                     return {"ok": True, "maintenance": True, "source": "interrupted transaction"}
@@ -1015,17 +1185,38 @@ class Lifecycle:
                 return {"ok": True, "status": "not_pending"}
             latest = json.loads(trusted_file(path).read_text())
             transaction = json.loads(trusted_file(journal).read_text())
-            if transaction.get("state") == "complete" and transaction.get("finalization", "complete") == "complete":
+            if (transaction.get("state") == "complete" and transaction.get("finalization", "complete") == "complete"
+                    and transaction.get("kernel_finalization") not in ("pending", "failed")
+                    and transaction.get("kernel_retention") not in ("pending", "failed")):
                 return {"ok": True, "status": "not_pending"}
             stage, current_boot = self._reboot_binding(latest, transaction, new_boot=True)
-            if latest.get("state") not in ("reboot_prepared", "recovery_required", "reboot_completed") or transaction.get("state") not in ("reboot_requested", "recovery_required", "complete"):
+            if transaction.get("kernel_finalization") == "complete" and transaction.get("kernel_retention") in ("pending", "failed"):
+                acceptance, _, _ = kernel_updates.read_acceptance(stage)
+                if acceptance["boot_id"] == current_boot:
+                    retained = self._kernel_retain(stage, latest, transaction)
+                    return self.receipt(stage, "reboot-complete", boot_id=current_boot, checks=acceptance["checks"],
+                                        status="complete", reboot_pending=False, retention=retained)
+            transition = os.path.lexists(stage / "kernel-boot-current.json")
+            latest_allowed = ("reboot_prepared", "recovery_required", "reboot_completed") + (("postcheck_passed", "postcheck_failed") if transition else ())
+            transaction_allowed = ("reboot_requested", "recovery_required", "complete") + (("reboot_preparing",) if transition else ())
+            if latest.get("state") not in latest_allowed or transaction.get("state") not in transaction_allowed:
                 raise Refused("Interrupted OS work has not reached the verified reboot phase")
             self.maintenance(True, stage)
+            candidate = None
+            boot_result = None
             try:
                 self.checked_backup(stage)
+                candidate = self._kernel_candidate(stage)
+                if candidate is not None:
+                    boot_result = kernel_boot.verify_postboot(stage, **self._kernel_callbacks())
+                    if boot_result.get("outcome") not in ("candidate", "recovery"):
+                        raise Refused("Kernel reboot outcome was not verified")
                 result = self.health(stage, os_health=True)
                 if result.get("ok") is not True or any(result.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS):
                     raise Refused("New-boot runtime, security or compliance acceptance failed")
+                if boot_result is not None and boot_result["outcome"] == "candidate":
+                    kernel_boot.commit_candidate(stage, health={"ok": True, "stage": str(stage), "boot_id": current_boot,
+                        "kernel": candidate[1]["kernel"], "checks": result["checks"]}, **self._kernel_callbacks())
             except Exception as exc:
                 atomic_json(path, {**latest, "state": "recovery_required", "observed_boot_id": current_boot, "error": type(exc).__name__})
                 atomic_json(journal, {**transaction, "state": "recovery_required", "observed_boot_id": current_boot, "error": type(exc).__name__})
@@ -1033,14 +1224,33 @@ class Lifecycle:
                 raise Refused("New-boot recovery or health acceptance failed; maintenance remains active") from exc
             # Record a successfully booted, accepted OS before releasing maintenance.
             atomic_json(path, {**latest, "state": "reboot_completed", "observed_boot_id": current_boot})
-            completed = {**transaction, "state": "complete", "finalization": "pending", "reboot_pending": False,
+            recovered = boot_result is not None and boot_result["outcome"] == "recovery"
+            completed = {**transaction, "state": "complete", "finalization": "pending", "reboot_pending": recovered,
                          "observed_boot_id": current_boot, "completed_at": datetime.now(timezone.utc).isoformat()}
+            if candidate is not None:
+                completed.update(kernel_finalization="recovery_required" if recovered else "pending", kernel_outcome=boot_result["outcome"])
+                if recovered:
+                    completed.update(kernel_retry="held", kernel_recovery_reason="candidate_not_running_after_reboot")
+                else:
+                    completed["kernel_retention"] = "pending"
             atomic_json(journal, completed)
             try:
                 self.maintenance(False, stage)
             except Exception as exc:
                 atomic_json(journal, {**completed, "finalization": "failed", "finalization_error": type(exc).__name__})
                 raise Refused("New OS boot passed; retry reboot-complete to release maintenance") from exc
-            atomic_json(journal, {**completed, "finalization": "complete"})
+            completed = {**completed, "finalization": "complete"}
+            atomic_json(journal, completed)
+            if candidate is not None and not recovered:
+                try:
+                    self._kernel_finalize(stage, result["checks"])
+                except Exception as exc:
+                    self.maintenance(True, stage)
+                    atomic_json(journal, {**completed, "kernel_finalization": "failed", "finalization_error": type(exc).__name__})
+                    raise Refused("Kernel boot passed; acceptance finalization requires retry") from exc
+                completed = {**completed, "kernel_finalization": "complete"}
+                atomic_json(journal, completed)
+                self._kernel_retain(stage, {**latest, "state": "reboot_completed", "observed_boot_id": current_boot}, completed)
             audit(self.data / "manager/audit.jsonl", "os.reboot_verified", boot_id=current_boot)
-            return self.receipt(stage, "reboot-complete", boot_id=current_boot, checks=result["checks"], status="complete")
+            return self.receipt(stage, "reboot-complete", boot_id=current_boot, checks=result["checks"],
+                                status="kernel_recovery_required" if recovered else "complete", reboot_pending=recovered)

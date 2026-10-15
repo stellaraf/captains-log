@@ -26,13 +26,96 @@ The first full-policy attempt exposed an AIDE 0.19.2 compatibility defect: under
 
 The independent source tests cover the OS-specific AIDE chain, unrelated drift, metadata rejection and recovery after a database swap interruption. The native joint test exercises the real RPM executor and full-policy scans, not the production enrollment, timer or healthy-host acceptance path. Full appliance OS runtime acceptance remains unqualified. A private scan baseline is not production enrollment.
 
+## Kernel lifecycle implementation and evidence limits
+
+The kernel recipe plans the exact four signed Rocky kernel packages, resolves
+their dependencies offline, and retains their bytes and vendor-script identities.
+Installation preserves the running kernel and its persistent boot selection.
+The recipe permits a fourth complete kernel set temporarily; another kernel
+installation is refused until accepted retention returns the inventory to three.
+Mixed kernel and unrelated package transactions remain unsupported.
+
+Before requesting a reboot, lifecycle verifies the retained backup, local
+authentication and the intended candidate initramfs's encrypted-storage unlock
+configuration. It stops services, syncs storage and arms one boot of the new
+kernel. The old kernel remains the persistent default until the actual candidate
+boot, full runtime/security checks and a separate measured promotion all pass.
+GRUB changes use the original AIDE enrollment's authorized-change chain. Exact
+abort restores the prior environment bytes. Interrupted arming, promotion and
+subsequent boot observations retain their original intent and proof records;
+they do not rewrite the original operation's boot identity.
+
+Final acceptance uses immutable `kernel-acceptance-<boot UUID>.json` generations
+and an atomic current pointer. A later boot links the prior acceptance digest
+instead of replacing its evidence. `promotion_sha256` identifies the original
+promotion plan; the recursive boot proof distinguishes a completed promotion
+from an interrupted prepared intent. The optional `resume_sha256` identifies a
+separately accepted later-boot transition. Candidate cleanup retains the first
+acceptance and original pending reference, including when interrupted after
+unlinking the pending pointer.
+
+Retention requires that current acceptance, a fresh verified backup and all
+runtime checks before removing only the oldest unprotected kernel. Its four
+original signed RPMs must be retained in an owned transaction stage or the
+factory provenance bundle; installed RPM database headers alone are insufficient.
+An erase intent is never replayed automatically. Missing provenance and partial
+erasure retain maintenance and recovery evidence. A refreshed backup keeps the
+original operation's maintenance gate active and publishes an immutable intent
+before updating its two journal references.
+
+Factory builds now capture the exact installed four-package kernel set, its
+signed RPM bytes and installed inventory. Sealing and initial AIDE enrollment
+verify that retained bundle offline; enrollment records immutable manifest and
+inventory digests. The verifier measures its original runtime dependencies
+before importing them. Native capture, sealing and first enrollment remain
+unqualified, and existing enrollments require an explicit migration. See the
+[factory build instructions](../appliance/packer/RELEASING.md).
+
+The source suites include real private-file transitions and a combined
+boot/AIDE dispatcher, snapshot and retained-database chain. Their native host
+identity, GRUB renderer and scanner inputs are controlled fixtures. A separate
+native Rocky test established the real GRUB tool's 1024-byte format and exact
+set/unset restoration on disposable private files, leaving live `/boot`
+unchanged. A subsequent isolated VM, using separate disk overlays and copied
+firmware state, exercised the exact `kernel_boot._replace` helper on its live
+XFS `/boot`. The replacement changed the inode, preserved the exact bytes,
+ownership, mode and SELinux/xattr metadata, and survived a real reboot. GRUB
+consumed the one-time selection while retaining the persistent default. Both
+selections identified the existing vendor kernel; this was a bootloader
+mechanism test, not a new-kernel promotion or unattended unlock acceptance.
+A second controlled boot confirmed the vendor reset of `boot_success=1` and
+`boot_indeterminate=1` to zero while preserving the replaced inode and security
+metadata. This also demonstrates why ordinary-boot flag reconciliation is
+required; the native fixture did not authorize those changes through AIDE.
+The original qualification VM and recovery disks were unchanged. None of these
+results establishes a complete installed-appliance kernel update.
+
+The following cases remain explicit qualification or implementation gaps:
+
+- Interruption between the GRUB temporary-file creation and replacement, and
+  the complete candidate-kernel boot/promotion path on a configured appliance.
+- A later boot during retention, including partially erased packages and an
+  earlier acceptance generation.
+- A late vendor boot-success timer change after a measured phase snapshot.
+- Ordinary-reboot integrity reconciliation before the first kernel update and
+  after a fully completed update/retention. The current reboot-completion path
+  returns `not_pending` in these states, while the AIDE policy still monitors
+  GRUB environment changes. No separate ordinary-boot transition currently
+  accepts legitimate flag changes into the retained integrity chain.
+- Power loss while writing the temporary kernel-default protection setting.
+- Retry or rollback of an unaccepted candidate after a verified fallback boot.
+  That state is reported as `kernel_recovery_required` with retry held; it must
+  not become an endless automatic reboot loop or a successful-update claim.
+- The complete general vendor update transaction, critical packages and their
+  service/generated-file migrations, and native VMware/AHV acceptance.
+
 ## Required next work
 
 - Inspect the real currently available Rocky update transaction and classify every resolved package before mutation. Unsupported packages must be reported by name and reason; an all-or-refuse transaction is an interim constraint, not the final automatic-update behavior.
 - Add explicit recipes for RPM scriptlets and installed triggers, with exact qualified outputs. The `hwdata` test candidate was rejected because its `/usr/lib/modprobe.d` payload would invoke a glibc file trigger; a package name alone is not a safe exemption.
 - Qualify systemd-generated files, loader caches, SELinux labeling changes and other generated outputs. Preserve unrelated customer configuration and demonstrate failed/interrupted execution recovery.
 - Implement and verify the AIDE/checker monitor-facts transition using independently verified replacement tools while retaining the prior checker and baseline chain.
-- Bind kernel, initramfs, BLS/EFI configuration and encrypted-storage unlock to the planned new kernel, then cold-boot that kernel on VMware and Nutanix. Secure Boot PCR 7 alone does not authenticate all initramfs/command-line inputs.
+- Qualify the implemented kernel, initramfs, BLS/EFI and encrypted-storage unlock binding by cold-booting the exact update on VMware and Nutanix. Secure Boot PCR 7 alone does not authenticate all initramfs/command-line inputs.
 - Test real unattended OS updates, service recovery, reboot/unlock, retained log data, local authentication and recovery after failures on fully configured appliances. The present kernel crypto self-test warning still blocks normal healthy-host acceptance; it has not been bypassed for these tests.
 
 `nebulalog update os-recover` can accept an interrupted operation only when the retained exact RPM result and fresh integrity/runtime checks pass. It does not claim that `dnf history undo` can reverse arbitrary scripts or persistent application data.

@@ -29,7 +29,8 @@ COMPONENT_IMAGES = {"nebulalog": "NEBULALOG_IMAGE", "postgresql": "POSTGRESQL_IM
                     "clickhouse": "CLICKHOUSE_IMAGE", "keycloak": "KEYCLOAK_FIPS_IMAGE"}
 ROOT_UID = 0
 FIXED_HOST_FILES = {"appliance/host_boot.py": Path("/usr/libexec/nebulalog/host-boot"),
-                    "appliance/factory_host.py": Path("/usr/libexec/nebulalog/factory-host")}
+                    "appliance/factory_host.py": Path("/usr/libexec/nebulalog/factory-host"),
+                    "appliance/factory_kernel.py": Path("/usr/libexec/nebulalog/factory-kernel")}
 FIXED_HOST_ROOT = Path("/")
 
 
