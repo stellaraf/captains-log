@@ -30,7 +30,10 @@ class InheritedCommandLockTests(unittest.TestCase):
                 ready, release = directory / "ready.json", directory / "release"
                 child = """import json,os,time
 from pathlib import Path
-Path(%r).write_text(json.dumps({'pid':os.getpid()}))
+ready=Path(%r)
+temporary=ready.with_suffix('.tmp')
+temporary.write_text(json.dumps({'pid':os.getpid()}))
+temporary.replace(ready)
 while not Path(%r).exists(): time.sleep(0.02)
 """ % (str(ready), str(release))
                 parent = """import sys
