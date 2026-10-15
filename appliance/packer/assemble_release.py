@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from nebulalog_manager import host_payload as payload, image_bundle, publisher_inputs
 from nebulalog_manager.image_bundle import ApplicationSchema as application_schema
 from nebulalog_manager.common import Refused, run
+from nebulalog_manager.baseline import ContentUpdate
 from nebulalog_manager.updates import verify_release, _utc, CLICKHOUSE_VERSION, validate_clickhouse_change
 from build_host_bundle import build as build_host
 from prepare_provenance import application_hash
@@ -83,7 +84,7 @@ def write_json(path, value):
 
 def validate_recipe(value, now=None):
     fields = {"schema", "repository", "sequence", "version", "issued_at", "expires_at", "schema_revision", "source_commit", "components", "evidence_artifacts"}
-    if (not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"database_migration"} or type(value["schema"]) is not int or value["schema"] != 1
+    if (not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"database_migration", "content_enrollment"} or type(value["schema"]) is not int or value["schema"] != 1
             or value["repository"] != REPOSITORY or type(value["sequence"]) is not int or not 0 < value["sequence"] < 2**63
             or not isinstance(value["version"], str) or not payload.VERSION.fullmatch(value["version"])
             or not isinstance(value["schema_revision"], str) or not re.fullmatch(r"[1-9][0-9]{0,8}", value["schema_revision"])
@@ -96,9 +97,16 @@ def validate_recipe(value, now=None):
     if not _utc(value["issued_at"]) <= now < _utc(value["expires_at"]):
         raise Refused("Release recipe must be currently valid with explicit expiration")
     changes = value["components"]
-    if not isinstance(changes, dict) or not {"host", "nebulalog"} <= set(changes) <= set(IMAGES) | {"host"}:
-        raise Refused("Every release requires host plus application; only fixed OCI components are supported")
+    if not isinstance(changes, dict) or not {"host", "nebulalog"} <= set(changes) <= set(IMAGES) | {"host", "baseline"}:
+        raise Refused("Every release requires host plus application; only fixed OCI and compliance-content components are supported")
+    if "content_enrollment" in value and (value["content_enrollment"] != "selected-baseline-v1" or "baseline" in changes):
+        raise Refused("Content enrollment must explicitly select the compatible host bridge without a baseline update")
     for name, change in changes.items():
+        if name == "baseline":
+            if not isinstance(change, dict) or set(change) != {"version", "from_versions", "content_schema", "descriptor_sha256"}:
+                raise Refused("Baseline recipe requires its exact content contract")
+            ContentUpdate.validate_component({**change, "artifact": "baseline-content.tar", "rollback_safe": True})
+            continue
         extra = {"family", "tested_minimum", "tested_maximum"} if name == "clickhouse" else {"qualification_artifact"} if name == "keycloak" else set()
         version_pattern = payload.VERSION if name in {"host", "nebulalog"} else CLICKHOUSE_VERSION if name == "clickhouse" else COMPONENT_VERSION
         if (not isinstance(change, dict) or set(change) != {"version", "from_versions"} | extra
@@ -153,9 +161,16 @@ def check_identity(recipe, stage, manifest):
         raise Refused("Unreferenced browser evidence is not published")
 
 
-def assemble(source, source_manifest, image_directory, recipe_path, output, *, signing_key=None, evidence_directory=None, now=None):
+def assemble(source, source_manifest, image_directory, recipe_path, output, *, signing_key=None, evidence_directory=None, content_archive=None, now=None):
     source, source_manifest, image_directory, output = map(lambda path: Path(path).absolute(), (source, source_manifest, image_directory, output))
     recipe = validate_recipe(read_json(recipe_path), now)
+    if ("baseline" in recipe["components"]) != (content_archive is not None):
+        raise Refused("Compliance archive must be supplied exactly when baseline content is declared")
+    content = None
+    if content_archive is not None:
+        spec = recipe["components"]["baseline"]
+        content = ContentUpdate.verify_archive(content_archive,
+            expected_descriptor_sha256=spec["descriptor_sha256"], expected_version=spec["version"])
     source_raw = payload.read_regular(source_manifest, payload.MAX_SOURCE_MANIFEST)
     snapshot = payload.source_manifest(source_raw)
     verify_source(source, snapshot)
@@ -190,11 +205,19 @@ def assemble(source, source_manifest, image_directory, recipe_path, output, *, s
         host = build_host(source, source_manifest, stage / "host.tar", version=recipe["version"])
         manifest = {"schema": 1, "product": "nebulalog", "channel": "stable", **{key: recipe[key] for key in ("sequence", "version", "issued_at", "expires_at")},
                     "components": {}, "artifacts": []}
+        if "content_enrollment" in recipe:
+            manifest["content_enrollment"] = recipe["content_enrollment"]
         artifacts = {"host.tar": file_info(stage / "host.tar")}
         for name, spec in sorted(recipe["components"].items()):
             component = {**spec, "rollback_safe": True}
             if name == "host":
                 component.update(artifact="host.tar", abi=payload.ABI, host_source_sha256=host["metadata"]["host_source_sha256"])
+            elif name == "baseline":
+                filename = "baseline-content.tar"
+                artifacts[filename] = file_info(Path(content_archive), ContentUpdate.MAX_ARCHIVE, stage / filename)
+                ContentUpdate.verify_archive(stage / filename, expected_sha256=content["archive_sha256"],
+                    expected_descriptor_sha256=spec["descriptor_sha256"], expected_version=spec["version"])
+                component["artifact"] = filename
             else:
                 item = images[IMAGES[name]]
                 filename = item["archive"]
@@ -280,7 +303,7 @@ def verify_package(package, *, expected_manifest, expected_commit, source_tree=N
             or record["application_source_sha256"] != application_hash(source)):
         raise Refused("Package public trust and source identity disagree")
     manifest = verify_release(package / "manifest.json", package / "manifest.sig", package / "publisher-public.spki", package, now=now)
-    if (not {"host", "nebulalog"} <= set(manifest["components"]) <= set(IMAGES) | {"host"}
+    if (not {"host", "nebulalog"} <= set(manifest["components"]) <= set(IMAGES) | {"host", "baseline"}
             or manifest["version"] != record["version"] or manifest["sequence"] != record["sequence"]):
         raise Refused("Package is not a combined host and OCI release")
     referenced = {change["artifact"] for change in manifest["components"].values()}
@@ -289,8 +312,14 @@ def verify_package(package, *, expected_manifest, expected_commit, source_tree=N
         "schema_revision": manifest["components"]["nebulalog"]["schema_revision"],
         "components": {}, "evidence_artifacts": [item["name"] for item in manifest["artifacts"] if item["name"] not in referenced]}
     recipe["database_migration"] = manifest["components"]["nebulalog"]["database_migration"]
+    if "content_enrollment" in manifest:
+        recipe["content_enrollment"] = manifest["content_enrollment"]
     application_schema.bind_source(source["files"], recipe["schema_revision"])
     for name, change in manifest["components"].items():
+        if name == "baseline":
+            ContentUpdate.validate_component(change)
+            recipe["components"][name] = {key: change[key] for key in ("version", "from_versions", "content_schema", "descriptor_sha256")}
+            continue
         keys = {"version", "from_versions"} | ({"family", "tested_minimum", "tested_maximum"} if name == "clickhouse" else {"qualification_artifact"} if name == "keycloak" else set())
         fixed = {"artifact", "rollback_safe"} | ({"abi", "host_source_sha256"} if name == "host" else {"image", "database_migration", "schema_revision", "schema_sha256"})
         declared = application_schema.declaration(source["files"], recipe["schema_revision"],
@@ -305,6 +334,11 @@ def verify_package(package, *, expected_manifest, expected_commit, source_tree=N
         raise Refused("Host generation differs from the frozen package source")
     for name, change in manifest["components"].items():
         if name == "host": continue
+        if name == "baseline":
+            ContentUpdate.verify_archive(package / change["artifact"],
+                expected_sha256=record["assets"][change["artifact"]]["sha256"],
+                expected_descriptor_sha256=change["descriptor_sha256"], expected_version=change["version"])
+            continue
         image = image_bundle.verify_oci_archive(package / change["artifact"], change["image"])
         if name == "nebulalog" and image["application_source_sha256"] != record["application_source_sha256"]:
             raise Refused("OCI application differs from the frozen package source")
@@ -353,6 +387,7 @@ def main():
         build.add_argument("--" + name, required=True, type=Path)
     build.add_argument("--signing-key", type=Path)
     build.add_argument("--evidence-directory", type=Path)
+    build.add_argument("--content-archive", type=Path)
     verify = sub.add_parser("verify-native")
     for name in ("package", "report", "evidence-directory", "ova", "source-tree"):
         verify.add_argument("--" + name, required=True, type=Path)
@@ -362,7 +397,7 @@ def main():
     try:
         if args.command == "assemble":
             result = assemble(args.source, args.source_manifest, args.image_directory, args.recipe, args.output,
-                              signing_key=args.signing_key, evidence_directory=args.evidence_directory)
+                              signing_key=args.signing_key, evidence_directory=args.evidence_directory, content_archive=args.content_archive)
         else:
             result = verify_native(args.package, args.report, args.evidence_directory, args.ova,
                                    expected_manifest=args.expected_manifest, expected_commit=args.expected_commit, source_tree=args.source_tree)

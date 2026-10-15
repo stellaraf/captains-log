@@ -638,7 +638,7 @@ def _fold(initial, history, identity):
         elif kind is None:
             # Fixed runtime generations cannot write any boot artifact or RPM
             # inventory. Do not silently ignore an overlapping future recipe.
-            paths = [i['path'] for key in ('files', 'generation_additions', 'preserved') for i in plan.get(key, [])]
+            paths = [i['path'] for key in ('files', 'generation_additions', 'content_additions', 'preserved') for i in plan.get(key, [])]
             paths.append(plan.get('selection', {}).get('path', '/invalid'))
             if any(path == native.ENV or native.protected_path(path) for path in paths):
                 refuse('host_recipe_overlaps_boot_scope')

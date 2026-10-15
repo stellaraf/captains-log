@@ -415,6 +415,8 @@ class HookJournal:
     @staticmethod
     def _scap_argv(value):
         argv = ["oscap", "xccdf", "eval", "--profile", value["profile"], "--results", value["xml"], "--report", value["html"]]
+        if value.get("arf") is not None:
+            argv += ["--results-arf", value["arf"]]
         if value["tailoring"] is not None:
             argv += ["--tailoring-file", value["tailoring"]["path"]]
         return argv + [value["datastream"]["path"]]
@@ -431,7 +433,7 @@ class HookJournal:
                 raise Refused("SCAP execution input changed during assessment")
 
     def _validate_scap(self, value):
-        if (not isinstance(value, dict) or set(value) != {"policy", "profile", "kind", "datastream", "tailoring", "xml", "html"}
+        if (not isinstance(value, dict) or set(value) not in ({"policy", "profile", "kind", "datastream", "tailoring", "xml", "html"}, {"policy", "profile", "kind", "datastream", "tailoring", "xml", "html", "arf"})
                 or value["kind"] not in {"cis", "stig"} or not isinstance(value["profile"], str) or not value["profile"].startswith("xccdf_")):
             raise Refused("Invalid fixed SCAP authority")
         for name in ("policy", "datastream", "tailoring"):
@@ -456,6 +458,10 @@ class HookJournal:
                 or xml.resolve() != xml or html.resolve() != html or not xml.is_relative_to(policy.parent)
                 or xml.parent != html.parent or xml.name != value["kind"] + ".xml" or html.name != value["kind"] + ".html"):
             raise Refused("SCAP output must belong to its retained operation policy")
+        if "arf" in value:
+            arf = Path(value["arf"])
+            if arf.resolve() != arf or arf.parent != xml.parent or arf.name != value["kind"] + ".arf.xml":
+                raise Refused("ARF output must belong to its exact retained assessment")
         body = payload.strict_json(trusted_file(policy).read_bytes())
         profiles = body.get("assessments", []) if isinstance(body, dict) else []
         matches = [profile for profile in profiles if isinstance(profile, dict) and profile.get("kind") == value["kind"]
@@ -471,7 +477,7 @@ class HookJournal:
     def scap_authority(self, policy_path, argv):
         policy_path = Path(policy_path)
         body = payload.strict_json(trusted_file(policy_path).read_bytes())
-        if len(argv) not in (10, 12) or argv[:4] != ["oscap", "xccdf", "eval", "--profile"]:
+        if len(argv) not in (10, 12, 14) or argv[:4] != ["oscap", "xccdf", "eval", "--profile"]:
             raise Refused("Only the fixed non-remediating SCAP eval can qualify")
         matches = [profile for profile in body.get("assessments", []) if profile.get("profile_id") == argv[4]
                    and Path(argv[6]).name == profile.get("kind", "") + ".xml"]
@@ -483,6 +489,8 @@ class HookJournal:
             "datastream": {"path": profile["datastream"], "sha256": profile["sha256"]},
             "tailoring": None if not profile.get("tailoring") else {"path": profile["tailoring"], "sha256": profile.get("tailoring_sha256")},
             "xml": argv[6], "html": argv[8]}
+        if argv[9:10] == ["--results-arf"]:
+            value["arf"] = argv[10]
         for name in ("datastream", "tailoring"):
             ref = value[name]
             if ref is None:
@@ -505,7 +513,7 @@ class HookJournal:
                 finally:
                     os.close(parent)
         self._validate_scap(value)
-        if argv != self._scap_argv(value) or os.path.lexists(value["xml"]) or os.path.lexists(value["html"]):
+        if argv != self._scap_argv(value) or os.path.lexists(value["xml"]) or os.path.lexists(value["html"]) or "arf" in value and os.path.lexists(value["arf"]):
             raise Refused("SCAP dispatch must create its exact fresh operation outputs")
         return value
 
@@ -527,8 +535,13 @@ class HookJournal:
             valid = False
         if not valid:
             raise Refused("SCAP result lacks a completed assessment interval")
-        return {"xml_sha256": payload.digest(raw), "html_sha256": payload.digest(html.read_bytes()),
-                "rules_sha256": payload.digest(self._encoded(rules))}
+        proof = {"xml_sha256": payload.digest(raw), "html_sha256": payload.digest(html.read_bytes()),
+                 "rules_sha256": payload.digest(self._encoded(rules))}
+        if "arf" in authority:
+            from .baseline import ContentUpdate
+            proof.update(arf_sha256=payload.digest(trusted_file(Path(authority["arf"])).read_bytes()),
+                         evidence_sha256=ContentUpdate.assessment_evidence(xml.parent, authority["kind"], authority["profile"], source=self.stage / ("component-scap-source-" + authority["datastream"]["sha256"] + ".xml")))
+        return proof
 
     def acknowledge_scap(self, hook, ticket, argv):
         if not isinstance(ticket, dict) or set(ticket) != {"id", "sha256"} or not isinstance(ticket["id"], str) or not re.fullmatch(r"[a-f0-9]{32}", ticket["id"]):

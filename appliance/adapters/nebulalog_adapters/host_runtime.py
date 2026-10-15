@@ -12,6 +12,7 @@ import re
 import stat
 
 from nebulalog_manager import aide, host_activation, host_dispatch, host_payload
+from nebulalog_manager.baseline import ContentUpdate
 from nebulalog_manager.common import Refused, atomic_json
 
 SYSTEMD = Path("/etc/systemd/system")
@@ -96,7 +97,7 @@ class HostRuntime:
         for item in entries:
             name = item["path"]
             if (name in MUTABLE_CUSTOMER or name.startswith("baseline-assessments/")
-                    or name == "bootstrap/runtime.lock"):
+                    or name == "bootstrap/runtime.lock" or name == "security-policy.json" and "baseline" in self.release["components"]):
                 continue
             total += item["bytes"]
             values.append({**item, "kind": "file", "path": str(self.lifecycle.configuration / name)})
@@ -157,7 +158,20 @@ class HostRuntime:
             resources.append((path, self._render_quadlet(self.old_root, service, image), self._render_quadlet(self.new_root, service, new_image)))
         if self.lifecycle.config.get("edge_service"):
             resources.append((EDGE, self._render_edge(self.old_root), self._render_edge(self.new_root)))
+        if "baseline" in self.release["components"]:
+            content = self.content()
+            resources.append((self.lifecycle.configuration / "security-policy.json", content["before"], content["after"]))
         return sorted(resources, key=lambda item: str(item[0]))
+
+    def content(self):
+        plan = host_dispatch.protected_json(self.stage / "content-plan.json")
+        value = ContentUpdate.validate_plan(self.stage, plan, self.release)
+        if value["transition"]["previous_identity"] != self.transaction["previous"]["components"].get("baseline"):
+            raise Refused("Content preimage differs from the accepted component inventory")
+        return value
+
+    def resource_mode(self, path):
+        return 0o600 if path == self.lifecycle.configuration / "security-policy.json" else 0o644
 
     def _generation_additions(self):
         host_dispatch.generation_info(self.candidate["generation"])
@@ -208,13 +222,20 @@ class HostRuntime:
     def preflight(self):
         self.phase("update-preflight")
         self.probe()
+        content = None
+        if "baseline" in self.release["components"]:
+            plan = ContentUpdate.prepare_transition(self.stage, self.release,
+                self.transaction["previous"]["components"].get("baseline"), self.lifecycle.configuration, self.lifecycle.cmd)
+            content = ContentUpdate.publish(self.stage, plan)
+            self.lifecycle.cmd(["restorecon", "-R", str(ContentUpdate.ROOT)])
         resources = self._resources()
         files = []
         for path, old, new in resources:
             actual, observed = checked_file(path)
-            if actual != old or observed != description(old):
+            mode = self.resource_mode(path)
+            if actual != old or observed != description(old, mode):
                 raise Refused("Package-managed host resource has local changes; automatic reconciliation refused: " + str(path))
-            files.append({"path": str(path), "before": description(old), "after": description(new)})
+            files.append({"path": str(path), "before": description(old, mode), "after": description(new, mode)})
         selection = host_activation.selection()
         # Match atomic_json's canonical bytes without writing any selection.
         encode_selection = lambda value: (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
@@ -226,17 +247,22 @@ class HostRuntime:
                 "selection": {"path": str(host_activation.SELECTION), "before": description(encode_selection(selection), 0o600),
                               "after": description(encode_selection(selected_new), 0o600), "restored": description(encode_selection(restored), 0o600)},
                 "migration_only": sorted(MIGRATION_ONLY)}
+        if content is not None:
+            plan.update(schema=2, content=content["plan"], content_additions=content["additions"])
         if self.plan_path.exists() or self.plan_path.is_symlink():
             if host_dispatch.protected_json(self.plan_path) != plan:
                 raise Refused("Existing host runtime plan differs")
         else:
             atomic_json(self.plan_path, plan)
         self.integrity("prepare")
+        if content is not None:
+            self.lifecycle.content_assessment(self.stage, content["before"], role="rollback")
+            self.lifecycle.content_assessment(self.stage, content["after"])
         return self.evidence("update-preflight", {"dispatcher_ready", "reconciliation_supported", "rollback_supported", "provenance_supported"})
 
     def plan(self):
         value = host_dispatch.protected_json(self.plan_path)
-        if (not isinstance(value, dict) or value.get("schema") != 1 or value.get("sequence") != self.transaction["sequence"]
+        if (not isinstance(value, dict) or value.get("schema") != (2 if "baseline" in self.release["components"] else 1) or value.get("sequence") != self.transaction["sequence"]
                 or value.get("manifest_sha256") != self.transaction["manifest_sha256"]
                 or value.get("coordinator_generation") != self.previous["generation"] or value.get("candidate_generation") != self.candidate["generation"]):
             raise Refused("Host runtime plan differs from the retained transaction")
@@ -254,6 +280,8 @@ class HostRuntime:
         paths = set(self.fixed_targets().values())
         paths.update(self.lifecycle.quadlets / ("nebulalog-" + name + ".container") for name in IMAGE_KEYS)
         if self.lifecycle.config.get("edge_service"): paths.add(EDGE)
+        if "baseline" in self.release["components"]:
+            paths.add(self.lifecycle.configuration / "security-policy.json")
         return paths
 
     def checked_plan(self):
@@ -270,10 +298,14 @@ class HostRuntime:
                 item = entry[phase]
                 if (not isinstance(item, dict) or set(item) != {"kind", "uid", "gid", "mode", "bytes", "sha256"}
                         or item["kind"] != "file" or type(item["uid"]) is not int or item["uid"] != OWNER_UID
-                        or type(item["gid"]) is not int or item["gid"] != OWNER_GID or type(item["mode"]) is not int or item["mode"] != 0o644
+                        or type(item["gid"]) is not int or item["gid"] != OWNER_GID or type(item["mode"]) is not int or item["mode"] != self.resource_mode(Path(entry["path"]))
                         or type(item["bytes"]) is not int or not 0 <= item["bytes"] <= host_payload.MAX_FILE
                         or not isinstance(item["sha256"], str) or not host_payload.SHA256.fullmatch(item["sha256"])):
                     raise Refused("Host runtime file metadata is outside its fixed contract")
+        if "baseline" in self.release["components"]:
+            content = self.content()
+            if value.get("content") != content["plan"] or value.get("content_additions") != content["additions"]:
+                raise Refused("Host content generation changed after preflight")
         return value
 
     def _write_retained(self, path, raw):
@@ -320,7 +352,7 @@ class HostRuntime:
             raise Refused("Host backup is not bound to the immutable runtime plan")
         for index, item in enumerate(plan["files"]):
             raw, info = checked_file(self.root / "old" / str(index))
-            if info["mode"] != 0o600 or description(raw) != item["before"]:
+            if info["mode"] != 0o600 or description(raw, self.resource_mode(Path(item["path"]))) != item["before"]:
                 raise Refused("Retained host backup content changed")
         return plan
 
@@ -332,7 +364,7 @@ class HostRuntime:
         resources = {str(path): (old, new) for path, old, new in self._resources()}
         for index, item in enumerate(plan["files"]):
             old, new = resources[item["path"]]
-            if description(old) != item["before"] or description(new) != item["after"]:
+            if description(old, self.resource_mode(Path(item["path"]))) != item["before"] or description(new, self.resource_mode(Path(item["path"]))) != item["after"]:
                 raise Refused("Prepared host bytes differ from their fixed preflight plan")
             self._write_retained(self.root / "new" / str(index), new)
             path = Path(item["path"])
@@ -347,11 +379,13 @@ class HostRuntime:
         self._preserved(plan)
         if not rollback:
             host_dispatch.generation_info(self.candidate["generation"])
+            if "baseline" in self.release["components"]:
+                ContentUpdate.current_review(self.content())
         phase, retained = ("before", "old") if rollback else ("after", "new")
         for index, item in enumerate(plan["files"]):
             path = Path(item["path"])
             raw, info = checked_file(self.root / retained / str(index))
-            if info["mode"] != 0o600 or description(raw) != item[phase] or raw != self.expected_resource(path, index, rollback=rollback):
+            if info["mode"] != 0o600 or description(raw, self.resource_mode(path)) != item[phase] or raw != self.expected_resource(path, index, rollback=rollback):
                 raise Refused("Retained host activation bytes changed")
             actual, observed = checked_file(path)
             if observed not in (item["before"], item["after"]):
@@ -387,6 +421,8 @@ class HostRuntime:
     def expected_resource(self, path, index, *, rollback):
         """Derive bytes from catalog source, never from plan-selected contents."""
         root = self.old_root if rollback else self.new_root
+        if path == self.lifecycle.configuration / "security-policy.json" and "baseline" in self.release["components"]:
+            return self.content()["before" if rollback else "after"]
         reverse = {target: name for name, target in self.fixed_targets().items()}
         if path in reverse:
             return self.source(root, reverse[path])

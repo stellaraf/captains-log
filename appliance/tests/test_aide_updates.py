@@ -520,7 +520,7 @@ class AuthorizedAideTests(unittest.TestCase):
             if self.source_changed and path == self.generation / self.source_changed:
                 return b"changed"
             return b"same"
-        for patched in (patch.object(updates.host_dispatch, "transaction_binding", return_value=(transaction, {})),
+        for patched in (patch.object(updates.host_dispatch, "transaction_binding", return_value=(transaction, {"components": {}})),
                         patch.object(updates.host_dispatch, "coordinator_pin", return_value=pin),
                         patch.object(updates.host_dispatch, "generation_info", return_value=candidate),
                         patch.object(updates.host_activation, "_candidate_identity", return_value=(candidate, None)),

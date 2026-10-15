@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+import copy
+from contextlib import contextmanager, ExitStack
 from datetime import datetime, timezone, timedelta
 import hashlib
 import json
@@ -11,6 +12,7 @@ from pathlib import Path
 import re
 import stat
 import sys
+import tarfile
 import uuid
 import xml.etree.ElementTree as ET
 
@@ -22,6 +24,927 @@ CONTENT = Path("/usr/share/xml/scap/ssg/content")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 RESULTS = {"pass", "fail", "error", "unknown", "notapplicable", "notchecked", "notselected", "informational", "fixed"}
 UNASSESSABLE = {"error", "unknown", "fixed"}
+
+
+class ContentUpdate:
+    """Fixed content-only release format; executable scanner updates are separate.
+
+    The archive contains data, never a hook, executable or remediation recipe.
+    A signed template is publisher provenance, not installation review authority.
+    """
+    KIND = "captains-log-compliance-content-v1"
+    ROOT = Path("/usr/share/nebulalog/compliance-content")
+    MAX_FILE = 128 * 1024**2
+    MAX_ARCHIVE = 384 * 1024**2
+    MAX_FILES = 16
+    NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,95}\.(?:xml|json)")
+    VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][a-zA-Z0-9.-]+)?")
+    COMPONENT_FIELDS = {"artifact", "version", "from_versions", "rollback_safe", "content_schema", "descriptor_sha256"}
+
+    @staticmethod
+    def encoded(value):
+        return (json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
+
+    @staticmethod
+    def digest(raw):
+        return hashlib.sha256(raw).hexdigest()
+
+    @classmethod
+    def engine(cls, runner=run):
+        nevra = runner(["rpm", "-q", "--qf", "%{NEVRA}", "openscap-scanner"]).strip()
+        if not re.fullmatch(r"openscap-scanner-[A-Za-z0-9.+:~_-]+\.x86_64", nevra):
+            raise Refused("Compliance content requires one exact x86_64 scanner package")
+        version = runner(["oscap", "--version"])
+        if not isinstance(version, str) or not 1 <= len(version) <= 65536 or "OpenSCAP" not in version:
+            raise Refused("Installed scanner identity is unavailable")
+        return {"scanner_nevra": nevra, "version_sha256": cls.digest(version.encode())}
+
+    @classmethod
+    def validate_component(cls, value):
+        if (not isinstance(value, dict) or set(value) != cls.COMPONENT_FIELDS
+                or type(value["content_schema"]) is not int or value["content_schema"] != 1
+                or value["rollback_safe"] is not True or not isinstance(value["version"], str)
+                or not cls.VERSION.fullmatch(value["version"])
+                or not isinstance(value["descriptor_sha256"], str) or not SHA256.fullmatch(value["descriptor_sha256"])
+                or not isinstance(value["artifact"], str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,120}\.tar", value["artifact"])
+                or not isinstance(value["from_versions"], list) or not value["from_versions"]
+                or any(not isinstance(v, str) or not (cls.VERSION.fullmatch(v) or re.fullmatch(r"sha256:[a-f0-9]{64}", v)) for v in value["from_versions"])
+                or len(set(value["from_versions"])) != len(value["from_versions"])):
+            raise Refused("Baseline content requires its exact signed component contract")
+        return value
+
+    @classmethod
+    def descriptor(cls, value):
+        fields = {"schema", "kind", "version", "platform", "source_url", "content_revision", "engine", "files", "policies"}
+        if (not isinstance(value, dict) or set(value) != fields or type(value["schema"]) is not int or value["schema"] != 1
+                or value["kind"] != cls.KIND or value["platform"] != "rocky9-x86_64"
+                or not isinstance(value["version"], str) or not cls.VERSION.fullmatch(value["version"])):
+            raise Refused("Unsupported compliance-content descriptor")
+        _text(value["source_url"], 8, 4096); _text(value["content_revision"], 1, 256)
+        engine = value["engine"]
+        if (not isinstance(engine, dict) or set(engine) != {"scanner_nevra", "version_sha256"}
+                or not isinstance(engine["scanner_nevra"], str) or not re.fullmatch(r"openscap-scanner-[A-Za-z0-9.+:~_-]+\.x86_64", engine["scanner_nevra"])
+                or not isinstance(engine["version_sha256"], str) or not SHA256.fullmatch(engine["version_sha256"])):
+            raise Refused("Content must declare the exact qualified scanner engine")
+        files = value["files"]
+        if not isinstance(files, dict) or not 1 <= len(files) <= cls.MAX_FILES:
+            raise Refused("Content file inventory is empty or exceeds its bound")
+        total = 0
+        for name, item in files.items():
+            if (not isinstance(name, str) or not cls.NAME.fullmatch(name) or name == "content.json"
+                    or not isinstance(item, dict) or set(item) != {"bytes", "sha256"}
+                    or type(item["bytes"]) is not int or not 0 < item["bytes"] <= cls.MAX_FILE
+                    or not isinstance(item["sha256"], str) or not SHA256.fullmatch(item["sha256"])):
+                raise Refused("Invalid bounded compliance-content file")
+            total += item["bytes"]
+        if total > cls.MAX_ARCHIVE - 1024**2:
+            raise Refused("Compliance content exceeds its aggregate bound")
+        policies = value["policies"]
+        if not isinstance(policies, dict) or set(policies) != set(security.BASELINES):
+            raise Refused("A content release must supply CIS Level 2, STIG and Unified templates")
+        used = set()
+        for name, policy in policies.items():
+            if (not isinstance(policy, dict) or type(policy.get("schema")) is not int or policy["schema"] != 1
+                    or policy.get("baseline") != name or "installation_id" in policy or "selection_id" in policy
+                    or "content_update" in policy):
+                raise Refused("Content policy template cannot assert installation authority")
+            for item in [*policy.get("assessments", []), *([policy["unified_remediation"]] if policy.get("unified_remediation") else [])]:
+                if not isinstance(item, dict):
+                    raise Refused("Malformed content assessment template")
+                for path_key, digest_key in (("datastream", "sha256"), ("tailoring", "tailoring_sha256")):
+                    if path_key not in item and path_key == "tailoring":
+                        continue
+                    path = item.get(path_key)
+                    if not isinstance(path, str) or path not in files or files[path]["sha256"] != item.get(digest_key):
+                        raise Refused("Content template references an unbound file")
+                    used.add(path)
+            if policy.get("unified_mapping"):
+                item = policy["unified_mapping"]
+                if not isinstance(item, dict) or set(item) != {"path", "sha256"} or item["path"] not in files or files[item["path"]]["sha256"] != item["sha256"]:
+                    raise Refused("Unified template mapping is not inventoried")
+                used.add(item["path"])
+        if used != set(files):
+            raise Refused("Content archive cannot carry unused files")
+        return value
+
+    @classmethod
+    def verify_archive(cls, path, *, expected_sha256=None, expected_descriptor_sha256=None, expected_version=None):
+        from . import host_payload
+        raw = host_payload.read_regular(Path(path), cls.MAX_ARCHIVE)
+        checksum = cls.digest(raw)
+        if expected_sha256 is not None and checksum != expected_sha256:
+            raise Refused("Signed compliance archive hash changed")
+        import io
+        files = {}
+        end = 0
+        try:
+            with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
+                for entry in archive:
+                    if (len(files) >= cls.MAX_FILES + 1 or not entry.isreg() or entry.name in files
+                            or not cls.NAME.fullmatch(entry.name) or entry.pax_headers
+                            or entry.type not in (tarfile.REGTYPE, tarfile.AREGTYPE)
+                            or entry.uid != 0 or entry.gid != 0 or entry.mode != 0o644
+                            or entry.offset != end or entry.offset_data != entry.offset + 512
+                            or not 0 < entry.size <= (1024**2 if entry.name == "content.json" else cls.MAX_FILE)):
+                        raise Refused("Compliance archive has an unsafe or duplicate member")
+                    stream = archive.extractfile(entry)
+                    body = stream.read(entry.size + 1)
+                    if len(body) != entry.size:
+                        raise Refused("Compliance archive member length changed")
+                    files[entry.name] = body
+                    end = entry.offset_data + ((entry.size + 511) // 512) * 512
+        except (tarfile.TarError, OSError, EOFError) as exc:
+            raise Refused("Malformed uncompressed compliance archive") from exc
+        if len(raw) - end < 1024 or len(raw) % 512 or any(raw[end:]):
+            raise Refused("Compliance archive has trailing or concatenated data")
+        descriptor_raw = files.pop("content.json", b"")
+        descriptor = cls.descriptor(host_payload.strict_json(descriptor_raw))
+        if descriptor_raw != cls.encoded(descriptor):
+            raise Refused("Compliance descriptor is not canonical JSON")
+        if expected_descriptor_sha256 is not None and cls.digest(descriptor_raw) != expected_descriptor_sha256:
+            raise Refused("Signed compliance descriptor hash changed")
+        if expected_version is not None and descriptor["version"] != expected_version:
+            raise Refused("Signed compliance version changed")
+        if set(files) != set(descriptor["files"]) or any({"bytes": len(body), "sha256": cls.digest(body)} != descriptor["files"][name] for name, body in files.items()):
+            raise Refused("Compliance archive differs from its complete inventory")
+        for policy in descriptor["policies"].values():
+            for item in [*policy.get("assessments", []), *([policy["unified_remediation"]] if policy.get("unified_remediation") else [])]:
+                cls.closed_datastream(files[item["datastream"]])
+        return {"descriptor": descriptor, "files": files, "archive_sha256": checksum}
+
+    @classmethod
+    def xml(cls, raw):
+        if not isinstance(raw, bytes) or len(raw) > cls.MAX_FILE or b"<!DOCTYPE" in raw.upper().replace(b"\0", b"") or b"<!ENTITY" in raw.upper().replace(b"\0", b""):
+            raise Refused("Unsafe or oversized compliance XML")
+        try:
+            return ET.fromstring(raw)
+        except ET.ParseError as exc:
+            raise Refused("Malformed compliance XML") from exc
+
+    @classmethod
+    def closed_datastream(cls, raw):
+        """Reject executable/remote checks before invoking a native XML consumer.
+
+        This deliberately does not strip SCE. Publisher preprocessing is a new
+        reviewed content artifact and cannot claim unchanged rule semantics.
+        """
+        root = cls.xml(raw)
+        ds = "{http://scap.nist.gov/schema/scap/source/1.2}"
+        xlink = "{http://www.w3.org/1999/xlink}href"
+        if root.tag != ds + "data-stream-collection":
+            raise Refused("Content updates require a closed SCAP source datastream")
+        components, refs, names = {}, {}, {}
+        for node in root.iter():
+            local = _local(node)
+            if local in {"script", "extended-component", "check-content", "fix"}:
+                raise Refused("Executable or inline checks require a separate execution recipe")
+            if node.tag == ds + "component":
+                identifier = node.get("id")
+                if not identifier or identifier in components or len(node) != 1:
+                    raise Refused("Ambiguous SCAP component")
+                components[identifier] = node
+            if node.tag == ds + "component-ref":
+                identifier, href = node.get("id"), node.get(xlink)
+                if not identifier or identifier in refs or not isinstance(href, str) or not href.startswith("#") or len(href) < 2:
+                    raise Refused("External or ambiguous SCAP component reference")
+                refs[identifier] = href[1:]
+            if node.tag == "{urn:oasis:names:tc:entity:xmlns:xml:catalog}uri":
+                name, uri = node.get("name"), node.get("uri")
+                if (not isinstance(name, str) or not name or name.startswith(("/", ".")) or ":" in name or "\\" in name
+                        or not isinstance(uri, str) or not uri.startswith("#") or names.get(name, uri[1:]) != uri[1:]):
+                    raise Refused("Remote or ambiguous SCAP catalog reference")
+                names[name] = uri[1:]
+        if not components or not refs or any(component not in components for component in refs.values()) or any(ref not in refs for ref in names.values()):
+            raise Refused("SCAP component graph is not closed")
+        allowed = {"http://oval.mitre.org/XMLSchema/oval-definitions-5", "http://scap.nist.gov/schema/ocil/2"}
+        for node in root.iter():
+            local = _local(node)
+            if local == "check" and node.get("system") not in allowed:
+                raise Refused("Unsupported or executable SCAP check engine")
+            if local == "check-content-ref" or local == "check" and node.get("href"):
+                href = node.get("href")
+                if href not in names:
+                    raise Refused("Check content is not an embedded authenticated component")
+        return root
+
+    @classmethod
+    def policy_paths(cls, policy, root):
+        result = copy.deepcopy(policy)
+        for item in [*result["assessments"], *([result["unified_remediation"]] if result.get("unified_remediation") else [])]:
+            for key in ("datastream", "tailoring"):
+                if key in item:
+                    item[key] = str(Path(root) / item[key])
+        if result.get("unified_mapping"):
+            result["unified_mapping"]["path"] = str(Path(root) / result["unified_mapping"]["path"])
+        return result
+
+    @classmethod
+    def _choices(cls, old, new, key, identifier):
+        """Existing site decisions win; missing source IDs fail full validation."""
+        original, proposed = old.get(key, []), new.get(key, [])
+        for values in (original, proposed):
+            if (not isinstance(values, list) or any(not isinstance(v, dict) or not isinstance(v.get(identifier), str) for v in values)
+                    or len({v[identifier] for v in values}) != len(values)):
+                raise Refused("Ambiguous site-policy decisions")
+        merged = {v[identifier]: copy.deepcopy(v) for v in proposed}
+        merged.update({v[identifier]: copy.deepcopy(v) for v in original})
+        return [merged[name] for name in sorted(merged)]
+
+    @classmethod
+    def _tailoring(cls, item):
+        ns = "{http://checklists.nist.gov/xccdf/1.2}"
+        root = ET.Element(ns + "Tailoring", {"id": "xccdf_com_captainslog_content_tailoring"})
+        ET.SubElement(root, ns + "benchmark", {"href": Path(item["datastream"]).name})
+        ET.SubElement(root, ns + "version", {"time": "2000-01-01T00:00:00Z"}).text = "1"
+        profile = ET.SubElement(root, ns + "Profile", {"id": item["profile_id"], "extends": item["base_profile_id"]})
+        for key, identifier in (("tailoring_decisions", "rule_id"), ("tailoring_groups", "group_id")):
+            for entry in item.get(key, []):
+                if type(entry.get("selected")) is not bool:
+                    raise Refused("Site selection must be explicitly boolean")
+                ET.SubElement(profile, ns + "select", {"idref": entry[identifier], "selected": str(entry["selected"]).lower()})
+        for entry in item.get("tailoring_values", []):
+            ET.SubElement(profile, ns + "refine-value", {"idref": entry["value_id"], "selector": entry["selector"]})
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    @classmethod
+    def derive(cls, archive, previous, generation):
+        """Construct exact bytes; never write or infer a review/exception renewal."""
+        descriptor = archive["descriptor"]
+        selected = previous.get("baseline")
+        if selected not in security.BASELINES:
+            raise Refused("Installed baseline selection is unavailable")
+        template = copy.deepcopy(descriptor["policies"][selected])
+        policy = copy.deepcopy(previous)
+        files = dict(archive["files"])
+        policy.pop("content_update", None)
+        def profile(old, proposed, label):
+            if old.get("kind") != proposed.get("kind"):
+                raise Refused("A content release cannot change the selected baseline kind")
+            result = copy.deepcopy(proposed)
+            # Preserve all existing site fields, including custom exception
+            # metadata. Only publisher source/profile identity is replaceable.
+            replace = {"datastream", "sha256", "source_url", "content_revision", "profile_id", "base_profile_id", "tailoring", "tailoring_sha256"}
+            for key, value in old.items():
+                if key not in replace and key not in {"tailoring_decisions", "tailoring_groups", "tailoring_values"}:
+                    result[key] = copy.deepcopy(value)
+            for key, identifier in (("tailoring_decisions", "rule_id"), ("tailoring_groups", "group_id"), ("tailoring_values", "value_id")):
+                merged = cls._choices(old, proposed, key, identifier)
+                if merged or key in old or key in proposed:
+                    result[key] = merged
+            if old.get("tailoring") or proposed.get("tailoring"):
+                result["base_profile_id"] = proposed.get("base_profile_id", proposed["profile_id"])
+                if result["profile_id"] == result["base_profile_id"]:
+                    result["profile_id"] = "xccdf_com_captainslog_profile_content_" + label
+                name = "site-" + label + ".xml"
+                if name in files:
+                    raise Refused("Signed content collides with a reserved site-policy file")
+                body = cls._tailoring(result)
+                files[name] = body
+                result["tailoring"], result["tailoring_sha256"] = name, cls.digest(body)
+            return result
+        old_by_kind = {p["kind"]: p for p in previous["assessments"]}
+        if set(old_by_kind) != {p.get("kind") for p in template["assessments"]}:
+            raise Refused("Content update cannot replace the selected baseline coverage")
+        policy["assessments"] = [profile(old_by_kind[item["kind"]], item, item["kind"]) for item in template["assessments"]]
+        if previous.get("unified_remediation") or template.get("unified_remediation"):
+            if not previous.get("unified_remediation") or not template.get("unified_remediation"):
+                raise Refused("Unified executable selection must retain its established policy shape")
+            policy["unified_remediation"] = profile(previous["unified_remediation"], template["unified_remediation"], "unified")
+        if selected == "unified":
+            old_mapping = _json(previous["unified_mapping"]["path"])
+            new_mapping = json.loads(files[template["unified_mapping"]["path"]])
+            mapping = copy.deepcopy(old_mapping)
+            mapping["controls"] = cls._choices(old_mapping, new_mapping, "controls", "control")
+            mapping["assessments"] = {p["kind"]: assessment_binding(p) for p in policy["assessments"]}
+            if policy.get("unified_remediation"):
+                item = policy["unified_remediation"]
+                mapping["remediation"] = {key: item[key] for key in ("sha256", "profile_id", "tailoring_sha256")}
+            if "site-unified-mapping.json" in files:
+                raise Refused("Signed content collides with a reserved site mapping")
+            body = cls.encoded(mapping)
+            files["site-unified-mapping.json"] = body
+            policy["unified_mapping"] = {"path": "site-unified-mapping.json", "sha256": cls.digest(body)}
+        policy = cls.policy_paths(policy, generation)
+        return policy, files
+
+    @classmethod
+    def measure(cls, policy_path, runner=run):
+        from . import host_payload
+        raw = host_payload.read_regular(Path(policy_path), 1024**2, trusted=True)
+        policy = host_payload.strict_json(raw)
+        if policy.get("baseline") not in security.BASELINES or not isinstance(policy.get("assessments"), list) or not policy["assessments"]:
+            raise Refused("Installed content identity requires the selected policy")
+        if (not isinstance(policy.get("installation_id"), str) or str(uuid.UUID(policy["installation_id"])) != policy["installation_id"]
+                or not isinstance(policy.get("selection_id"), str) or not re.fullmatch(r"[a-f0-9]{32}", policy["selection_id"])):
+            raise Refused("Installed content identity requires exact installation selection")
+        validate_policy(policy, runner)
+        files = {}
+        for item in [*policy["assessments"], *([policy["unified_remediation"]] if policy.get("unified_remediation") else [])]:
+            for key, hash_key in (("datastream", "sha256"), ("tailoring", "tailoring_sha256")):
+                if key not in item and key == "tailoring":
+                    continue
+                path = Path(item.get(key, ""))
+                body = host_payload.read_regular(path, cls.MAX_FILE, trusted=True)
+                if cls.digest(body) != item.get(hash_key):
+                    raise Refused("Active content differs from the selected policy")
+                files[str(path)] = {"bytes": len(body), "sha256": cls.digest(body)}
+        if policy.get("unified_mapping"):
+            item = policy["unified_mapping"]
+            body = host_payload.read_regular(Path(item["path"]), cls.MAX_FILE, trusted=True)
+            if cls.digest(body) != item["sha256"]:
+                raise Refused("Active Unified mapping changed")
+            files[item["path"]] = {"bytes": len(body), "sha256": cls.digest(body)}
+        engine = cls.engine(runner)
+        generation = cls.digest(cls.encoded({"policy_sha256": cls.digest(raw), "files": files, "engine": engine}))
+        # Publisher upgrade endpoints must be portable between installations;
+        # local policy/selection identity remains separately bound in generation.
+        source_version = cls.digest(cls.encoded(sorted({item["sha256"] for item in policy["assessments"]})))
+        version = cls.selected_authority(policy)["transition"]["version"] if "content_update" in policy else "sha256:" + source_version
+        return {"version": version, "generation": generation, "policy_sha256": cls.digest(raw), "engine": engine}
+
+    @classmethod
+    def bridge(cls, stage, configuration=CONFIGURATION, runner=run):
+        from . import host_payload
+        configuration, stage = Path(configuration), Path(stage)
+        setup = _json(configuration / "bootstrap/setup.json")
+        identity = str(uuid.UUID(setup["installation_id"]))
+        manager = Baseline(configuration, runner=runner)
+        checks = manager.checks(identity, setup["baseline"])
+        if not all(checks.get(key) is True for key in ("baseline_assessed", "baseline_review_complete")):
+            raise Refused("Content inventory bridge requires the accepted selected baseline and exact current review")
+        measured = cls.measure(manager.policy_path, runner)
+        record = {"schema": 1, "kind": "compliance-content-enrollment-v1", "installation_id": identity,
+                  "baseline": setup["baseline"], "identity": measured,
+                  "assessment_sha256": _sha(manager.assessment_path), "review_sha256": _sha(manager.review_path)}
+        cls._retain(stage / "content-enrollment.json", cls.encoded(record))
+        return record
+
+    @classmethod
+    def bridge_health(cls, stage, configuration=CONFIGURATION, runner=run):
+        from . import host_payload
+        record = host_payload.strict_json(host_payload.read_regular(Path(stage) / "content-enrollment.json", 65536, trusted=True))
+        if record != cls.bridge(stage, configuration, runner):
+            raise Refused("Content bridge authority changed during full lifecycle acceptance")
+        return record["identity"]
+
+    @classmethod
+    def semantic_identity(cls, policy, reader):
+        """Conservative whole-source identity, not a guessed rule equivalence.
+
+        XML formatting is retained: false negatives require review rather than
+        accidentally treating a changed OVAL expression/value as equivalent.
+        """
+        value = copy.deepcopy(policy)
+        value.pop("content_update", None)
+        for item in [*value["assessments"], *([value["unified_remediation"]] if value.get("unified_remediation") else [])]:
+            source = reader(item["datastream"])
+            cls.xml(source)
+            item["source_bytes_sha256"] = cls.digest(source)
+            for key in ("datastream", "sha256", "source_url", "content_revision", "tailoring", "tailoring_sha256", "content_review"):
+                item.pop(key, None)
+        if value.get("unified_mapping"):
+            mapping = json.loads(reader(value["unified_mapping"]["path"]))
+            for key in ("review", "assessments", "remediation"):
+                mapping.pop(key, None)
+            value["unified_mapping"] = mapping
+        return cls.digest(cls.encoded(value))
+
+    @classmethod
+    def review_binding(cls, previous_raw, policy_raw, archive_sha256):
+        previous, policy = json.loads(previous_raw), json.loads(policy_raw)
+        return {"installation_id": previous["installation_id"], "baseline": previous["baseline"],
+                "previous_policy_sha256": cls.digest(previous_raw), "candidate_policy_sha256": cls.digest(policy_raw),
+                "archive_sha256": archive_sha256}
+
+    @classmethod
+    def validate_review(cls, value, binding, previous, now=None):
+        now = now or _now()
+        fields = {"schema", "binding", "approved", "control_semantics_reviewed", "reviewer", "rationale", "reviewed_at", "expires_at"}
+        if (not isinstance(value, dict) or set(value) != fields or type(value["schema"]) is not int or value["schema"] != 1
+                or value["binding"] != binding or value["approved"] is not True or value["control_semantics_reviewed"] is not True):
+            raise Refused("The exact content transition needs explicit control-semantics review")
+        _text(value["reviewer"], 3, 200); _text(value["rationale"], 16, 8192)
+        reviewed, expires = _date(value["reviewed_at"]), _date(value["expires_at"])
+        old_expirations = [_date(item["content_review"]["expires_at"]) for item in previous["assessments"]]
+        if previous.get("unified_remediation"):
+            old_expirations.append(_date(previous["unified_remediation"]["content_review"]["expires_at"]))
+        if previous.get("unified_mapping"):
+            old_expirations.append(_date(_json(previous["unified_mapping"]["path"])["review"]["expires_at"]))
+        if reviewed > now or not now < expires <= min(*old_expirations, reviewed + timedelta(days=90)):
+            raise Refused("Content review cannot renew the original authority or exception expiry")
+        return value
+
+    @classmethod
+    def _retain(cls, path, raw, mode=0o600):
+        from . import host_payload
+        path = Path(path)
+        host_payload._trusted_tree(path.parent)
+        if os.path.lexists(path):
+            actual = host_payload.read_regular(path, cls.MAX_FILE, trusted=True)
+            info = path.lstat()
+            if actual != raw or stat.S_IMODE(info.st_mode) != mode or info.st_uid != 0 or info.st_gid != 0:
+                raise Refused("Retained compliance content differs; automatic replacement refused")
+            return
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+        with os.fdopen(descriptor, "wb") as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @classmethod
+    def prepare_transition(cls, stage, release, previous_identity, configuration=CONFIGURATION, runner=run):
+        """Prepare nonactive exact bytes and review authority before maintenance."""
+        from . import host_payload
+        stage, configuration = Path(stage), Path(configuration)
+        component = cls.validate_component(release["components"]["baseline"])
+        artifacts = [item for item in release["artifacts"] if item["name"] == component["artifact"]]
+        if len(artifacts) != 1:
+            raise Refused("Baseline archive identity is ambiguous")
+        archive = cls.verify_archive(stage / component["artifact"], expected_sha256=artifacts[0]["sha256"],
+                                     expected_descriptor_sha256=component["descriptor_sha256"], expected_version=component["version"])
+        observed = cls.measure(configuration / "security-policy.json", runner)
+        if not isinstance(previous_identity, dict) or any(previous_identity.get(key) != observed[key] for key in ("version", "generation", "policy_sha256", "engine")):
+            raise Refused("Active compliance content differs from its enrolled identity")
+        if archive["descriptor"]["engine"] != observed["engine"]:
+            raise Refused("Scanner changes require a separate qualified engine recipe")
+        previous_raw = host_payload.read_regular(configuration / "security-policy.json", 1024**2, trusted=True)
+        previous = host_payload.strict_json(previous_raw)
+        token = cls.digest(cls.encoded({"archive": archive["archive_sha256"], "previous_policy": cls.digest(previous_raw)}))
+        generation = cls.ROOT / token
+        work = stage / "content-work"
+        if not work.exists():
+            work.mkdir(mode=0o700)
+        host_payload._trusted_tree(work)
+        policy, files = cls.derive(archive, previous, generation)
+        policy["content_update"] = {"schema": 1, "generation": token, "archive_sha256": archive["archive_sha256"],
+                                    "previous_policy_sha256": cls.digest(previous_raw)}
+        for name, raw in files.items():
+            cls._retain(work / name, raw)
+        # Validate every advertised baseline, then the actual site-preserving
+        # candidate. Native info/validation is observable through fixed hooks.
+        for template in archive["descriptor"]["policies"].values():
+            validate_policy(cls.policy_paths(template, work), runner)
+        candidate_for_validation = copy.deepcopy(policy)
+        candidate_for_validation.pop("content_update")
+        for item in [*candidate_for_validation["assessments"], *([candidate_for_validation["unified_remediation"]] if candidate_for_validation.get("unified_remediation") else [])]:
+            for key in ("datastream", "tailoring"):
+                if key in item:
+                    item[key] = str(work / Path(item[key]).name)
+        if candidate_for_validation.get("unified_mapping"):
+            candidate_for_validation["unified_mapping"]["path"] = str(work / Path(candidate_for_validation["unified_mapping"]["path"]).name)
+        validate_policy(candidate_for_validation, runner)
+        policy_raw = cls.encoded(policy)
+        binding = cls.review_binding(previous_raw, policy_raw, archive["archive_sha256"])
+        before_semantic = cls.semantic_identity(previous, lambda path: host_payload.read_regular(Path(path), cls.MAX_FILE, trusted=True))
+        after_semantic = cls.semantic_identity(policy, lambda path: files[Path(path).name])
+        request = {"schema": 1, "binding": binding, "generation": token, "before_semantic_sha256": before_semantic,
+                   "after_semantic_sha256": after_semantic, "review_required": before_semantic != after_semantic}
+        cls._retain(stage / "content-review-request.json", cls.encoded(request))
+        cls._retain(work / "security-policy.json", policy_raw)
+        review = None
+        if request["review_required"]:
+            review_path = stage.parent.parent / "content-reviews" / (token + ".json")
+            if not os.path.lexists(review_path):
+                raise Refused("Content semantics changed; review this exact content transition before installation")
+            review = cls.validate_review(host_payload.strict_json(host_payload.read_regular(review_path, 65536, trusted=True)), binding, previous)
+        transition = {"schema": 1, "kind": cls.KIND, "generation": token, "binding": binding,
+                      "descriptor_sha256": component["descriptor_sha256"], "version": component["version"],
+                      "engine": observed["engine"], "previous_identity": previous_identity,
+                      "before_semantic_sha256": before_semantic, "after_semantic_sha256": after_semantic, "review": review}
+        files.update({"content.json": cls.encoded(archive["descriptor"]), "original-policy.json": previous_raw,
+                      "security-policy.json": policy_raw, "transition.json": cls.encoded(transition)})
+        if any(name in archive["files"] for name in {"original-policy.json", "security-policy.json", "transition.json"}):
+            raise Refused("Signed content collides with fixed transaction evidence")
+        for name, raw in files.items():
+            cls._retain(work / name, raw)
+        expected = {"schema": 1, "kind": cls.KIND, "generation": token, "root": str(generation),
+                    "transition_sha256": cls.digest(files["transition.json"]),
+                    "before_policy_sha256": cls.digest(previous_raw), "after_policy_sha256": cls.digest(policy_raw),
+                    "files": {name: {"bytes": len(raw), "sha256": cls.digest(raw)} for name, raw in sorted(files.items())}}
+        if {item.name for item in work.iterdir()} != set(files):
+            raise Refused("Unrelated files appeared in content preparation")
+        cls._retain(stage / "content-plan.json", cls.encoded(expected))
+        return expected
+
+    @classmethod
+    def review_template(cls, stage):
+        from . import host_dispatch, host_payload
+        transaction, _ = host_dispatch.transaction_binding(Path(stage))
+        if transaction.get("activation_started") is not False or transaction["state"] != "preflight_failed":
+            raise Refused("Content review requires a settled failed preflight before activation")
+        host_dispatch.HookJournal(stage, transaction).assert_settled()
+        request = host_payload.strict_json(host_payload.read_regular(Path(stage) / "content-review-request.json", 65536, trusted=True))
+        if request.get("review_required") is not True:
+            raise Refused("This content transition does not require new semantic authority")
+        return {"schema": 1, "binding": request["binding"], "approved": False, "control_semantics_reviewed": False,
+                "reviewer": "", "rationale": "", "reviewed_at": _now().isoformat(), "expires_at": ""}
+
+    @classmethod
+    def approve(cls, stage, review_path, confirmation, configuration=CONFIGURATION):
+        from . import host_payload
+        require_linux_root()
+        stage = Path(stage)
+        template = cls.review_template(stage)
+        raw = host_payload.read_regular(stage / "content-work/security-policy.json", 1024**2, trusted=True)
+        if cls.digest(raw) != confirmation or template["binding"]["candidate_policy_sha256"] != confirmation:
+            raise Refused("Candidate policy changed since explicit review")
+        previous_raw = host_payload.read_regular(Path(configuration) / "security-policy.json", 1024**2, trusted=True)
+        if cls.digest(previous_raw) != template["binding"]["previous_policy_sha256"]:
+            raise Refused("Installed policy changed before content approval")
+        value = host_payload.strict_json(host_payload.read_regular(Path(review_path), 65536, trusted=True))
+        cls.validate_review(value, template["binding"], host_payload.strict_json(previous_raw))
+        token = json.loads(raw)["content_update"]["generation"]
+        root = stage.parent.parent / "content-reviews"
+        if not root.exists():
+            root.mkdir(mode=0o700)
+        cls._retain(root / (token + ".json"), cls.encoded(value))
+        return {"ok": True, "generation": token, "candidate_policy_sha256": confirmation,
+                "findings_approved": False, "installed": False}
+
+    @classmethod
+    def publish(cls, stage, plan):
+        """Publish only inactive immutable files; the active policy is untouched.
+
+        The protected owner record precedes any covered-path creation. A partial
+        publication can continue only with the identical owner/inventory, and
+        an unrelated existing directory is never adopted even if bytes match.
+        """
+        from . import host_payload
+        stage = Path(stage)
+        root = cls.ROOT / plan["generation"]
+        if plan["root"] != str(root):
+            raise Refused("Content generation path changed")
+        owners = stage.parent.parent / "content-owners"
+        if not owners.exists():
+            owners.mkdir(mode=0o700)
+        owner = owners / (plan["generation"] + ".json")
+        owner_body = cls.encoded({"schema": 1, "plan_sha256": cls.digest(cls.encoded(plan)), "plan": plan})
+        existed = os.path.lexists(owner)
+        if not existed and os.path.lexists(root):
+            raise Refused("Existing content generation has no protected publication owner")
+        cls._retain(owner, owner_body)
+        if not cls.ROOT.exists():
+            host_payload._trusted_tree(cls.ROOT.parent)
+            cls.ROOT.mkdir(mode=0o555)
+            cls.ROOT.chmod(0o555)
+        host_payload._trusted_tree(cls.ROOT)
+        parent_info = cls.ROOT.lstat()
+        if parent_info.st_uid != 0 or parent_info.st_gid != 0 or stat.S_IMODE(parent_info.st_mode) != 0o555:
+            raise Refused("Content generation parent is not immutable root-owned storage")
+        if not root.exists():
+            root.mkdir(mode=0o555)
+            root.chmod(0o555)
+        host_payload._trusted_tree(root)
+        info = root.lstat()
+        if info.st_uid != 0 or info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o555:
+            raise Refused("Content generation directory metadata changed")
+        if {path.name for path in root.iterdir()} - set(plan["files"]):
+            raise Refused("Content generation contains foreign files")
+        for name, expected in plan["files"].items():
+            raw = host_payload.read_regular(stage / "content-work" / name, cls.MAX_FILE, trusted=True)
+            if {"bytes": len(raw), "sha256": cls.digest(raw)} != expected:
+                raise Refused("Prepared content differs from its immutable plan")
+            cls._retain(root / name, raw, 0o444)
+        return cls.validate_plan(stage, plan)
+
+    @classmethod
+    def validate_plan(cls, stage, plan, release=None):
+        from . import host_payload
+        fields = {"schema", "kind", "generation", "root", "transition_sha256", "before_policy_sha256", "after_policy_sha256", "files"}
+        if (not isinstance(plan, dict) or set(plan) != fields or type(plan["schema"]) is not int or plan["schema"] != 1
+                or plan["kind"] != cls.KIND or not isinstance(plan["generation"], str) or not SHA256.fullmatch(plan["generation"])
+                or plan["root"] != str(cls.ROOT / plan["generation"])):
+            raise Refused("Malformed fixed content plan")
+        root = Path(plan["root"])
+        owner = host_payload.strict_json(host_payload.read_regular(Path(stage).parent.parent / "content-owners" / (plan["generation"] + ".json"), 1024**2, trusted=True))
+        if owner != {"schema": 1, "plan_sha256": cls.digest(cls.encoded(plan)), "plan": plan}:
+            raise Refused("Content publication ownership changed")
+        def read(name):
+            if not isinstance(name, str) or not cls.NAME.fullmatch(name):
+                raise Refused("Unsafe immutable content filename")
+            return host_payload.read_regular(root / name, cls.MAX_FILE, trusted=True)
+        if not isinstance(plan["files"], dict) or not 5 <= len(plan["files"]) <= cls.MAX_FILES + 8 or {p.name for p in root.iterdir()} != set(plan["files"]):
+            raise Refused("Content generation inventory changed")
+        for name, info in plan["files"].items():
+            raw = read(name)
+            metadata = (root / name).lstat()
+            if info != {"bytes": len(raw), "sha256": cls.digest(raw)} or stat.S_IMODE(metadata.st_mode) != 0o444 or metadata.st_uid != 0 or metadata.st_gid != 0:
+                raise Refused("Immutable content bytes or security metadata changed")
+        for path in (cls.ROOT, root):
+            metadata = path.lstat()
+            if stat.S_IMODE(metadata.st_mode) != 0o555 or metadata.st_uid != 0 or metadata.st_gid != 0:
+                raise Refused("Immutable content directory changed")
+        descriptor_raw = read("content.json")
+        descriptor = cls.descriptor(host_payload.strict_json(descriptor_raw))
+        transition_raw, previous_raw, policy_raw = read("transition.json"), read("original-policy.json"), read("security-policy.json")
+        transition, previous, policy = map(host_payload.strict_json, (transition_raw, previous_raw, policy_raw))
+        if (not isinstance(transition, dict) or set(transition) != {"schema", "kind", "generation", "binding", "descriptor_sha256", "version", "engine", "previous_identity", "before_semantic_sha256", "after_semantic_sha256", "review"}
+                or type(transition.get("schema")) is not int or transition["schema"] != 1 or transition["kind"] != cls.KIND
+                or cls.encoded(transition) != transition_raw or cls.encoded(descriptor) != descriptor_raw
+                or cls.digest(transition_raw) != plan["transition_sha256"] or cls.digest(previous_raw) != plan["before_policy_sha256"]
+                or cls.digest(policy_raw) != plan["after_policy_sha256"]
+                or transition.get("binding") != cls.review_binding(previous_raw, policy_raw, transition.get("binding", {}).get("archive_sha256"))
+                or transition.get("descriptor_sha256") != cls.digest(descriptor_raw) or transition.get("version") != descriptor["version"]
+                or transition.get("engine") != descriptor["engine"] or transition.get("generation") != plan["generation"]):
+            raise Refused("Content transition identity changed")
+        archive_sha = transition["binding"]["archive_sha256"]
+        if not isinstance(archive_sha, str) or not SHA256.fullmatch(archive_sha) or plan["generation"] != cls.digest(cls.encoded({"archive": archive_sha, "previous_policy": cls.digest(previous_raw)})):
+            raise Refused("Content generation is not bound to its source and previous selection")
+        if release is not None:
+            component = cls.validate_component(release["components"]["baseline"])
+            artifacts = [item for item in release["artifacts"] if item["name"] == component["artifact"]]
+            if (len(artifacts) != 1 or artifacts[0]["sha256"] != archive_sha
+                    or component["descriptor_sha256"] != cls.digest(descriptor_raw) or component["version"] != descriptor["version"]):
+                raise Refused("Content plan differs from the signed release")
+        source_files = {name: read(name) for name in descriptor["files"]}
+        if any({"bytes": len(body), "sha256": cls.digest(body)} != descriptor["files"][name] for name, body in source_files.items()):
+            raise Refused("Signed content source changed")
+        rebuilt, derived = cls.derive({"descriptor": descriptor, "files": source_files}, previous, root)
+        rebuilt["content_update"] = {"schema": 1, "generation": plan["generation"], "archive_sha256": archive_sha,
+                                     "previous_policy_sha256": cls.digest(previous_raw)}
+        if cls.encoded(rebuilt) != policy_raw or any(read(name) != raw for name, raw in derived.items()):
+            raise Refused("Candidate policy no longer preserves its exact site authority")
+        before = cls.semantic_identity(previous, lambda path: host_payload.read_regular(Path(path), cls.MAX_FILE, trusted=True))
+        after = cls.semantic_identity(policy, lambda path: read(Path(path).name))
+        if transition.get("before_semantic_sha256") != before or transition.get("after_semantic_sha256") != after:
+            raise Refused("Content semantic identity changed")
+        if before != after:
+            # Plan authority is historical: expiry must not prevent restoring
+            # the exact old bytes. Selecting/assessing the candidate checks live
+            # expiry separately; no approval is renewed here.
+            review = transition.get("review")
+            cls.validate_review(review, transition["binding"], previous, now=_date(review.get("reviewed_at")) if isinstance(review, dict) else None)
+        elif transition.get("review") is not None:
+            raise Refused("Unexpected equivalent-content approval")
+        additions = [{"path": str(path), "kind": "directory", "mode": 0o555, "uid": 0, "gid": 0} for path in (cls.ROOT, root)]
+        additions.extend({"path": str(root / name), "kind": "file", "mode": 0o444, "uid": 0, "gid": 0, **info} for name, info in sorted(plan["files"].items()))
+        return {"plan": plan, "additions": additions, "policy": policy, "before": previous_raw, "after": policy_raw,
+                "transition": transition}
+
+    @classmethod
+    def selected_authority(cls, policy):
+        from . import host_dispatch, host_payload
+        selection = policy.get("content_update")
+        if (not isinstance(selection, dict) or set(selection) != {"schema", "generation", "archive_sha256", "previous_policy_sha256"}
+                or type(selection["schema"]) is not int or selection["schema"] != 1
+                or any(not isinstance(selection[key], str) or not SHA256.fullmatch(selection[key]) for key in ("generation", "archive_sha256", "previous_policy_sha256"))):
+            raise Refused("Selected content transition authority is malformed")
+        owner = host_payload.strict_json(host_payload.read_regular(host_dispatch.STATE / "content-owners" / (selection["generation"] + ".json"), 1024**2, trusted=True))
+        result = cls.validate_plan(host_dispatch.STATE / "releases" / "content-authority", owner.get("plan"))
+        if result["policy"] != policy:
+            raise Refused("Selected policy differs from its reviewed immutable transition")
+        cls.current_review(result)
+        return result
+
+    @classmethod
+    def current_review(cls, result):
+        transition = result["transition"]
+        if transition["review"] is not None:
+            cls.validate_review(transition["review"], transition["binding"], json.loads(result["before"]))
+
+    @classmethod
+    def assessment_evidence(cls, directory, kind, profile, *, source=None):
+        """Conservative complete ARF equality, not a rule/status waiver.
+
+        Keep every instance, collected item, object, variable, definition result,
+        source and relationship. Only generated TestResult IDs and the explicitly
+        named scan/collection times are volatile. Other format differences fail
+        closed; missing OVAL system characteristics never establishes equivalence.
+        """
+        directory = Path(directory)
+        arf = cls.xml(trusted_file(directory / (kind + ".arf.xml")).read_bytes())
+        if arf.tag != "{http://scap.nist.gov/schema/asset-reporting-format/1.1}asset-report-collection":
+            raise Refused("Full ARF assessment evidence is required")
+        xccdf = "{http://checklists.nist.gov/xccdf/1.2}"
+        oval = "{http://oval.mitre.org/XMLSchema/oval-results-5}"
+        system = "{http://oval.mitre.org/XMLSchema/oval-system-characteristics-5}"
+        common = "{http://oval.mitre.org/XMLSchema/oval-common-5}"
+        tests = list(arf.iter(xccdf + "TestResult"))
+        actual = cls.xml(trusted_file(directory / (kind + ".xml")).read_bytes())
+        standalone = [node for node in actual.iter() if _local(node) == "TestResult"]
+        if (len(tests) != 1 or len(standalone) != 1
+                or [node.get("idref") for node in tests[0] if _local(node) == "profile"] != [profile]
+                or not list(arf.iter(oval + "oval_results")) or not list(arf.iter(system + "collected_objects"))):
+            raise Refused("ARF lacks exact XCCDF result or collected OVAL facts")
+        for result in arf.iter(oval + "oval_results"):
+            systems = result.findall(oval + "results/" + oval + "system")
+            if len(systems) != 1:
+                raise Refused("ARF OVAL host result is missing or ambiguous")
+            current = systems[0]
+            characteristics = current.findall(system + "oval_system_characteristics")
+            if len(characteristics) != 1:
+                raise Refused("ARF OVAL collected host facts are missing")
+            facts = characteristics[0]
+            objects, data = facts.findall(system + "collected_objects"), facts.findall(system + "system_data")
+            if len(objects) != 1 or len(data) > 1:
+                raise Refused("ARF OVAL fact collection is ambiguous")
+            items = list(data[0]) if data else []
+            identifiers = [node.get("id") for node in items]
+            object_ids = [node.get("id") for node in objects[0]]
+            if (any(not value for value in identifiers + object_ids) or len(set(identifiers)) != len(identifiers)
+                    or len(set(object_ids)) != len(object_ids)):
+                raise Refused("ARF OVAL item or object identities are missing or duplicated")
+            refs = [node.get("item_ref") for node in objects[0].iter(system + "reference")]
+            tested = [node.get("item_id") for node in current.iter(oval + "tested_item")]
+            if any(ref not in identifiers for ref in refs + tested) or set(identifiers) - set(refs):
+                raise Refused("ARF OVAL item evidence is missing or foreign to its host")
+        # Namespace-qualified XCCDF results must agree exactly before reducing
+        # volatile metadata. This also binds the human-readable summary's input.
+        def node_value(node, parent=None, volatile=True):
+            attributes = dict(node.attrib)
+            if volatile and node.tag == xccdf + "TestResult":
+                if not re.fullmatch(r"xccdf_org.open-scap_testresult_[A-Za-z0-9_.:-]+", attributes.get("id", "")):
+                    raise Refused("Unknown generated assessment identity")
+                attributes.pop("id")
+                for key in ("start-time", "end-time"):
+                    _date(attributes.pop(key, None))
+            elif volatile and node.tag == xccdf + "rule-result" and "time" in attributes:
+                _date(attributes.pop("time"))
+            text = node.text or ""
+            if volatile and node.tag == common + "timestamp" and parent in (oval + "generator", system + "generator"):
+                try:
+                    datetime.fromisoformat(text.replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    raise Refused("Invalid OVAL collection timestamp") from None
+                text = "<assessment-time>"
+            elif list(node) and not text.strip():
+                text = ""
+            tail = node.tail or ""
+            if not tail.strip(): tail = ""
+            return [node.tag, sorted(attributes.items()), text, tail,
+                    [node_value(child, node.tag, volatile) for child in node]]
+        arf_ns = "{http://scap.nist.gov/schema/asset-reporting-format/1.1}"
+        requests = list(arf.iter(arf_ns + "report-request"))
+        if (len(requests) != 1 or len(requests[0]) != 1 or requests[0][0].tag != arf_ns + "content"
+                or len(requests[0][0]) != 1):
+            raise Refused("ARF source request is missing or ambiguous")
+        expected_source = cls.xml(trusted_file(Path(source) if source is not None else directory / (kind + "-content.xml")).read_bytes())
+        if node_value(requests[0][0][0], volatile=False) != node_value(expected_source, volatile=False):
+            raise Refused("ARF embedded source differs from the exact retained assessment content")
+        # OpenSCAP embeds the same result but rewrites benchmark/check hrefs to
+        # internal ARF components/reports and adds the bound target asset link.
+        # Prove those references before comparing every remaining result field.
+        arf_ns = "{http://scap.nist.gov/schema/asset-reporting-format/1.1}"
+        def unique(tag):
+            values = list(arf.iter(tag))
+            ids = [node.get("id") for node in values]
+            if any(not isinstance(key, str) or not key for key in ids) or len(set(ids)) != len(ids):
+                raise Refused("Duplicate or missing ARF graph identity")
+            return dict(zip(ids, values))
+        reports = unique(arf_ns + "report")
+        assets = unique(arf_ns + "asset")
+        components = unique("{http://scap.nist.gov/schema/scap/source/1.2}component")
+        def reference(node, values):
+            href = node.get("href", "")
+            if not href.startswith("#") or href.count("#") != 1 or href[1:] not in values:
+                raise Refused("ARF result reference is not an exact internal fragment")
+            return values[href[1:]]
+        left, right = copy.deepcopy(tests[0]), copy.deepcopy(standalone[0])
+        if len(list(left.iter(xccdf + "benchmark"))) != 1 or len(list(left.iter(xccdf + "target-id-ref"))) != 1:
+            raise Refused("ARF assessment source or asset link is ambiguous")
+        for node in left.iter():
+            if node.tag == xccdf + "benchmark":
+                target = reference(node, components)
+                if len(target) != 1 or target[0].tag != xccdf + "Benchmark" or target[0].get("id") != node.get("id"):
+                    raise Refused("ARF benchmark source reference is unresolved")
+            if node.tag == xccdf + "check-content-ref":
+                target = reference(node, reports)
+                if (len(target) != 1 or target[0].tag != arf_ns + "content" or len(target[0]) != 1
+                        or target[0][0].tag != oval + "oval_results"
+                        or sum(child.get("id") == node.get("name") for child in target.iter("{http://oval.mitre.org/XMLSchema/oval-definitions-5}definition")) != 1):
+                    raise Refused("ARF check result reference is unresolved")
+        for node in list(left):
+            if node.tag == xccdf + "target-id-ref":
+                if (set(node.attrib) != {"name", "system", "href"} or node.get("name") not in assets
+                        or node.get("system") != "http://scap.nist.gov/schema/asset-identification/1.1" or node.get("href") != ""):
+                    raise Refused("ARF target asset reference is unresolved")
+                left.remove(node)
+        for root in (left, right):
+            for node in root.iter():
+                if node.tag in (xccdf + "benchmark", xccdf + "check-content-ref"):
+                    node.attrib.pop("href", None)
+        if node_value(left, volatile=False) != node_value(right, volatile=False):
+            raise Refused("ARF and standalone assessment results differ")
+        return cls.digest(cls.encoded(node_value(arf)))
+
+    @staticmethod
+    def assessment_host(runner):
+        value = _host(runner)
+        packages = runner(["rpm", "-qa", "--qf", "%{NEVRA}\n"])
+        if not packages or len(packages) > 1024**2:
+            raise Refused("Content assessment package inventory is unavailable")
+        value.update(boot_id=str(uuid.UUID(Path("/proc/sys/kernel/random/boot_id").read_text().strip())),
+                     packages_sha256=hashlib.sha256("\n".join(sorted(packages.splitlines())).encode()).hexdigest())
+        return value
+
+    @classmethod
+    def _assessment_owner(cls, stage, pointer, role="candidate"):
+        from . import host_payload
+        if role not in {"candidate", "rollback"}:
+            raise Refused("Unknown content assessment direction")
+        root = Path(stage).parent.parent
+        fields = {"schema", "directory", "policy_sha256", "host"}
+        if (not isinstance(pointer, dict) or set(pointer) != fields or type(pointer["schema"]) is not int or pointer["schema"] != 1):
+            raise Refused("Malformed content assessment owner")
+        directory = Path(pointer["directory"])
+        if (directory.name != "content-" + role + "-assessment" or directory.parent.parent != root / "releases"
+                or directory.resolve() != directory or not directory.is_absolute()):
+            raise Refused("Candidate assessment belongs to another protected release")
+        host_payload._trusted_tree(directory)
+        token = cls.digest(cls.encoded({"policy_sha256": pointer["policy_sha256"], "host": pointer["host"], "role": role}))
+        index = root / "content-assessments" / (token + ".json")
+        if host_payload.read_regular(index, 65536, trusted=True) != cls.encoded(pointer):
+            raise Refused("Candidate assessment owner changed")
+        return directory
+
+    @classmethod
+    def candidate_assessment(cls, stage, policy_raw, runner=run, *, host=None, role="candidate"):
+        """Retain an operation-owned assessment for explicit preflight review."""
+        from . import host_payload
+        stage = Path(stage)
+        if role not in {"candidate", "rollback"}:
+            raise Refused("Unknown content assessment direction")
+        policy = host_payload.strict_json(policy_raw)
+        host = host or cls.assessment_host
+        identity = host(runner)
+        token = cls.digest(cls.encoded({"policy_sha256": cls.digest(policy_raw), "host": identity, "role": role}))
+        root = stage.parent.parent / "content-assessments"
+        if not root.exists(): root.mkdir(mode=0o700)
+        directory = stage / ("content-" + role + "-assessment")
+        if not directory.exists(): directory.mkdir(mode=0o700)
+        cls._retain(directory / "security-policy.json", policy_raw)
+        index = root / (token + ".json")
+        pointer = {"schema": 1, "directory": str(directory), "policy_sha256": cls.digest(policy_raw), "host": identity}
+        if os.path.lexists(index):
+            pointer = host_payload.strict_json(host_payload.read_regular(index, 65536, trusted=True))
+        else:
+            cls._retain(index, cls.encoded(pointer))
+        cls._assessment_owner(stage, pointer, role)
+        cls._retain(stage / ("content-" + role + "-assessment.json"), cls.encoded(pointer))
+        manager = Baseline(directory, runner=runner, host=host, full_evidence=True)
+        if not os.path.lexists(manager.attempt_path):
+            manager.scan(policy["installation_id"], policy["baseline"])
+        assessment, findings, assessed = manager._validated_assessment(policy["installation_id"], policy["baseline"])
+        if not assessed:
+            raise Refused("Candidate content produced unusable assessment results")
+        try:
+            continuation = cls.finding_continuation(stage, manager, runner, host=host, role=role)
+        except (Refused, OSError, ValueError, KeyError, TypeError):
+            raise Refused("Review the retained candidate content assessment before activation: " + pointer["directory"]) from None
+        return {**pointer, "assessment_sha256": _sha(manager.assessment_path), "continuation": continuation}
+
+    @classmethod
+    def finding_continuation(cls, stage, current, runner=run, *, host=None, role="candidate", current_locked=False):
+        from . import host_payload
+        pointer = host_payload.strict_json(host_payload.read_regular(Path(stage) / ("content-" + role + "-assessment.json"), 65536, trusted=True))
+        directory = cls._assessment_owner(stage, pointer, role)
+        with ExitStack() as locks:
+            if not current_locked:
+                locks.enter_context(locked(current.configuration / "baseline.lock"))
+            if directory != current.configuration:
+                locks.enter_context(locked(directory / "baseline.lock"))
+            return cls._finding_continuation_locked(stage, current, runner, host=host, role=role)
+
+    @classmethod
+    def _finding_continuation_locked(cls, stage, current, runner=run, *, host=None, role="candidate"):
+        """Carry only exact observed facts; original review and expiry stay intact."""
+        from . import host_payload
+        stage = Path(stage)
+        pointer = host_payload.strict_json(host_payload.read_regular(stage / ("content-" + role + "-assessment.json"), 65536, trusted=True))
+        directory = cls._assessment_owner(stage, pointer, role)
+        host = host or cls.assessment_host
+        manager = Baseline(directory, runner=runner, host=host, full_evidence=True)
+        policy = host_payload.strict_json(host_payload.read_regular(manager.policy_path, 1024**2, trusted=True))
+        if (pointer["policy_sha256"] != _sha(manager.policy_path) or pointer["host"] != host(runner)
+                or _sha(current.policy_path) != pointer["policy_sha256"]):
+            raise Refused("Candidate findings belong to another policy or host")
+        prior, previous_findings, assessed = manager._validated_assessment(policy["installation_id"], policy["baseline"])
+        assessment, findings, current_ok = current._validated_assessment(policy["installation_id"], policy["baseline"])
+        if not assessed or not current_ok or previous_findings != findings or prior["assessments"] != assessment["assessments"]:
+            raise Refused("Fresh candidate outcomes changed; earlier review cannot authorize them")
+        before = directory / "baseline-assessments" / prior["artifact_directory"]
+        after = current.configuration / "baseline-assessments" / assessment["artifact_directory"]
+        evidence = {}
+        for item in policy["assessments"]:
+            old = cls.assessment_evidence(before, item["kind"], item["profile_id"])
+            new = cls.assessment_evidence(after, item["kind"], item["profile_id"])
+            if old != new:
+                raise Refused("Collected assessment facts or instance scope changed despite unchanged result status")
+            evidence[item["kind"]] = new
+        automated = all(item["automated_assessment_passed"] for item in assessment["assessments"])
+        review = None
+        if not automated:
+            review = _json(manager.review_path)
+            manager._validate_review(review, policy["installation_id"], policy["baseline"], findings)
+        return {"schema": 1, "kind": "exact-content-findings-continuation-v1", "configuration": str(directory),
+                "review_sha256": None if automated else _sha(manager.review_path),
+                "reviewed_assessment_sha256": _sha(manager.assessment_path), "current_assessment_sha256": _sha(current.assessment_path),
+                "policy_sha256": pointer["policy_sha256"], "evidence": evidence,
+                "expires_at": None if automated else review["expires_at"], "manual_attestation_revalidated": any(f["manual_only"] for f in findings)}
 
 
 def _now():
@@ -364,6 +1287,8 @@ def validate_policy(policy, runner=run, now=None):
     now = now or _now()
     if not isinstance(policy, dict) or policy.get("schema") != 1 or policy.get("baseline") not in security.BASELINES:
         raise Refused("A schema-1 cis-level2, stig, or unified policy is required")
+    if "content_update" in policy:
+        ContentUpdate.selected_authority(policy)
     assessments = policy.get("assessments")
     required = {"cis", "stig"} if policy["baseline"] == "unified" else {"cis" if policy["baseline"] == "cis-level2" else "stig"}
     if not isinstance(assessments, list) or len(assessments) != len(required) or {p.get("kind") for p in assessments if isinstance(p, dict)} != required:
@@ -658,7 +1583,8 @@ def initial_hardening(configuration, installation_id, baseline):
 
 
 class Baseline:
-    def __init__(self, configuration=CONFIGURATION, *, runner=run, scanner=security.scan, host=_host, clock=_now):
+    def __init__(self, configuration=CONFIGURATION, *, runner=run, scanner=security.scan, host=_host, clock=_now, full_evidence=False):
+        self.full_evidence = full_evidence
         self.configuration = Path(configuration)
         self.runner, self.scanner, self.host, self.clock = runner, scanner, host, clock
         self.policy_path = self.configuration / "security-policy.json"
@@ -806,7 +1732,7 @@ class Baseline:
             policy_hash = _sha(self.policy_path)
             output = self.configuration / "baseline-assessments" / uuid.uuid4().hex
             _directory(output.parent, create=True)
-            summary = self.scanner(self.policy_path, output, self.runner)
+            summary = self.scanner(self.policy_path, output, self.runner, **({"full_evidence": True} if self.full_evidence else {}))
             artifacts = {}
             for profile in policy["assessments"]:
                 kind = profile["kind"]
@@ -825,6 +1751,9 @@ class Baseline:
                         destination.chmod(0o600)
                         source = destination
                     artifacts[name] = _sha(source)
+                if self.full_evidence:
+                    ContentUpdate.assessment_evidence(output, kind, profile["profile_id"])
+                    artifacts[kind + ".arf.xml"] = _sha(output / (kind + ".arf.xml"))
                 if artifacts[kind + "-content.xml"] != profile["sha256"]:
                     raise Refused("SCAP content changed while retaining its provenance")
                 if profile.get("tailoring"):
@@ -871,6 +1800,8 @@ class Baseline:
         expected = {"policy.json"}
         for profile in policy["assessments"]:
             expected.update(profile["kind"] + suffix for suffix in (".xml", ".html", "-content.xml"))
+            if value.get("evidence_schema") == "arf-v1":
+                expected.add(profile["kind"] + ".arf.xml")
             if profile.get("tailoring"):
                 expected.add(profile["kind"] + "-tailoring.xml")
         if policy.get("unified_mapping"):
@@ -887,6 +1818,10 @@ class Baseline:
             kind = profile["kind"]
             rows = [item for item in value["assessments"] if item.get("kind") == kind]
             rules = rule_results(output / (kind + ".xml"), profile["profile_id"])
+            if self.full_evidence and value.get("evidence_schema") != "arf-v1":
+                raise Refused("Full assessment evidence is required for content continuation")
+            if value.get("evidence_schema") == "arf-v1":
+                ContentUpdate.assessment_evidence(output, kind, profile["profile_id"])
             manual = _manual_rules(output / (kind + "-content.xml"))
             if len(rows) != 1 or rows[0].get("rules") != rules or rows[0].get("profile") != profile["profile_id"] or _sha(output / (kind + "-content.xml")) != profile["sha256"]:
                 raise Refused("Rule evidence differs from the recorded assessment")
@@ -1007,15 +1942,33 @@ def main(argv=None):
     item = commands.add_parser("review")
     item.add_argument("--review-file", type=Path, required=True)
     item.add_argument("--confirm-assessment-sha256", required=True)
+    item = commands.add_parser("content-review-template")
+    item.add_argument("--stage", type=Path, required=True)
+    item = commands.add_parser("content-review")
+    item.add_argument("--stage", type=Path, required=True)
+    item.add_argument("--review-file", type=Path, required=True)
+    item.add_argument("--confirm-candidate-policy-sha256", required=True)
     args = parser.parse_args(argv)
     try:
         require_linux_root()
         if args.command == "inventory":
             result = inventory(args.content_directory)
+        elif args.command == "content-review-template":
+            result = ContentUpdate.review_template(args.stage)
+        elif args.command == "content-review":
+            result = ContentUpdate.approve(args.stage, args.review_file, args.confirm_candidate_policy_sha256, args.configuration)
         else:
             setup = _json(args.setup)
             installation_id, baseline = setup["installation_id"], setup["baseline"]
-            manager = Baseline(args.configuration)
+            role = next((role for role in ("candidate", "rollback") if args.configuration.name == "content-" + role + "-assessment"), None)
+            if role:
+                stage = args.configuration.parent
+                pointer = _json(stage / ("content-" + role + "-assessment.json"))
+                if ContentUpdate._assessment_owner(stage, pointer, role) != args.configuration or args.command not in {"review-template", "review", "status"}:
+                    raise Refused("Retained content assessment permits only exact review or status")
+                manager = Baseline(args.configuration, host=ContentUpdate.assessment_host, full_evidence=True)
+            else:
+                manager = Baseline(args.configuration)
             if args.command == "select":
                 result = manager.select(args.policy, args.confirm_policy_sha256, installation_id, baseline)
             elif args.command == "scan":

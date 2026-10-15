@@ -1,8 +1,11 @@
 """Real OCI/hash and RSA tests; runtime service observations are isolated fixtures."""
 import hashlib
+from contextlib import ExitStack
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import shutil
 import subprocess
 import tempfile
@@ -10,10 +13,12 @@ import unittest
 from unittest.mock import Mock, patch
 
 from nebulalog_manager import update_enrollment as enrollment
+from nebulalog_manager import baseline, host_payload
 from nebulalog_manager.common import Refused, atomic_json, run
 from nebulalog_manager.image_bundle import verify_bundle
 from nebulalog_manager.updates import UpdateManager
 from test_image_bundle import fixture_bundle
+from test_baseline import CONTENT, CIS
 
 INSTALLATION = "458a08e3-ef3b-4cd1-83e5-b402a2c1e913"
 
@@ -33,7 +38,19 @@ class InstalledReleaseTests(unittest.TestCase):
         self.source_files = {"cmd/nebulalog/main.go": "a" * 64, **enrollment.application_schema.SCHEMAS["1"]}
         self.pins, self.bundle_manifest, self.images = fixture_bundle(self.share / "images", enrollment.application_source_digest(self.source_files))
         atomic_json(self.etc / "images.json", self.pins)
-        atomic_json(self.data / "configuration/bootstrap/setup.json", {"installation_id": INSTALLATION})
+        atomic_json(self.data / "configuration/bootstrap/setup.json", {"installation_id": INSTALLATION, "baseline": "cis-level2"})
+        self.content_path = self.share / "ssg-fixture.xml"
+        self.content_path.write_text(CONTENT)
+        self.content_path.chmod(0o600)
+        now = datetime.now(timezone.utc)
+        self.policy_path = self.data / "configuration/security-policy.json"
+        self.policy = {"schema": 1, "baseline": "cis-level2", "installation_id": INSTALLATION,
+            "selection_id": "a" * 32, "assessments": [{"kind": "cis", "platform": "rocky9", "reviewed": True,
+                "datastream": str(self.content_path), "sha256": digest(self.content_path), "profile_id": CIS,
+                "source_url": "https://example.invalid/fixture", "content_revision": "fixture-v1",
+                "content_review": {"approved": True, "reviewer": "Fixture reviewer", "platform_basis": "Fixture Rocky CPE",
+                    "benchmark_basis": "Fixture Level 2 profile", "license_basis": "Synthetic fixture only",
+                    "reviewed_at": (now - timedelta(days=1)).isoformat(), "expires_at": (now + timedelta(days=1)).isoformat()}}]}
         atomic_json(self.data / "configuration/lifecycle.json", {"schema_revision": "1"})
         atomic_json(self.share / "source-manifest.json", {"schema": 1, "files": self.source_files})
         self.descriptor = {"schema": 1, "product": "nebulalog", "sequence": 0, "schema_revision": "1", "source_commit": "b" * 40,
@@ -61,12 +78,21 @@ class InstalledReleaseTests(unittest.TestCase):
         self.addCleanup(self.running_host_probe.stop)
         for mocker in (patch.object(enrollment, "require_linux_root"), patch.object(enrollment, "_tree"),
                        patch.object(enrollment, "ROOT_UID", os.getuid()),
+                       patch.object(host_payload, "_OWNER_UID", os.getuid()),
+                       patch.object(baseline, "_directory", side_effect=lambda path: Path(path)),
+                       patch.object(baseline, "trusted_file", side_effect=lambda path: Path(path)),
                        patch.object(enrollment, "verify_bundle", side_effect=lambda path, pins, **_: verify_bundle(path, pins))):
             mocker.start()
             self.addCleanup(mocker.stop)
 
     def runner(self, argv, **kwargs):
         self.calls.append(argv)
+        if argv[:2] == ["oscap", "info"]:
+            return "Profiles:\nID: " + CIS
+        if argv == ["oscap", "--version"]:
+            return "OpenSCAP command line tool (oscap) 1.3.fixture"
+        if argv == ["rpm", "-q", "--qf", "%{NEVRA}", "openscap-scanner"]:
+            return "openscap-scanner-1.3.14-1.el9.x86_64"
         if argv[0] == "openssl":
             return run(argv, **kwargs)
         if argv[:3] == ["podman", "image", "exists"]:
@@ -95,7 +121,103 @@ class InstalledReleaseTests(unittest.TestCase):
         self.assertEqual(self.manager.installed(), result)
         self.assertEqual((self.manager.state / "current.json").read_bytes(), before)
         self.assertFalse((self.etc / "release-public.pem").exists())
+        self.assertNotIn("baseline", receipt["current"]["components"])
+        self.assertFalse(self.policy_path.exists())
         self.assertTrue(all(call[0] == "podman" for call in self.calls))
+
+    def test_content_from_another_installation_or_missing_policy_is_not_adopted(self):
+        for changes in ({"installation_id": "11111111-2222-4333-8444-555555555555"}, {"baseline": "stig"}):
+            atomic_json(self.policy_path, {**self.policy, **changes})
+            with self.subTest(changes=changes), self.assertRaisesRegex(Refused, "installation and baseline"):
+                self.manager._content(INSTALLATION)
+            self.assertFalse((self.manager.state / "current.json").exists())
+        self.policy_path.unlink()
+        with self.assertRaises(Refused): self.manager._content(INSTALLATION)
+        self.assertFalse((self.manager.state / "initial-enrollment.json").exists())
+
+    def test_content_change_during_readonly_measurement_is_refused(self):
+        atomic_json(self.policy_path, self.policy)
+        runner = self.manager.runner
+        def changed(argv, **kwargs):
+            result = runner(argv, **kwargs)
+            if argv[:2] == ["oscap", "info"]:
+                self.content_path.write_text(CONTENT + "\n<!-- changed during observation -->")
+            return result
+        self.manager.runner = changed
+        with self.assertRaises(Refused): self.manager._content(INSTALLATION)
+        self.assertFalse((self.manager.state / "current.json").exists())
+
+    def test_readonly_content_measurement_binds_scanner_without_writing_enrollment(self):
+        atomic_json(self.policy_path, self.policy)
+        runner, versions = self.manager.runner, iter(("1.3.fixture", "1.4.changed"))
+        def changed(argv, **kwargs):
+            result = runner(argv, **kwargs)
+            if argv == ["oscap", "--version"]:
+                return "OpenSCAP command line tool (oscap) " + next(versions)
+            return result
+        self.manager.runner = changed
+        before = self.manager._content(INSTALLATION)
+        after = self.manager._content(INSTALLATION)
+        self.assertEqual(before["policy_sha256"], digest(self.policy_path))
+        self.assertNotEqual(before["engine"], after["engine"])
+        self.assertNotEqual(before["generation"], after["generation"])
+        self.assertFalse((self.manager.state / "initial-pending.json").exists())
+
+    def test_policy_change_after_completed_initial_enrollment_is_not_reenrolled(self):
+        self.manager.installed()
+        before = (self.manager.state / "initial-enrollment.json").read_bytes()
+        atomic_json(self.policy_path, self.policy)
+        self.assertNotIn("baseline", self.manager.installed()["current"]["components"])
+        measured = self.manager._content(INSTALLATION)
+        self.assertEqual(measured["policy_sha256"], digest(self.policy_path))
+        self.assertEqual((self.manager.state / "initial-enrollment.json").read_bytes(), before)
+
+    def test_runtime_prepare_precedes_console_hardening_without_fabricating_initial_content(self):
+        from nebulalog_manager import bootstrap, firstboot
+        from nebulalog_manager.firstboot import Locations, RUNTIME_CHECKS
+        paths = Locations(self.etc, self.data, self.root / "run")
+        paths.bootstrap.mkdir()
+        setup = {"installation_id": INSTALLATION, "hostname": "fixture.invalid", "baseline": "cis-level2"}
+        atomic_json(self.data / "configuration/bootstrap/setup.json", setup)
+        stages = []
+        def runtime_runner(argv, **kwargs):
+            self.assertEqual(argv, [str(bootstrap.ENROLL_RELEASE)])
+            self.assertFalse(self.policy_path.exists())
+            stages.append("installed-release")
+            return json.dumps(self.manager.installed())
+        runtime = bootstrap.Bootstrap(paths, runner=runtime_runner, firstboot=self.firstboot)
+        runtime.setup, runtime.pins = setup, self.pins
+        runtime.state = {"installation_id": INSTALLATION, "completed": []}
+        evidence = {"checks": {name: True for name in RUNTIME_CHECKS}, "https_url": "https://fixture.invalid"}
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(runtime, "_load"))
+            stack.enter_context(patch.object(runtime, "_schema_revision", return_value="1"))
+            stack.enter_context(patch.object(runtime, "_evidence", return_value=evidence))
+            stack.enter_context(patch.object(bootstrap, "INITIAL_RELEASE", self.share / "initial-release.json"))
+            stack.enter_context(patch.object(bootstrap, "trusted_file", side_effect=lambda path: Path(path)))
+            stack.enter_context(patch.object(bootstrap.os, "access", return_value=True))
+            stack.enter_context(patch.object(enrollment.UpdateEnrollment, "_factory_host", return_value=self.host))
+            for method in ("_directories", "_storage_maintenance", "_certificates", "_images", "_environment", "_realm", "_postgres", "_migrate", "_identity", "_lifecycle", "_edge"):
+                stack.enter_context(patch.object(runtime, method))
+            receipt = runtime.prepare(runtime.bootstrap / "setup.json", runtime.bootstrap / "secrets.json")
+        initial = (self.manager.state / "initial-enrollment.json").read_bytes()
+        self.assertNotIn("baseline", json.loads(initial)["current"]["components"])
+        self.assertFalse(self.policy_path.exists())
+        def hardening(manager, config):
+            # Only the native hardening boundary is inert; console ordering,
+            # actual runtime enrollment and immutable evidence remain real.
+            self.assertEqual(config, setup)
+            stages.append("HARDENING")
+            atomic_json(self.policy_path, self.policy)
+        with patch("nebulalog_manager.setup_integrity.pending_console"), \
+                patch.object(firstboot, "_answer", side_effect=["HARDENING", "LATER"]), \
+                patch.object(firstboot, "_hardening_console", side_effect=hardening):
+            result = firstboot._runtime_console(SimpleNamespace(paths=paths), setup, receipt)
+        self.assertEqual(stages, ["installed-release", "HARDENING"])
+        self.assertEqual(result["state"], "runtime-ready")
+        self.assertTrue(self.policy_path.exists())
+        self.assertEqual((self.manager.state / "initial-enrollment.json").read_bytes(), initial)
+        self.assertNotIn("baseline", json.loads((self.manager.state / "current.json").read_text())["components"])
 
     def test_pristine_installer_and_sealer_verify_same_real_bundle_source_contract(self):
         value = self.manager.verify_build_inputs()

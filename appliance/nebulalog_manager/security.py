@@ -93,7 +93,7 @@ def summarize_xccdf(path: Path) -> dict:
             "certification": "not asserted"}
 
 
-def scan(policy_path: Path, output: Path, runner=run) -> dict:
+def scan(policy_path: Path, output: Path, runner=run, *, full_evidence=False) -> dict:
     require_linux_root()
     trusted_file(policy_path)
     policy = json.loads(policy_path.read_text())
@@ -121,6 +121,8 @@ def scan(policy_path: Path, output: Path, runner=run) -> dict:
         html = output / (profile["kind"] + ".html")
         argv = ["oscap", "xccdf", "eval", "--profile", profile_id,
                 "--results", str(xml), "--report", str(html)]
+        if full_evidence:
+            argv += ["--results-arf", str(output / (profile["kind"] + ".arf.xml"))]
         if profile.get("tailoring"):
             from .baseline import validate_tailoring
             validate_tailoring(profile, runner=runner)
@@ -142,5 +144,7 @@ def scan(policy_path: Path, output: Path, runner=run) -> dict:
     report = {"observed_at": datetime.now(timezone.utc).isoformat(), "baseline": policy["baseline"],
               "host": status(runner), "assessments": reports,
               "exceptions": policy.get("exceptions", []), "certification": "not asserted"}
+    if full_evidence:
+        report["evidence_schema"] = "arf-v1"
     atomic_json(output / "summary.json", report)
     return report

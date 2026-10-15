@@ -121,7 +121,7 @@ def _metadata(path):
             "selinux_sha256": digest({key: value for key, value in values.items() if key == "security.selinux"})}
 
 
-def _measure(manager, item, *, preserved=False):
+def _measure(manager, item, *, preserved=False, maximum=host_payload.MAX_FILE):
     path = Path(item["path"])
     customer = preserved and path.is_relative_to(CONFIGURATION)
     if customer:
@@ -150,7 +150,7 @@ def _measure(manager, item, *, preserved=False):
                 if len(raw) != opened.st_size or not host_payload.same_file(opened, os.fstat(stream.fileno())):
                     _refuse("managed_path_changed_during_read")
         else:
-            raw = manager.reader(path, maximum=host_payload.MAX_FILE)
+            raw = manager.reader(path, maximum=maximum)
         value = {"kind": "file", "uid": before.st_uid, "gid": before.st_gid, "mode": stat.S_IMODE(before.st_mode), "bytes": len(raw), "sha256": _sha(raw)}
     else:
         _refuse("unsafe_managed_path")
@@ -160,7 +160,7 @@ def _measure(manager, item, *, preserved=False):
     return value, metadata
 
 
-def _description(value, *, directory=False, preserved=False):
+def _description(value, *, directory=False, preserved=False, maximum=host_payload.MAX_FILE):
     fields = {"kind", "uid", "gid", "mode"} | (set() if directory else {"bytes", "sha256"})
     exact(value, fields)
     if (value["kind"] != ("directory" if directory else "file")
@@ -170,7 +170,7 @@ def _description(value, *, directory=False, preserved=False):
         _refuse("invalid_file_description")
     if not directory:
         digest_value(value["sha256"])
-        if type(value["bytes"]) is not int or not 0 <= value["bytes"] <= host_payload.MAX_FILE:
+        if type(value["bytes"]) is not int or not 0 <= value["bytes"] <= maximum:
             _refuse("invalid_file_description")
 
 
@@ -205,8 +205,9 @@ def _bound_plan(manager, stage, path, *, preparing):
     host_dispatch.generation_info(candidate["generation"])
     raw = manager.reader(path, maximum=host_payload.MAX_SOURCE_MANIFEST, private=True)
     plan = strict_json(raw)
-    exact(plan, {"schema", "sequence", "manifest_sha256", "coordinator_generation", "candidate_generation", "files", "generation_additions", "selection", "preserved", "migration_only"})
-    if (type(plan["schema"]) is not int or plan["schema"] != 1
+    content_update = "baseline" in release["components"]
+    exact(plan, {"schema", "sequence", "manifest_sha256", "coordinator_generation", "candidate_generation", "files", "generation_additions", "selection", "preserved", "migration_only"} | ({"content", "content_additions"} if content_update else set()))
+    if (type(plan["schema"]) is not int or plan["schema"] != (2 if content_update else 1)
             or type(plan["sequence"]) is not int or plan["sequence"] != transaction["sequence"]
             or plan["manifest_sha256"] != transaction["manifest_sha256"]
             or plan["coordinator_generation"] != pin["generation"] or plan["candidate_generation"] != candidate["generation"]):
@@ -217,6 +218,13 @@ def _bound_plan(manager, stage, path, *, preparing):
     targets |= {str(Path("/usr/share/nebulalog/quadlet-templates") / name) for name in host_payload.QUADLETS}
     targets |= {"/usr/share/nebulalog/httpd/nebulalog.conf.in", "/usr/share/nebulalog/keycloak/realm.json"}
     targets |= {"/etc/containers/systemd/nebulalog-" + name + ".container" for name in ("api", "ingest", "postgresql", "clickhouse", "keycloak")}
+    if content_update:
+        from .baseline import ContentUpdate
+        content = ContentUpdate.validate_plan(stage, plan["content"], release)
+        if (plan["content_additions"] != content["additions"]
+                or content["transition"]["previous_identity"] != transaction["previous"]["components"].get("baseline")):
+            _refuse("content_inventory_mismatch")
+        targets.add(str(CONFIGURATION / "security-policy.json"))
     paths = [item.get("path") for item in plan["files"] if isinstance(item, dict)]
     if set(paths) not in (targets, targets | {"/etc/httpd/conf.d/nebulalog.conf"}) or len(paths) != len(set(paths)):
         _refuse("unexpected_runtime_destination")
@@ -224,8 +232,12 @@ def _bound_plan(manager, stage, path, *, preparing):
         exact(item, {"path", "before", "after"})
         for phase in ("before", "after"):
             _description(item[phase])
-            if item[phase]["mode"] != 0o644:
+            if item[phase]["mode"] != (0o600 if item["path"] == str(CONFIGURATION / "security-policy.json") else 0o644):
                 _refuse("invalid_runtime_mode")
+        if content_update and item["path"] == str(CONFIGURATION / "security-policy.json"):
+            for phase, key in (("before", "before"), ("after", "after")):
+                if item[phase]["sha256"] != _sha(content[key]) or item[phase]["bytes"] != len(content[key]):
+                    _refuse("content_policy_description_changed")
     selection = plan["selection"]
     exact(selection, {"path", "before", "after", "restored"})
     if selection["path"] != str(host_activation.SELECTION):
@@ -256,7 +268,10 @@ def _bound_plan(manager, stage, path, *, preparing):
         _refuse("preserved_inventory_invalid")
     for item in plan["preserved"]:
         _description({key: value for key, value in item.items() if key != "path"}, preserved=True)
-    all_paths = paths + [selection["path"]] + [item["path"] for item in additions + plan["preserved"]]
+    content_additions = plan.get("content_additions", [])
+    for item in content_additions:
+        _description({key: value for key, value in item.items() if key != "path"}, directory=item.get("kind") == "directory", maximum=ContentUpdate.MAX_FILE)
+    all_paths = paths + [selection["path"]] + [item["path"] for item in additions + content_additions + plan["preserved"]]
     if len(all_paths) != len(set(all_paths)) or any(not isinstance(item, str) or not item.startswith("/") or str(Path(os.path.normpath(item))) != item for item in all_paths):
         _refuse("overlapping_or_invalid_paths")
     return plan, _sha(raw)
@@ -302,11 +317,16 @@ def _plan_snapshot(manager, plan, phase, retained=None):
     items = [{"path": item["path"], **item["before" if phase == "prepare" else "after" if phase == "forward" else "before"]} for item in plan["files"]]
     selection_phase = {"prepare": "before", "forward": "after", "rollback": "restored"}[phase]
     items += [{"path": plan["selection"]["path"], **plan["selection"][selection_phase]}]
-    items += plan["generation_additions"] + plan["preserved"]
+    items += plan["generation_additions"] + plan.get("content_additions", []) + plan["preserved"]
     values = {}
     preserved_paths = {item["path"] for item in plan["preserved"]}
+    content_paths = {item["path"] for item in plan.get("content_additions", [])}
     for item in items:
-        description, metadata = _measure(manager, item, preserved=item["path"] in preserved_paths)
+        maximum = host_payload.MAX_FILE
+        if item["path"] in content_paths:
+            from .baseline import ContentUpdate
+            maximum = ContentUpdate.MAX_FILE
+        description, metadata = _measure(manager, item, preserved=item["path"] in preserved_paths, maximum=maximum)
         if description != {key: value for key, value in item.items() if key != "path"}:
             _refuse("live_file_not_authorized")
         if retained is not None and retained.get(item["path"]) != metadata:
@@ -353,7 +373,7 @@ def _allowed_report(report, plan, phase, metadata=None):
     if plan.get("kind") == "os-payload-v1":
         from . import os_payload
         return os_payload.allowed_integrity_report(report, plan, phase)
-    additions = {item["path"] for item in plan["generation_additions"]}
+    additions = {item["path"] for item in plan["generation_additions"] + plan.get("content_additions", [])}
     changes = set() if phase == "prepare" else {item["path"] for item in plan["files"]} | {plan["selection"]["path"]}
     if set(report.get("added", {})) - additions or report.get("removed") or set(report.get("changed", {})) - changes:
         _refuse("unrelated_integrity_change")

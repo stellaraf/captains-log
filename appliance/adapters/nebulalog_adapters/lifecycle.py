@@ -19,9 +19,9 @@ from urllib.parse import urlsplit
 from urllib.request import build_opener, HTTPSHandler, ProxyHandler, Request
 import uuid
 
-from nebulalog_manager import host_dispatch, aide, kernel_boot, kernel_integrity, kernel_retention, kernel_retention_integration, kernel_updates, os_payload
+from nebulalog_manager import host_dispatch, host_activation, aide, kernel_boot, kernel_integrity, kernel_retention, kernel_retention_integration, kernel_updates, os_payload
 from nebulalog_manager.backup import _encrypted_staging
-from nebulalog_manager.baseline import Baseline, _json as baseline_json, rule_results
+from nebulalog_manager.baseline import Baseline, ContentUpdate, _json as baseline_json, rule_results
 from nebulalog_manager.common import CommandFailed, Refused, atomic_json, audit, locked, require_linux_root, trusted_file
 from nebulalog_manager.security import status as security_status, scan
 from nebulalog_manager.updates import digest_file, REQUIRED_CHECKS
@@ -165,8 +165,10 @@ class Lifecycle:
         if transaction.get("release") != str(stage) or transaction.get("manifest_sha256") != digest_file(manifest):
             raise Refused("Adapter release does not match the durable verified transaction")
         release = json.loads(manifest.read_text())
-        if not set(release["components"]) <= set(NAMES) | {"host"}:
-            raise Refused("This runtime adapter accepts OCI application and fixed host components; baseline/SCAP content requires a qualified content adapter")
+        if not set(release["components"]) <= set(NAMES) | {"host", "baseline"}:
+            raise Refused("Scanner engine changes require a separately qualified vendor RPM recipe")
+        if "baseline" in release["components"] and "host" not in release["components"]:
+            raise Refused("Compliance content requires the fixed host coordinator and integrity transaction")
         for artifact in release["artifacts"]:
             name = artifact["name"]
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}", name):
@@ -1093,7 +1095,7 @@ END $fence$; SELECT 'fenced';"""
         migration = self.application_schema_transition(application, schema["revision"]) if application else "none"
         target_schema = application["schema_revision"] if application else schema["revision"]
         for component, change in release["components"].items():
-            if component == "host":
+            if component in {"host", "baseline"}:
                 continue
             if change.get("rollback_safe") is not True or not IMAGE.fullmatch(change.get("image", "")):
                 raise Refused("Every component needs a reversible release and an immutable OCI image")
@@ -1119,6 +1121,12 @@ END $fence$; SELECT 'fenced';"""
         self.ch("SELECT 1")
         if shutil.disk_usage(self.data).free < sum(item["bytes"] for item in release["artifacts"]) * 3 + 1024**3:
             raise Refused("Insufficient staged-image and metadata backup reserve")
+        if release.get("content_enrollment") == "selected-baseline-v1":
+            from nebulalog_manager.baseline import ContentUpdate
+            if "baseline" in previous:
+                raise Refused("Content enrollment cannot replace an existing measured component")
+            ContentUpdate.bridge(stage, self.configuration, self.cmd)
+            self.content_assessment(stage, trusted_file(self.configuration / "security-policy.json").read_bytes())
         host = {"host": HostRuntime(self, stage).preflight()} if "host" in release["components"] else {}
         # Written before returning to the manager, before backup or preparation
         # can stop writers or authorize candidate effects. An interrupted fixed
@@ -1318,7 +1326,7 @@ END $fence$; SELECT 'fenced';"""
         prepared.mkdir(mode=0o700, exist_ok=False)
         images = {}
         for component, change in release["components"].items():
-            if component == "host":
+            if component in {"host", "baseline"}:
                 continue
             self.cmd(["skopeo", "copy", "--preserve-digests", "oci-archive:" + str(stage / change["artifact"]),
                       "containers-storage:" + change["image"]], timeout=900)
@@ -1407,7 +1415,7 @@ END $fence$; SELECT 'fenced';"""
         if host:
             host.apply(rollback=True)
         # Restore original image pins and environment/TLS/identity configuration before services start.
-        changed_units = {"nebulalog-" + name + ".container" for component in release["components"] if component != "host" for name in NAMES[component]}
+        changed_units = {"nebulalog-" + name + ".container" for component in release["components"] if component in NAMES for name in NAMES[component]}
         for source in (stage / "recovery/quadlets").iterdir():
             if historical and source.name not in changed_units:
                 continue
@@ -1534,6 +1542,30 @@ END $fence$; SELECT 'fenced';"""
                 atomic_json(report, {"status": "failed", "error": type(exc).__name__})
             raise
 
+    def baseline_runner(self, stage, policy_path):
+        """Fixed eval completion, shared by preflight and postactivation scans."""
+        def bounded(argv, **kwargs):
+            kwargs["timeout"] = min(kwargs.get("timeout", 120), 900)
+            ticket = getattr(self, "_component_ticket", None)
+            if ticket is None or argv[:3] != ["oscap", "xccdf", "eval"]:
+                return self.cmd(argv, **kwargs)
+            _, transaction = self.release(stage)
+            journal = host_dispatch.HookJournal(stage, transaction)
+            self._component_scap = journal.scap_authority(policy_path, argv)
+            try:
+                return self.cmd(argv, **kwargs)
+            except CommandFailed as failure:
+                if failure.returncode == 2:
+                    journal.acknowledge_scap(ticket, getattr(failure, "execution_ticket", None), argv)
+                raise
+            finally:
+                del self._component_scap
+        return bounded
+
+    def content_assessment(self, stage, policy_raw, role="candidate"):
+        path = stage / ("content-" + role + "-assessment") / "security-policy.json"
+        return ContentUpdate.candidate_assessment(stage, policy_raw, self.baseline_runner(stage, path), role=role)
+
     def _compliance(self, stage):
         context = self._compliance_context()
         binding = hashlib.sha256(json.dumps(context, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -1550,24 +1582,12 @@ END $fence$; SELECT 'fenced';"""
                 raise Refused("Lifecycle assessment binding is missing or changed")
             if digest_file(trusted_file(directory / "security-policy.json")) != context["policy_sha256"]:
                 raise Refused("Retained assessment policy differs from the installed selection")
-            def bounded(argv, **kwargs):
-                kwargs["timeout"] = min(kwargs.get("timeout", 120), 900)
-                ticket = getattr(self, "_component_ticket", None)
-                evaluation = ticket is not None and argv[:3] == ["oscap", "xccdf", "eval"]
-                if not evaluation:
-                    return self.cmd(argv, **kwargs)
-                _, transaction = self.release(stage)
-                journal = host_dispatch.HookJournal(stage, transaction)
-                self._component_scap = journal.scap_authority(manager.policy_path, argv)
-                try:
-                    return self.cmd(argv, **kwargs)
-                except CommandFailed as failure:
-                    if failure.returncode == 2:
-                        journal.acknowledge_scap(ticket, getattr(failure, "execution_ticket", None), argv)
-                    raise
-                finally:
-                    del self._component_scap
-            manager = Baseline(directory, runner=bounded)
+            bounded = self.baseline_runner(stage, directory / "security-policy.json")
+            roles = [role for role in ("candidate", "rollback") if os.path.lexists(stage / ("content-" + role + "-assessment.json")) and context["policy_sha256"] == host_dispatch.protected_json(stage / ("content-" + role + "-assessment.json")).get("policy_sha256")]
+            if len(roles) > 1:
+                raise Refused("Content assessment direction is ambiguous")
+            content_assessment = roles[0] if roles else None
+            manager = Baseline(directory, runner=bounded, **({"host": ContentUpdate.assessment_host, "full_evidence": True} if content_assessment else {}))
             scanned = record.get("scan_complete") is not True
             if scanned:
                 manager.scan(context["installation_id"], context["baseline"])
@@ -1586,7 +1606,10 @@ END $fence$; SELECT 'fenced';"""
                          "assessment_sha256": digest_file(manager.assessment_path),
                          "policy_sha256": context["policy_sha256"], "baseline": context["baseline"],
                          "automated_assessment_passed": automated, "review_complete": False}
-                if not automated:
+                if content_assessment:
+                    proof["content_continuation"] = ContentUpdate.finding_continuation(stage, manager, bounded, role=content_assessment, current_locked=True)
+                    proof.update(review_complete=not automated, review_sha256=proof["content_continuation"]["review_sha256"])
+                elif not automated:
                     try:
                         manager._validate_review(baseline_json(manager.review_path), context["installation_id"],
                                                  context["baseline"], findings)
@@ -1599,7 +1622,7 @@ END $fence$; SELECT 'fenced';"""
                     # image identities. Measure every rule again; an old review
                     # can approve only the exact outcomes still observed now.
                     verification = directory / ("verification-" + uuid.uuid4().hex)
-                    current = scan(manager.policy_path, verification, bounded)
+                    current = scan(manager.policy_path, verification, bounded, **({"full_evidence": True} if content_assessment else {}))
                     if current.get("host", {}).get("host_controls_ok") is not True:
                         raise Refused("Current host security controls failed during assessment")
                     for item in assessment["assessments"]:
@@ -1607,6 +1630,11 @@ END $fence$; SELECT 'fenced';"""
                             atomic_json(marker, {**record, "scan_complete": False})
                             atomic_json(stage / "adapter-compliance.json", {**proof, "status": "assessment_changed"})
                             raise Refused("Current rule outcomes changed; a fresh assessment and review are required")
+                    if content_assessment:
+                        previous_output = directory / "baseline-assessments" / assessment["artifact_directory"]
+                        for item in assessment["assessments"]:
+                            if ContentUpdate.assessment_evidence(previous_output, item["kind"], item["profile"]) != ContentUpdate.assessment_evidence(verification, item["kind"], item["profile"], source=previous_output / (item["kind"] + "-content.xml")):
+                                raise Refused("Current assessment facts changed; candidate approval cannot continue")
                     proof["verification_report"] = str(verification / "summary.json")
                 if self._compliance_context() != context:
                     raise Refused("Appliance changed before lifecycle assessment acceptance")
@@ -1614,7 +1642,10 @@ END $fence$; SELECT 'fenced';"""
                     context["installation_id"], context["baseline"])
                 if not current_assessed or current_assessment != assessment or current_findings != findings:
                     raise Refused("Assessment or current host evidence changed before acceptance")
-                if not automated:
+                if content_assessment:
+                    if ContentUpdate.finding_continuation(stage, manager, bounded, role=content_assessment, current_locked=True) != proof["content_continuation"]:
+                        raise Refused("Content approval changed before lifecycle acceptance")
+                elif not automated:
                     manager._validate_review(baseline_json(manager.review_path), context["installation_id"],
                                              context["baseline"], findings)
                 atomic_json(stage / "adapter-compliance.json", {**proof, "status": "passed"})
@@ -1699,8 +1730,28 @@ END $fence$; SELECT 'fenced';"""
                     checks["host"] = True
                 except Exception as exc:
                     evidence["host"] = {"error": type(exc).__name__}
+        content = {}
+        if all(checks.values()) and ("baseline" in release.get("components", {}) or release.get("content_enrollment") == "selected-baseline-v1"):
+            from nebulalog_manager.baseline import ContentUpdate
+            try:
+                _, transaction = self.release(stage)
+                if release.get("content_enrollment") == "selected-baseline-v1":
+                    measured = ContentUpdate.bridge_health(stage, self.configuration, self.cmd)
+                else:
+                    measured = ContentUpdate.measure(self.configuration / "security-policy.json", self.cmd)
+                    forward = host_activation.selection()["generation"] == HostRuntime(self, stage).candidate["generation"]
+                    expected = HostRuntime(self, stage).content()
+                    if measured["policy_sha256"] != expected["plan"]["after_policy_sha256" if forward else "before_policy_sha256"]:
+                        raise Refused("Content health measured another selected policy")
+                    version = release["components"]["baseline"]["version"] if forward else transaction["previous"]["components"]["baseline"]["version"]
+                    if measured["version"] != version:
+                        raise Refused("Content health version differs from its retained signed authority")
+                content["content"] = measured
+            except Exception as exc:
+                checks["compliance"] = False
+                evidence["content"] = {"error": type(exc).__name__}
         value = {"ok": all(checks.values()), "checks": checks, "evidence": evidence,
-                 "observed_at": datetime.now(timezone.utc).isoformat(), "certification": "not asserted", **host}
+                 "observed_at": datetime.now(timezone.utc).isoformat(), "certification": "not asserted", **host, **content}
         atomic_json(stage / "adapter-health.json", value)
         return value
 
@@ -1717,6 +1768,15 @@ END $fence$; SELECT 'fenced';"""
             if health.get("checks", {}).get("host") is not True:
                 raise Refused("Maintenance cannot end without measured host acceptance")
             host["host"] = HostRuntime(self, stage).runtime_evidence("update-finalize", accept_integrity=True)
+        if "baseline" in release["components"] or release.get("content_enrollment") == "selected-baseline-v1":
+            current = host_dispatch.protected_json(self.state / "current.json")
+            expected = current.get("components", {}).get("baseline")
+            if transaction["state"] == "committed" or expected is not None:
+                from nebulalog_manager.baseline import ContentUpdate
+                measured = ContentUpdate.measure(self.configuration / "security-policy.json", self.cmd)
+                if (not isinstance(expected, dict) or health.get("content") != expected
+                        or any(expected.get(key) != measured[key] for key in ("generation", "policy_sha256", "engine"))):
+                    raise Refused("Content commit inventory differs from current policy and accepted health")
         self.storage_maintenance(stage, held=False)
         self.maintenance(False, stage)
         if host:

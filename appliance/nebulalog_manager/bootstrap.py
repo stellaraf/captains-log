@@ -630,6 +630,8 @@ class Bootstrap:
             raise Refused("Installed-release sequence differs from the protected build descriptor")
         expected = {"nebulalog": "NEBULALOG_IMAGE", "postgresql": "POSTGRESQL_IMAGE", "clickhouse": "CLICKHOUSE_IMAGE", "keycloak": "KEYCLOAK_FIPS_IMAGE"}
         components = current.get("components")
+        # Initial runtime setup precedes reviewed policy selection. Content is
+        # enrolled by the later typed bridge, never fabricated in this receipt.
         if not isinstance(components, dict) or set(components) != set(expected) | {"host"}:
             raise Refused("Installed-release component inventory is incomplete")
         from .update_enrollment import UpdateEnrollment

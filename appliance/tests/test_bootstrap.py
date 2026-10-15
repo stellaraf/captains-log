@@ -315,6 +315,10 @@ class ProvisioningTests(unittest.TestCase):
             with self.assertRaisesRegex(Refused, "host generation"):
                 self.manager._installed_release()
             receipt["current"]["components"]["host"] = host
+            receipt["current"]["components"]["baseline"] = {"version": "guessed-from-package-version"}
+            with self.assertRaisesRegex(Refused, "inventory is incomplete"):
+                self.manager._installed_release()
+            receipt["current"]["components"].pop("baseline")
             receipt["current"]["components"]["clickhouse"]["image"] = "different@sha256:" + "b" * 64
             with self.assertRaises(Refused):
                 self.manager._installed_release()

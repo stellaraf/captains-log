@@ -160,6 +160,9 @@ def verify_release(manifest_path: Path, signature: Path, public_key: Path, bundl
     components = manifest.get("components")
     if not isinstance(components, dict) or not components or not set(components) <= COMPONENTS:
         raise Refused("Unknown release components")
+    if "content_enrollment" in manifest and (manifest["content_enrollment"] != "selected-baseline-v1"
+            or not {"host", "nebulalog"} <= set(components) or "baseline" in components):
+        raise Refused("Content enrollment requires the fixed measured host bridge without a content change")
     for name, change in components.items():
         if not isinstance(change, dict) or not isinstance(change.get("artifact"), str) or change["artifact"] not in names:
             raise Refused("Component references an unverified artifact")
@@ -171,6 +174,17 @@ def verify_release(manifest_path: Path, signature: Path, public_key: Path, bundl
             raise Refused(f"Unsupported {name} upgrade path")
         if type(change.get("rollback_safe")) is not bool:
             raise Refused("Component must explicitly declare rollback safety")
+        if name == "scap":
+            raise Refused("Scanner engine changes require a qualified signed vendor RPM recipe")
+        if name == "baseline":
+            from .baseline import ContentUpdate
+            ContentUpdate.validate_component(change)
+            if "host" not in components or any(other != name and item.get("artifact") == change["artifact"] for other, item in components.items()):
+                raise Refused("Content updates require a combined host release and a distinct artifact")
+            if not metadata_only:
+                artifact = next(item for item in artifacts if item["name"] == change["artifact"])
+                ContentUpdate.verify_archive(bundle / change["artifact"], expected_sha256=artifact["sha256"],
+                    expected_descriptor_sha256=change["descriptor_sha256"], expected_version=change["version"])
         if name == "host":
             if (set(change) != {"artifact", "version", "from_versions", "rollback_safe", "abi", "host_source_sha256"}
                     or any(not isinstance(version, str) or not host_payload.VERSION.fullmatch(version) for version in change["from_versions"])
@@ -432,6 +446,10 @@ class UpdateManager:
                         or any(previous_host.get(key) != value for key, value in host_dispatch.generation_info(previous_host.get("generation")).items())
                         or host_activation.selection() != {"schema": 1, "generation": previous_host["generation"], "sequence": current["sequence"]}):
                     raise Refused("Host update requires the factory-enrolled current immutable generation")
+            if "baseline" in release["components"] and "baseline" not in current["components"]:
+                raise Refused("Install the measured selected-baseline enrollment bridge before content updates")
+            if release.get("content_enrollment") and "baseline" in current["components"]:
+                raise Refused("Content enrollment cannot replace the accepted selected content identity")
             if any(not c["rollback_safe"] for c in release["components"].values()):
                 raise Refused("Controlled migration release requires an approved database-specific recovery procedure")
             if shutil.disk_usage(self.state.parent).free < release["verified_bytes"] * 3 + 1024**3:
@@ -501,6 +519,21 @@ class UpdateManager:
                 if not REQUIRED_CHECKS <= set(health.get("checks", {})) or any(health["checks"].get(k) is not True for k in REQUIRED_CHECKS):
                     raise Refused("Post-update health/security acceptance failed")
                 versions = {**current["components"], **release["components"]}
+                if "baseline" in release["components"] or release.get("content_enrollment") == "selected-baseline-v1":
+                    measured = health.get("content")
+                    if not isinstance(measured, dict) or set(measured) != {"version", "generation", "policy_sha256", "engine"}:
+                        raise Refused("Content update requires exact measured health inventory")
+                    if release.get("content_enrollment"):
+                        enrollment = host_dispatch.protected_json(stage / "content-enrollment.json")
+                        if enrollment.get("identity") != measured:
+                            raise Refused("Content bridge identity changed after preflight")
+                    else:
+                        plan = host_dispatch.protected_json(stage / "content-plan.json")
+                        if measured.get("version") != release["components"]["baseline"]["version"] or measured.get("policy_sha256") != plan.get("after_policy_sha256"):
+                            raise Refused("Content commit differs from its signed version or planned policy")
+                    if any(not isinstance(measured.get(key), str) or not re.fullmatch(r"[a-f0-9]{64}", measured[key]) for key in ("generation", "policy_sha256")):
+                        raise Refused("Malformed measured content identity")
+                    versions["baseline"] = measured
                 if host_update:
                     versions["host"] = candidate
                 self._advance_host_sequence(transaction, stage)
