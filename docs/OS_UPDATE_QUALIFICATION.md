@@ -52,6 +52,17 @@ also remain held. Source tests include actual Python subprocess/flock survival
 and lost-acknowledgement cases; native delegated-command recovery still needs
 separate qualification.
 
+An abrupt scheduler loss during payload application can leave the journal in
+`updating` with `payload_started=true`. That state remains held: `os-recover`
+does not infer completion from installed bytes, result files, current health or
+an available process lock. These observations cannot exclude a surviving RPM
+process, scriptlet or delegated job with later effects. A crash after application
+returns but before the durable postcheck record has the same conservative
+disposition. Neither automatic maintenance nor preapply cancellation replays or
+reclassifies this work. Qualification still requires a durable payload-dispatch
+completion protocol and native interruption tests before this recovery path can
+be enabled; operators must retain its stage, journals and maintenance holds.
+
 ## Measured native result
 
 On the disposable Rocky 9.8 x86_64 VMware guest, the signed `linux-firmware-whence` package was set to `20260707-161.1.el9_8` as an explicit test fixture, then upgraded by the exact executor to `20260804-161.2.el9_8`. The latter was the original installed version. This changes the real `/usr/share/licenses/linux-firmware-whence/WHENCE` payload. Both versions were downloaded from the official Rocky 9 BaseOS repository and verified against the enrolled Rocky key.
