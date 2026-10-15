@@ -9,11 +9,13 @@ are retained privately on the enrolled encrypted filesystem.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import tempfile
 import uuid
@@ -27,6 +29,7 @@ from .host_operations import digest_value, uuid_value
 MAX_CHAIN = 1000
 MAX_PATHS = 4096
 _UNSET = object()
+_LOCK_CONTEXT = contextvars.ContextVar('aide_update_lock_context', default=None)
 CONFIGURATION = Path("/var/lib/nebulalog/configuration")
 
 
@@ -49,6 +52,8 @@ def _immutable(manager, path, value, identity):
 
 @contextlib.contextmanager
 def _locked(manager):
+    if _LOCK_CONTEXT.get() is not None:
+        _refuse('nested_integrity_mutation')
     identity = manager.guard()
     state = identity.root / "manager/aide"
     for path in (state, state / "reports", state / "tmp"):
@@ -71,7 +76,26 @@ def _locked(manager):
                 _refuse("coordination_busy")
         if manager.guard() != identity:
             _refuse("identity_changed")
-        yield state, identity
+        token = _LOCK_CONTEXT.set((manager, state, identity))
+        try:
+            yield state, identity
+        finally:
+            _LOCK_CONTEXT.reset(token)
+
+
+@contextlib.contextmanager
+def _evidence_locked(manager):
+    """Reuse only this context's held locks for nested read-only evidence."""
+    active = _LOCK_CONTEXT.get()
+    if active is not None:
+        owner, state, identity = active
+        if manager is not None and manager is not owner or owner.guard() != identity:
+            _refuse('retained_evidence_lock_owner_changed')
+        yield owner, state, identity
+    else:
+        owner = manager or aide.Aide()
+        with _locked(owner) as (state, identity):
+            yield owner, state, identity
 
 
 def _metadata(path):
@@ -157,6 +181,8 @@ def _bound_plan(manager, stage, path, *, preparing):
         return kernel_boot.bound_integrity_plan(manager, stage, path, preparing=preparing)
     if path == stage / kernel_retention.INTEGRITY:
         return kernel_retention.bound_integrity_plan(manager, stage, path, preparing=preparing)
+    if path.parent == stage and kernel_retention.RESUME_NAME.fullmatch(path.name):
+        return kernel_retention.bound_resume_integrity_plan(manager, stage, path, preparing=preparing)
     if path == stage / "os-integrity-plan.json":
         from . import os_payload
         return os_payload.bound_integrity_plan(manager, stage, path, preparing=preparing)
@@ -229,6 +255,9 @@ def _bound_plan(manager, stage, path, *, preparing):
 
 
 def _snapshot(manager, plan, phase, retained=None):
+    if plan.get('kind') == 'rocky-kernel-retention-resume-v1':
+        from . import kernel_retention
+        return kernel_retention.resume_integrity_snapshot(manager, plan, phase, retained)
     if plan.get('kind') == 'kernel-boot-v1':
         from . import kernel_boot
         return kernel_boot.integrity_snapshot(manager, plan, phase, retained)
@@ -272,6 +301,9 @@ def _parse_update(result, database_in, database_out):
 
 
 def _allowed_report(report, plan, phase):
+    if plan.get('kind') == 'rocky-kernel-retention-resume-v1':
+        from . import kernel_retention
+        return kernel_retention.allowed_resume_integrity_report(report, plan, phase)
     if plan.get('kind') == 'kernel-boot-v1':
         from . import kernel_boot
         return kernel_boot.allowed_integrity_report(report, plan, phase)
@@ -447,6 +479,70 @@ def active_enrollment(manager, state, identity, base_receipt):
     return {**base_receipt, "database_sha256": database_sha}
 
 
+def retained_plan_acceptance(stage, plan_path, *, manager=None, expected=None, historical=False):
+    """Verify retained scan/database evidence for one immutable OS plan.
+
+    Historical evidence proves its published chain prefix, never a clean live
+    host. Current evidence additionally requires membership in the active chain
+    and its exact live database. Neither path writes a journal or a database.
+    """
+    stage, plan_path = Path(stage), Path(plan_path)
+    if historical and expected is None:
+        _refuse('historical_acceptance_reference_required')
+    if expected is not None:
+        exact(expected, {'entry', 'original_enrollment_sha256', 'plan_sha256',
+                         'prepared_sha256', 'database_sha256'})
+        exact(expected['entry'], {'id', 'sha256'})
+        uuid_value(expected['entry']['id'])
+        digest_value(expected['entry']['sha256'])
+        for key in ('original_enrollment_sha256', 'plan_sha256', 'prepared_sha256', 'database_sha256'):
+            digest_value(expected[key])
+    with _evidence_locked(manager) as (owner, state, identity):
+        if (not stage.is_absolute() or stage.parent != identity.root / 'manager/os-updates'
+                or not re.fullmatch(r'[a-f0-9]{32}', stage.name) or stage.resolve() != stage
+                or plan_path.parent != stage or plan_path.is_symlink()):
+            _refuse('retained_acceptance_stage_changed')
+        owner.records.directory(stage, identity)
+        raw = owner._bytes(plan_path, identity)
+        plan, plan_sha = strict_json(raw), _sha(raw)
+        base = owner._initial_enrollment(state, identity)
+        root = state / 'authorized'
+        if historical:
+            pointer = expected['entry']
+            # Only an actual retained entry is eligible. An uncommitted ready
+            # journal's in-memory proposal cannot serve as published proof.
+            owner.records.read(root / 'entries' / (pointer['id'] + '.json'), identity)
+            _chain(owner, state, identity, base, head_override=pointer)
+        else:
+            active_enrollment(owner, state, identity, base)
+            pointer, _, _ = _chain(owner, state, identity, base)
+        seen = set()
+        while pointer is not None:
+            exact(pointer, {'id', 'sha256'})
+            token = uuid_value(pointer['id'])
+            if token in seen or len(seen) >= MAX_CHAIN:
+                _refuse('retained_acceptance_chain_limit')
+            seen.add(token)
+            entry = _read_bound(owner, root / 'entries', pointer, identity)
+            prepared = _read_bound(owner, root / 'prepared', entry['prepared'], identity)
+            matches = (entry['direction'] == 'forward' and entry['plan_sha256'] == plan_sha
+                       and prepared['release'] == str(stage) and prepared['plan'] == plan
+                       and prepared['plan_sha256'] == plan_sha)
+            if matches:
+                proof = {'entry': pointer, 'original_enrollment_sha256': digest(base),
+                         'plan_sha256': plan_sha, 'prepared_sha256': digest(prepared),
+                         'database_sha256': entry['database_sha256']}
+                if expected is not None and proof != expected:
+                    _refuse('retained_acceptance_reference_changed')
+                return proof
+            if historical:
+                # A historical caller names this exact accepted generation;
+                # finding some older matching plan is not equivalent authority.
+                break
+            pointer = entry['previous']
+        _refuse('retained_plan_acceptance_missing')
+
+
 def _directories(manager, state, identity):
     for path in (state / "authorized", state / "authorized/artifacts", state / "authorized/entries", state / "authorized/prepared"):
         manager.records.directory(path, identity, create=True)
@@ -505,6 +601,62 @@ def _resume_kernel_pending(manager, state, identity, base, stage, plan_path, pla
     manager._sync(root / 'pending.json', root, state)
 
 
+def _resume_retention_pending(manager, state, identity, base, stage, plan_path, plan, plan_sha):
+    """Retain only an exact ancestor's interrupted CAS, then require new scans.
+
+    The immutable erase authorization binds the original preparation. Compound
+    ancestry also covers a reboot before an intermediate plan was prepared.
+    No unpublished database is copied and no clean result is produced here.
+    """
+    from . import kernel_retention
+    if plan.get('kind') != kernel_retention.RESUME_KIND:
+        _refuse('retention_resume_plan_required')
+    origin = kernel_retention.resume_origin(stage, plan_path)
+    _, original = _prepared(manager, state, identity, stage, origin['integrity'], origin['integrity_sha256'])
+    if (original is None or original['original_enrollment_sha256'] != digest(base)
+            or digest(original) != origin['prepared_sha256']):
+        _refuse('retention_resume_original_preparation_changed')
+    pending = _pending(manager, state, identity)
+    if pending is None or pending['state'] == 'complete':
+        return
+    prior, prior_sha, prior_path = plan, plan_sha, Path(plan_path)
+    seen = set()
+    while True:
+        if prior_sha in seen or len(seen) >= MAX_CHAIN:
+            _refuse('retention_resume_ancestry_limit')
+        seen.add(prior_sha)
+        _, prepared = _prepared(manager, state, identity, stage, prior, prior_sha)
+        if prepared is not None:
+            if prepared['original_enrollment_sha256'] != digest(base):
+                _refuse('retention_resume_preparation_changed')
+            if pending.get('prepared') == _pointer(prepared):
+                break
+        if prior.get('kind') != kernel_retention.RESUME_KIND:
+            _refuse('retention_resume_different_acceptance_pending')
+        prior, prior_sha = kernel_retention.resume_integrity_predecessor(stage, prior_path)
+        if prior.get('kind') == kernel_retention.RESUME_KIND:
+            prior_path = Path(stage) / ('kernel-retention-resume-' + prior['id'] + '-plan.json')
+        elif prior != origin['integrity'] or prior_sha != origin['integrity_sha256']:
+            _refuse('retention_resume_original_plan_changed')
+    if (pending.get('direction') != 'forward'
+            or pending.get('previous_database_sha256') != prepared['database_sha256']):
+        _refuse('retention_resume_different_acceptance_pending')
+    metadata = _snapshot(manager, plan, 'prepare')
+    root = state / 'authorized'
+    archive = {'schema': 1, 'resume_plan_sha256': plan_sha, 'prior_plan_sha256': prior_sha,
+               'original_preparation_sha256': origin['prepared_sha256'], 'pending': pending}
+    _immutable(manager, root / 'artifacts' / (pending['id'] + '.' + plan_sha + '.retention-resume.json'), archive, identity)
+    if pending['state'] == 'ready':
+        _retain_interrupted_forward(manager, state, identity, base, pending)
+    head, checksum, _ = _chain(manager, state, identity, base)
+    if (manager._database(state / 'aide.db.gz', identity)[1] != checksum
+            or pending['state'] == 'scanning' and (head != pending['previous'] or checksum != pending['previous_database_sha256'])
+            or _snapshot(manager, plan, 'prepare', metadata) != metadata):
+        _refuse('retention_resume_historical_database_changed')
+    manager.records.write(root / 'pending.json', {'schema': 1, 'state': 'complete', 'entry': head, 'database_sha256': checksum}, identity)
+    manager._sync(root / 'pending.json', root, state)
+
+
 def prepare(manager, stage, plan_path):
     with _locked(manager) as (state, identity):
         plan, plan_sha = _bound_plan(manager, stage, plan_path, preparing=True)
@@ -512,6 +664,9 @@ def prepare(manager, stage, plan_path):
         if plan.get('kind') == 'kernel-boot-v1' and plan.get('phase') in {'postboot', 'resume'}:
             manager._monitor(identity, state, base)
             _resume_kernel_pending(manager, state, identity, base, stage, plan_path, plan, plan_sha)
+        if plan.get('kind') == 'rocky-kernel-retention-resume-v1':
+            manager._monitor(identity, state, base)
+            _resume_retention_pending(manager, state, identity, base, stage, plan_path, plan, plan_sha)
         enrolled = active_enrollment(manager, state, identity, base)
         policy = manager._monitor(identity, state, enrolled)
         metadata = _snapshot(manager, plan, "prepare")

@@ -9,6 +9,7 @@ factory kernel; installed RPM headers alone are not signed provenance.
 """
 from __future__ import annotations
 
+import base64
 import os
 from pathlib import Path
 import re
@@ -16,8 +17,8 @@ import stat
 import uuid
 
 from . import kernel_updates as kernel, os_payload as rpm
-from .common import Refused, require_linux_root, run
-from .host_job_storage import exact, strict_json
+from .common import Refused, atomic_json, require_linux_root, run
+from .host_job_storage import digest, exact, strict_json
 from .updates import REQUIRED_CHECKS
 
 KIND = 'rocky-kernel-retention-v1'
@@ -30,6 +31,13 @@ ACCEPTED_FIELDS = {'schema', 'operation_sha256', 'kernel_plan_sha256', 'installe
                    'postboot_sha256', 'promotion_sha256', 'resume_sha256', 'kernel', 'boot_id',
                    'recovery_kernel', 'checks', 'finalization', 'previous_acceptance_sha256'}
 PROJECTION_FIELDS = {'ok', 'kernel', 'recovery_kernel', 'boot_id', 'receipt_sha256', 'install_plan_sha256'}
+RESUME_KIND = 'rocky-kernel-retention-resume-v1'
+OBSERVATION = re.compile(r'kernel-retention-observation-([a-f0-9-]{36})\.json')
+RESUME_PLAN = re.compile(r'kernel-retention-resume-([a-f0-9]{32})-plan\.json')
+RESUME_NAME = RESUME_PLAN
+RESUME_RESULT = re.compile(r'kernel-retention-resume-([a-f0-9]{32})-result\.json')
+PROVISIONAL_FIELDS = {'ok', 'stage', 'boot_id', 'backup_stage', 'backup_sha256',
+                      'operation_sha256', 'retention_plan_sha256'}
 
 
 def refuse(reason):
@@ -50,14 +58,19 @@ def acceptance_record(stage):
     """Validate immutable receipt bytes; caller still proves fresh live health."""
     stage = Path(stage)
     value, receipt_sha, _ = kernel.read_acceptance(stage)
-    exact(value, ACCEPTED_FIELDS)
+    return _acceptance_projection(stage, value, receipt_sha, current=True)
+
+
+def _acceptance_projection(stage, value, receipt_sha, *, current):
+    stage = Path(stage)
+    exact(value, ACCEPTED_FIELDS | ({'retention_integrity_sha256'} if 'retention_integrity_sha256' in value else set()))
     if (type(value['schema']) is not int or value['schema'] != 1 or value['finalization'] != 'complete'
             or type(value['checks']) is not dict or set(value['checks']) != REQUIRED_CHECKS
             or any(result is not True for result in value['checks'].values())
             or not kernel.KERNEL.fullmatch(str(value['kernel']))
             or not kernel.KERNEL.fullmatch(str(value['recovery_kernel']))
             or value['kernel'] == value['recovery_kernel']
-            or value['boot_id'] != boot_id()):
+            or current and value['boot_id'] != boot_id()):
         refuse('final_lifecycle_acceptance_missing')
     for field in ('operation_sha256', 'kernel_plan_sha256', 'installed_sha256', 'postboot_sha256', 'promotion_sha256'):
         if not kernel.SHA.fullmatch(str(value[field])):
@@ -65,6 +78,8 @@ def acceptance_record(stage):
     for field in ('resume_sha256', 'previous_acceptance_sha256'):
         if value[field] is not None and not kernel.SHA.fullmatch(str(value[field])):
             refuse('invalid_acceptance_binding')
+    if value.get('retention_integrity_sha256') is not None and not kernel.SHA.fullmatch(str(value['retention_integrity_sha256'])):
+        refuse('invalid_acceptance_binding')
     candidate_stage, candidate, candidate_sha, _ = kernel.load_candidate(stage)
     if (value['operation_sha256'] != rpm.sha(rpm.read(stage / 'operation.json', 8192))
             or value['kernel_plan_sha256'] != candidate_sha
@@ -74,6 +89,18 @@ def acceptance_record(stage):
     return {'ok': True, 'kernel': value['kernel'], 'recovery_kernel': value['recovery_kernel'],
             'boot_id': value['boot_id'], 'receipt_sha256': receipt_sha,
             'install_plan_sha256': value['kernel_plan_sha256']}
+
+
+def historical_acceptance(stage, approved):
+    """Resolve an exact ancestor; historical validity never authorizes erasure."""
+    exact(approved, PROJECTION_FIELDS)
+    matches = [item for item in kernel._acceptance_chain(Path(stage)) if item[1] == approved['receipt_sha256']]
+    if len(matches) != 1:
+        refuse('original_acceptance_not_in_current_history')
+    value, checksum, _ = matches[0]
+    if _acceptance_projection(stage, value, checksum, current=False) != approved:
+        refuse('original_acceptance_projection_changed')
+    return value
 
 
 def acceptance(stage, accepted, runner):
@@ -260,16 +287,30 @@ def plan_cached(stage, packages, *, accepted, runner=run):
 
 
 def load_plan(stage):
+    return _load_plan(stage, historical=False)
+
+
+def load_historical_plan(stage):
+    """Validate frozen scope and accepted ancestry without granting authority."""
+    return _load_plan(stage, historical=True)
+
+
+def _load_plan(stage, *, historical):
     stage = Path(stage)
     raw = rpm.read(stage / PLAN, rpm.MAX_XML)
     plan = strict_json(raw)
     exact(plan, {'schema', 'kind', 'operation_sha256', 'acceptance', 'boot_id', 'kernel', 'machine_id', 'key_sha256', 'keydb',
                  'packages', 'target', 'before_inventory', 'after_inventory', 'inventory_sha256', 'removed',
                  'preserved', 'mutable_directories', 'retained_kernels'})
-    if (plan['schema'] != 1 or plan['kind'] != KIND or plan['key_sha256'] != rpm.KEY_SHA256
+    approved = plan['acceptance']
+    if historical:
+        historical_acceptance(stage, approved)
+    elif approved != acceptance_record(stage) or plan['boot_id'] != boot_id():
+        refuse('plan_binding_changed')
+    if (type(plan['schema']) is not int or plan['schema'] != 1 or plan['kind'] != KIND or plan['key_sha256'] != rpm.KEY_SHA256
             or not re.fullmatch(r'kernel-retention-keydb-[a-f0-9]{32}', str(plan['keydb']))
             or plan['operation_sha256'] != rpm.sha(rpm.read(stage / 'operation.json', 8192))
-            or plan['acceptance'] != acceptance_record(stage) or plan['boot_id'] != boot_id()
+            or plan['boot_id'] != approved['boot_id'] or raw != kernel.encode(plan)
             or plan['kernel'] in plan['retained_kernels'] or len(set(plan['retained_kernels'])) != 3
             or {plan['acceptance']['kernel'], plan['acceptance']['recovery_kernel']} - set(plan['retained_kernels'])
             or set(plan['removed']) & set(plan['preserved'])
@@ -460,3 +501,384 @@ def allowed_integrity_report(report, plan, phase):
     changed = set(plan['mutable_directories']) if phase == 'forward' else set()
     if report.get('added') or set(report.get('removed', {})) - removed or set(report.get('changed', {})) - changed:
         refuse('unrelated_integrity_change')
+
+
+def erase_intent(stage, plan, checksum):
+    """Validate the one global attempt sentinel without authorizing its replay."""
+    raw = rpm.read(Path(stage) / INTENT, 8192)
+    intent = strict_json(raw)
+    exact(intent, {'schema', 'plan_sha256', 'authorization'})
+    value = intent['authorization']
+    exact(value, {'ok', 'plan_sha256', 'backup_sha256', 'aide_preparation_sha256', 'boot_id'})
+    if (type(intent['schema']) is not int or intent['schema'] != 1 or raw != kernel.encode(intent)
+            or intent['plan_sha256'] != checksum or value['ok'] is not True
+            or value['plan_sha256'] != checksum or value['boot_id'] != plan['boot_id']
+            or any(not kernel.SHA.fullmatch(str(value[key])) for key in ('backup_sha256', 'aide_preparation_sha256'))):
+        refuse('historical_erase_intent_changed')
+    return intent, rpm.sha(raw)
+
+
+def classify_inventory(plan, inventory, *, attempted):
+    """Pure classification; even unchanged RPM inventory cannot disprove execution."""
+    if inventory == plan['before_inventory']:
+        if attempted:
+            refuse('attempted_erase_outcome_ambiguous_no_replay')
+        return 'unattempted'
+    if inventory == plan['after_inventory'] and attempted:
+        return 'exact_erased'
+    refuse('partial_or_unowned_erase_requires_recovery')
+
+
+def verify_signed_history(stage, plan, *, runner=run):
+    """Revalidate the vendor bytes and original headers after installed erasure."""
+    stage = Path(stage)
+    rpm.platform(runner)
+    verify_remove_hooks()
+    if os.readlink('/lib') != 'usr/lib' or rpm.sha(rpm.read(rpm.KEY, 65536)) != plan['key_sha256']:
+        refuse('historical_vendor_trust_changed')
+    original = rpm.read(stage / 'kernel-retention-inventory.xml', rpm.MAX_XML)
+    headers = rpm.headers(original.decode())
+    inventory = sorted(rpm.identity(header)['nevra'] for header in headers)
+    if rpm.sha(original) != plan['inventory_sha256'] or inventory != plan['before_inventory']:
+        refuse('historical_inventory_changed')
+    original_by_nevra = {rpm.identity(header)['nevra']: header for header in headers}
+    files = {}
+    for item in plan['packages']:
+        if (item.get('rpm') != item.get('sha256', '') + '.rpm'
+                or not kernel.SHA.fullmatch(str(item.get('sha256')))
+                or type(item.get('bytes')) is not int or not 0 < item['bytes'] <= rpm.MAX_RPM):
+            refuse('historical_package_identity_changed')
+        path = stage / 'kernel-retention-packages' / item['rpm']
+        raw = rpm.read(path)
+        if (len(raw) != item['bytes'] or rpm.sha(raw) != item['sha256']
+                or rpm.signature(path, stage / plan['keydb'], runner) != item['signature']):
+            refuse('historical_signed_package_changed')
+        queried = rpm.headers(runner(['/usr/bin/rpm', '--query', '--package', '--xml', str(path)], timeout=180))
+        if len(queried) != 1:
+            refuse('historical_signed_header_ambiguous')
+        payload = kernel.payload(queried[0])
+        if payload != kernel.payload(original_by_nevra[item['nevra']]):
+            refuse('historical_installed_header_changed')
+        for entry in payload.pop('files'):
+            if entry['path'] in files and files[entry['path']] != entry:
+                refuse('historical_payload_overlap')
+            files[entry['path']] = entry
+        if payload != {key: value for key, value in item.items() if key not in {'rpm', 'sha256', 'bytes', 'signature'}}:
+            refuse('historical_signed_payload_changed')
+    if files != {item['path']: item for item in plan['target']['files']}:
+        refuse('historical_frozen_payload_changed')
+
+
+def _exact_erased(stage, plan, *, runner):
+    verify_signed_history(stage, plan, runner=runner)
+    _, _, inventory = rpm.inventory(runner)
+    classify_inventory(plan, inventory, attempted=True)
+    for path, expected in plan['preserved'].items():
+        # Boot owns the *exact* transition of this one file. This observation
+        # only supplies inventory authority; it cannot accept integrity.
+        if path != kernel.GRUBENV and preserved_description(path) != expected:
+            refuse('recovery_protected_state_changed')
+    if any(os.path.lexists(path) for path in plan['removed']):
+        refuse('recovery_erase_target_still_present')
+    approved = plan['acceptance']
+    if (runner(['/usr/bin/uname', '-r']) != approved['kernel']
+            or runner(['/usr/sbin/grubby', '--default-kernel']) != '/boot/vmlinuz-' + approved['kernel']):
+        refuse('recovery_running_default_changed')
+    return inventory
+
+
+def _boot_observation(stage, *, runner):
+    plan, checksum = load_historical_plan(stage)
+    _, intent_sha = erase_intent(stage, plan, checksum)
+    inventory = _exact_erased(stage, plan, runner=runner)
+    current = boot_id()
+    if current == plan['boot_id']:
+        refuse('later_boot_required')
+    candidate_stage, candidate, candidate_sha, _ = kernel.load_candidate(stage)
+    raw = rpm.read(kernel.GRUBENV, 1024)
+    observed = kernel.describe(kernel.GRUBENV)
+    if (len(raw) != 1024 or observed.get('kind') != 'file'
+            or observed.get('sha256') != rpm.sha(raw) or observed.get('bytes') != len(raw)):
+        refuse('recovery_environment_observation_changed')
+    return {'schema': 1, 'kind': 'kernel-retention-observation-v1', 'stage': str(stage),
+            'operation_sha256': plan['operation_sha256'], 'retention_plan_sha256': checksum,
+            'erase_intent_sha256': intent_sha, 'original_acceptance_sha256': plan['acceptance']['receipt_sha256'],
+            'candidate_plan_sha256': candidate_sha,
+            'installed_sha256': rpm.sha(rpm.read(candidate_stage / 'kernel-installed.json', rpm.MAX_XML)),
+            'boot_id': current, 'kernel': candidate['kernel'], 'recovery_kernel': candidate['old_kernel'],
+            'after_inventory': inventory, 'grub_before': plan['preserved'][kernel.GRUBENV],
+            'grub_observed': observed, 'grub_observed_raw': base64.b64encode(raw).decode()}
+
+
+def _reference(stage, reference, pattern):
+    exact(reference, {'filename', 'sha256'})
+    if (not isinstance(reference['filename'], str) or not pattern.fullmatch(reference['filename'])
+            or not kernel.SHA.fullmatch(str(reference['sha256']))):
+        refuse('invalid_recovery_reference')
+    raw = rpm.read(Path(stage) / reference['filename'], rpm.MAX_XML)
+    value = strict_json(raw)
+    if rpm.sha(raw) != reference['sha256'] or raw != kernel.encode(value):
+        refuse('recovery_reference_changed')
+    return value
+
+
+def observe_boot_authority(stage, *, runner=run):
+    """Retain exact erasure evidence; this cannot authorize RPM or AIDE adoption."""
+    require_linux_root()
+    stage = Path(stage)
+    value = _boot_observation(stage, runner=runner)
+    name = 'kernel-retention-observation-' + value['boot_id'] + '.json'
+    kernel.record(stage, name, value)
+    return {'filename': name, 'sha256': rpm.sha(kernel.encode(value))}
+
+
+def validate_boot_authority(stage, reference, *, runner=run, historical=False):
+    """The only supported exact-three inventory exception for candidate proof."""
+    stage = Path(stage)
+    value = _reference(stage, reference, OBSERVATION)
+    plan, checksum = load_historical_plan(stage)
+    _, intent_sha = erase_intent(stage, plan, checksum)
+    candidate_stage, candidate, candidate_sha, _ = kernel.load_candidate(stage)
+    exact(value, {'schema', 'kind', 'stage', 'operation_sha256', 'retention_plan_sha256', 'erase_intent_sha256',
+                  'original_acceptance_sha256', 'candidate_plan_sha256', 'installed_sha256', 'boot_id', 'kernel',
+                  'recovery_kernel', 'after_inventory', 'grub_before', 'grub_observed', 'grub_observed_raw'})
+    if (type(value['schema']) is not int or value['schema'] != 1 or value['kind'] != 'kernel-retention-observation-v1'
+            or value['stage'] != str(stage) or value['operation_sha256'] != plan['operation_sha256']
+            or value['retention_plan_sha256'] != checksum or value['erase_intent_sha256'] != intent_sha
+            or value['original_acceptance_sha256'] != plan['acceptance']['receipt_sha256']
+            or value['candidate_plan_sha256'] != candidate_sha
+            or value['installed_sha256'] != rpm.sha(rpm.read(candidate_stage / 'kernel-installed.json', rpm.MAX_XML))
+            or value['kernel'] != candidate['kernel'] or value['recovery_kernel'] != candidate['old_kernel']
+            or value['after_inventory'] != plan['after_inventory']
+            or value['grub_before'] != plan['preserved'][kernel.GRUBENV]
+            or reference['filename'] != 'kernel-retention-observation-' + value['boot_id'] + '.json'
+            or value['boot_id'] == plan['boot_id']):
+        refuse('recovery_observation_binding_changed')
+    try:
+        raw = base64.b64decode(value['grub_observed_raw'], validate=True)
+        valid_boot = str(uuid.UUID(value['boot_id'])) == value['boot_id']
+    except (ValueError, TypeError, AttributeError):
+        refuse('invalid_recovery_observation')
+    if (not valid_boot or len(raw) != 1024 or value['grub_observed'].get('sha256') != rpm.sha(raw)
+            or value['grub_observed'].get('bytes') != 1024):
+        refuse('invalid_recovery_observation')
+    if not historical and value != _boot_observation(stage, runner=runner):
+        refuse('recovery_observation_no_longer_current')
+    return value
+
+
+def resume_origin(stage, path):
+    """Identify the original AIDE preparation, independent of its current DB."""
+    stage, path = Path(stage), Path(path)
+    if path.parent != stage or not RESUME_NAME.fullmatch(path.name):
+        refuse('unowned_resume_plan')
+    value = strict_json(rpm.read(path, rpm.MAX_XML))
+    original, checksum = load_historical_plan(stage)
+    intent, intent_sha = erase_intent(stage, original, checksum)
+    integrity_raw = rpm.read(stage / INTEGRITY, rpm.MAX_XML)
+    integrity = strict_json(integrity_raw)
+    if (integrity_raw != kernel.encode(integrity) or integrity != integrity_plan(original, checksum)
+            or value.get('retention_plan_sha256') != checksum
+            or value.get('original_integrity_sha256') != rpm.sha(integrity_raw)
+            or value.get('original_preparation_sha256') != intent['authorization']['aide_preparation_sha256']
+            or value.get('erase_intent_sha256') != intent_sha):
+        refuse('resume_original_preparation_changed')
+    return {'plan': original, 'plan_sha256': checksum, 'integrity': integrity,
+            'integrity_sha256': rpm.sha(integrity_raw),
+            'prepared_sha256': intent['authorization']['aide_preparation_sha256'],
+            'intent': intent, 'intent_sha256': intent_sha}
+
+
+def _provisional(value, stage, observation):
+    exact(value, PROVISIONAL_FIELDS)
+    if (value['ok'] is not True or value['stage'] != str(stage)
+            or value['boot_id'] != observation['boot_id']
+            or value['operation_sha256'] != observation['operation_sha256']
+            or value['retention_plan_sha256'] != observation['retention_plan_sha256']
+            or not kernel.SHA.fullmatch(str(value['backup_sha256']))
+            or not isinstance(value['backup_stage'], str)
+            or Path(value['backup_stage']).parent != Path(stage).parent
+            or not re.fullmatch(r'[a-f0-9]{32}', Path(value['backup_stage']).name)):
+        refuse('provisional_recovery_authorization_changed')
+    return value
+
+
+def prepare_resume(stage, authority_ref, boot_ref, *, authorize, runner=run):
+    """Freeze a compound integrity reconciliation; never invoke RPM erasure."""
+    from . import kernel_boot
+    require_linux_root()
+    stage = Path(stage)
+    observed = validate_boot_authority(stage, authority_ref, runner=runner)
+    boot = kernel_boot.validate_retention_resume(stage, boot_ref, runner=runner)
+    authorization = _provisional(authorize(stage, observed['retention_plan_sha256']), stage, observed)
+    pointer = stage / 'kernel-retention-resume-current.json'
+    linked = kernel_boot.read_retention_integrity_binding(stage, boot_ref)
+    if linked is not None:
+        parsed, _ = load_resume(stage, linked, runner=runner)
+        if parsed['authority_ref'] != authority_ref or parsed['boot_ref'] != boot_ref:
+            refuse('linked_resume_plan_changed')
+        atomic_json(pointer, linked)
+        return stage / linked['filename'], parsed
+    if os.path.lexists(pointer):
+        previous = strict_json(rpm.read(pointer, 8192))
+        value = _reference(stage, previous, RESUME_NAME)
+        if value.get('boot_id') == observed['boot_id']:
+            parsed, checksum = load_resume(stage, previous, runner=runner)
+            if parsed['authority_ref'] != authority_ref or parsed['boot_ref'] != boot_ref:
+                refuse('current_resume_plan_changed')
+            kernel_boot.bind_retention_integrity(stage, boot_ref, previous, runner=runner)
+            return stage / previous['filename'], parsed
+    original, checksum = load_historical_plan(stage)
+    intent, intent_sha = erase_intent(stage, original, checksum)
+    integrity_raw = rpm.read(stage / INTEGRITY, rpm.MAX_XML)
+    if strict_json(integrity_raw) != integrity_plan(original, checksum):
+        refuse('original_integrity_plan_changed')
+    if (boot['plan_sha256'] != boot_ref['sha256'] or boot['boot_id'] != observed['boot_id']
+            or boot['authority_ref'] != authority_ref or boot['kernel'] != observed['kernel']
+            or boot['recovery_kernel'] != observed['recovery_kernel']
+            or boot['operation_sha256'] != observed['operation_sha256']
+            or len(boot['files']) != 1 or boot['files'][0]['path'] != kernel.GRUBENV
+            or boot['files'][0]['after'] != observed['grub_observed']):
+        refuse('qualified_boot_resume_changed')
+    token = uuid.uuid4().hex
+    value = {'schema': 1, 'kind': RESUME_KIND, 'sequence': 0, 'id': token, 'stage': str(stage),
+             'operation_sha256': original['operation_sha256'], 'boot_id': observed['boot_id'],
+             'retention_plan_sha256': checksum, 'authority_ref': authority_ref, 'boot_ref': boot_ref,
+             'previous_retention_plan': boot['previous_retention_plan'],
+             'original_integrity_sha256': rpm.sha(integrity_raw),
+             'original_preparation_sha256': intent['authorization']['aide_preparation_sha256'],
+             'erase_intent_sha256': intent_sha, 'authorization': authorization,
+             'removed': original['removed'],
+             'preserved': {key: value for key, value in original['preserved'].items() if key != kernel.GRUBENV},
+             'mutable_directories': original['mutable_directories'],
+             'files': [{'path': kernel.GRUBENV, 'before': original['preserved'][kernel.GRUBENV],
+                        'after': observed['grub_observed']}]}
+    value['manifest_sha256'] = digest(value)
+    name = 'kernel-retention-resume-' + token + '-plan.json'
+    kernel.record(stage, name, value)
+    reference = {'filename': name, 'sha256': rpm.sha(kernel.encode(value))}
+    load_resume(stage, reference, runner=runner)
+    kernel_boot.bind_retention_integrity(stage, boot_ref, reference, runner=runner)
+    # Publishing the pointer does not supersede the original erase sentinel.
+    atomic_json(pointer, reference)
+    return stage / name, value
+
+
+def load_resume(stage, reference, *, runner=run, historical=False):
+    from . import kernel_boot
+    stage = Path(stage)
+    value = _reference(stage, reference, RESUME_NAME)
+    exact(value, {'schema', 'kind', 'sequence', 'id', 'stage', 'operation_sha256', 'boot_id',
+                  'retention_plan_sha256', 'authority_ref', 'boot_ref', 'original_integrity_sha256',
+                  'previous_retention_plan',
+                  'original_preparation_sha256', 'erase_intent_sha256', 'authorization', 'removed',
+                  'preserved', 'mutable_directories', 'files', 'manifest_sha256'})
+    origin = resume_origin(stage, stage / reference['filename'])
+    original = origin['plan']
+    observed = validate_boot_authority(stage, value['authority_ref'], runner=runner, historical=historical)
+    boot = kernel_boot.validate_retention_resume(stage, value['boot_ref'], runner=runner, historical=historical)
+    _provisional(value['authorization'], stage, observed)
+    if (type(value['schema']) is not int or value['schema'] != 1 or value['kind'] != RESUME_KIND
+            or type(value['sequence']) is not int or value['sequence'] != 0
+            or reference['filename'] != 'kernel-retention-resume-' + value['id'] + '-plan.json'
+            or value['stage'] != str(stage) or value['operation_sha256'] != original['operation_sha256']
+            or value['boot_id'] != observed['boot_id'] or boot['boot_id'] != observed['boot_id']
+            or boot['plan_sha256'] != value['boot_ref']['sha256'] or boot['authority_ref'] != value['authority_ref']
+            or value['previous_retention_plan'] != boot['previous_retention_plan']
+            or boot['kernel'] != observed['kernel'] or boot['recovery_kernel'] != observed['recovery_kernel']
+            or boot['operation_sha256'] != observed['operation_sha256']
+            or len(boot['files']) != 1 or boot['files'][0]['path'] != kernel.GRUBENV
+            or boot['files'][0]['after'] != observed['grub_observed']
+            or value['removed'] != original['removed']
+            or value['preserved'] != {key: item for key, item in original['preserved'].items() if key != kernel.GRUBENV}
+            or value['mutable_directories'] != original['mutable_directories']
+            or value['files'] != [{'path': kernel.GRUBENV, 'before': original['preserved'][kernel.GRUBENV],
+                                   'after': observed['grub_observed']}]
+            or value['manifest_sha256'] != digest({key: item for key, item in value.items() if key != 'manifest_sha256'})):
+        refuse('compound_resume_scope_changed')
+    return value, reference['sha256']
+
+
+def resume_integrity_predecessor(stage, path):
+    """One exact ancestry edge, including planned generations never prepared."""
+    from . import kernel_boot
+    stage, path = Path(stage), Path(path)
+    raw = rpm.read(path, rpm.MAX_XML)
+    reference = {'filename': path.name, 'sha256': rpm.sha(raw)}
+    plan, _ = load_resume(stage, reference, historical=True)
+    kernel_boot.verify_retention_integrity_binding(stage, plan['boot_ref'], reference)
+    previous = plan['previous_retention_plan']
+    if previous is None:
+        origin = resume_origin(stage, path)
+        return origin['integrity'], origin['integrity_sha256']
+    prior, checksum = load_resume(stage, previous, historical=True)
+    kernel_boot.verify_retention_integrity_binding(stage, prior['boot_ref'], previous)
+    if (prior['id'] == plan['id'] or prior['boot_id'] == plan['boot_id']
+            or any(prior[key] != plan[key] for key in ('operation_sha256', 'retention_plan_sha256',
+                   'original_integrity_sha256', 'original_preparation_sha256', 'erase_intent_sha256'))):
+        refuse('resume_predecessor_changed')
+    return prior, checksum
+
+
+def bound_resume_integrity_plan(manager, stage, path, *, preparing):
+    from . import kernel_boot
+    identity = manager.guard()
+    stage, path = Path(stage), Path(path)
+    if stage.is_symlink() or stage.parent != identity.root / 'manager/os-updates' or path.parent != stage:
+        refuse('unowned_resume_integrity_stage')
+    raw = manager.reader(path, maximum=rpm.MAX_XML, private=True)
+    reference = {'filename': path.name, 'sha256': rpm.sha(raw)}
+    value, checksum = load_resume(stage, reference, runner=run)
+    kernel_boot.verify_retention_integrity_binding(stage, value['boot_ref'], reference)
+    latest = strict_json(rpm.read(identity.root / 'manager/os-latest.json', 65536))
+    journal = strict_json(rpm.read(identity.root / 'manager/os-transaction.json', 65536))
+    if (latest.get('stage') != str(stage) or journal.get('stage') != str(stage)
+            or journal.get('kernel_retention') not in {'pending', 'failed'}
+            or journal.get('state') not in {'complete', 'recovery_required', 'retaining', 'retention_postcheck', 'retention_recovery_required'}):
+        refuse('resume_integrity_operation_binding_changed')
+    return value, checksum
+
+
+def resume_integrity_snapshot(manager, plan, phase, retained=None):
+    if phase not in {'prepare', 'forward'}:
+        refuse('unsupported_resume_integrity_phase')
+    # Retain original authorized preimages through every CAS. A fresh scan
+    # observes the compound delta; it does not invent a clean preparation.
+    values = integrity_snapshot(manager, plan, 'forward',
+                                None if retained is None else {key: item for key, item in retained.items() if key != kernel.GRUBENV})
+    item = plan['files'][0]
+    if item['path'] != kernel.GRUBENV or kernel.describe(kernel.GRUBENV) != item['after']:
+        refuse('resume_environment_metadata_changed')
+    if retained is not None and retained.get(kernel.GRUBENV) != item['before']:
+        refuse('resume_environment_preimage_changed')
+    values[kernel.GRUBENV] = item['before']
+    return values
+
+
+def allowed_resume_integrity_report(report, plan, phase):
+    if phase not in {'prepare', 'forward'}:
+        refuse('unsupported_resume_integrity_phase')
+    allowed = {**plan, 'mutable_directories': [*plan['mutable_directories'], kernel.GRUBENV]}
+    allowed_integrity_report(report, allowed, 'forward')
+
+
+def validate_boot_completion(stage, boot_ref, compound_ref, *, runner=run, historical=False):
+    """Verify real published AIDE evidence; never accept a hash-shaped approval."""
+    from . import aide_updates, kernel_boot
+    stage = Path(stage)
+    result = _reference(stage, compound_ref, RESUME_RESULT)
+    exact(result, {'schema', 'status', 'plan', 'boot_ref', 'authority_ref', 'boot_id', 'kernel',
+                   'retention_plan_sha256', 'aide', 'release_accepted'})
+    plan, checksum = load_resume(stage, result['plan'], runner=runner, historical=historical)
+    kernel_boot.verify_retention_integrity_binding(stage, boot_ref, result['plan'])
+    observed = validate_boot_authority(stage, plan['authority_ref'], runner=runner, historical=historical)
+    if (type(result['schema']) is not int or result['schema'] != 1 or result['status'] != 'integrity_reconciled'
+            or result['release_accepted'] is not False or result['plan']['sha256'] != checksum
+            or compound_ref['filename'] != 'kernel-retention-resume-' + plan['id'] + '-result.json'
+            or result['boot_ref'] != boot_ref or result['boot_ref'] != plan['boot_ref']
+            or result['authority_ref'] != plan['authority_ref'] or result['boot_id'] != plan['boot_id']
+            or result['kernel'] != observed['kernel'] or result['retention_plan_sha256'] != plan['retention_plan_sha256']):
+        refuse('compound_integrity_result_changed')
+    aide_updates.retained_plan_acceptance(stage, stage / result['plan']['filename'],
+                                         expected=result['aide'], historical=historical)
+    return result

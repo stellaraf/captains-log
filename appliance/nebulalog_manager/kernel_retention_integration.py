@@ -134,7 +134,7 @@ def context(manager, stage):
     latest = strict_json(rpm.read(identity.root / 'manager/os-latest.json', 65536))
     journal = strict_json(rpm.read(identity.root / 'manager/os-transaction.json', 65536))
     if (latest.get('stage') != str(stage) or journal.get('stage') != str(stage)
-            or journal.get('state') not in {'complete', 'retaining', 'retention_postcheck', 'retention_recovery_required'}):
+            or journal.get('state') not in {'complete', 'recovery_required', 'retaining', 'retention_postcheck', 'retention_recovery_required'}):
         retain.refuse('retention_operation_changed')
     return identity, latest, journal
 
@@ -231,4 +231,120 @@ def retain_three(stage, *, accepted, runner=run):
                   'acceptance_sha256': approved['receipt_sha256'], 'integrity_sha256': integrity_sha,
                   'database_sha256': integrity['database_sha256'], 'retained_kernels': plan['retained_kernels']}
     kernel.record(stage, COMPLETE, completion)
+    return {'ok': True, **completion}
+
+
+def provisional_authorization(stage, checksum, *, authorize, manager):
+    """Reread actual backup ownership; this authority can never invoke RPM."""
+    from . import kernel_integrity
+    stage = Path(stage)
+    _, latest, journal = context(manager, stage)
+    value = authorize(stage, checksum)
+    original, original_sha = retain.load_historical_plan(stage)
+    observation = {'boot_id': retain.boot_id(), 'operation_sha256': original['operation_sha256'],
+                   'retention_plan_sha256': original_sha}
+    retain._provisional(value, stage, observation)
+    if checksum != original_sha or journal.get('kernel_retention') not in {'pending', 'failed'}:
+        retain.refuse('provisional_operation_changed')
+    expected = latest.get('recovery_backup_stage', str(stage))
+    if (journal.get('recovery_backup_stage', str(stage)) != expected or value['backup_stage'] != expected):
+        retain.refuse('provisional_backup_owner_changed')
+    backup = owned_directory(Path(expected), private=True)
+    if backup.parent != stage.parent or not STAGE.fullmatch(backup.name):
+        retain.refuse('provisional_backup_stage_changed')
+    actual = kernel_integrity.checked_backup(backup)
+    if value['backup_sha256'] != actual:
+        retain.refuse('provisional_backup_inventory_changed')
+    if backup != stage:
+        reference = strict_json(rpm.read(stage / 'recovery-backup-current.json', 8192))
+        exact(reference, {'filename', 'sha256'})
+        if (reference['filename'] != 'recovery-backup-' + backup.name + '.json'
+                or not kernel.SHA.fullmatch(str(reference['sha256']))):
+            retain.refuse('provisional_backup_reference_changed')
+        raw = rpm.read(stage / reference['filename'], 8192)
+        intent = strict_json(raw)
+        exact(intent, {'schema', 'owner_stage', 'boot_id', 'previous', 'backup', 'inventory_sha256'})
+        if (rpm.sha(raw) != reference['sha256'] or raw != kernel.encode(intent)
+                or type(intent['schema']) is not int or intent['schema'] != 1
+                or intent['owner_stage'] != str(stage) or intent['backup'] != str(backup)
+                or intent['inventory_sha256'] != actual or intent['boot_id'] != journal.get('boot_id')
+                or latest.get('boot_id') != journal.get('boot_id')
+                or Path(intent['previous']).parent != stage.parent or not STAGE.fullmatch(Path(intent['previous']).name)):
+            retain.refuse('provisional_backup_intent_changed')
+    return value
+
+
+def recover_later_boot(stage, *, authorize, runner=run):
+    """Reconcile an exact completed erase through AIDE and boot, never RPM.
+
+    Final runtime acceptance belongs to lifecycle. Call finish_later_boot only
+    after that owner has published a current immutable acceptance generation.
+    """
+    from . import aide, aide_updates, kernel_boot
+    require_linux_root()
+    stage = Path(stage)
+    manager = aide.Aide()
+    context(manager, stage)
+    original, checksum = retain.load_historical_plan(stage)
+    # The pure classifier refuses an unchanged or partial inventory once an
+    # erase intent exists. No recovery branch calls execute_cached/command.
+    retain.erase_intent(stage, original, checksum)
+    checked = lambda current, sha: provisional_authorization(current, sha, authorize=authorize, manager=manager)
+    checked(stage, checksum)
+    authority_ref = retain.observe_boot_authority(stage, runner=runner)
+    boot_path, boot_plan = kernel_boot.plan_retention_resume(stage, authority_ref, runner=runner)
+    boot_ref = {'filename': Path(boot_path).name, 'sha256': rpm.sha(kernel.encode(boot_plan))}
+    plan_path, plan = retain.prepare_resume(stage, authority_ref, boot_ref, authorize=checked, runner=runner)
+    plan_ref = {'filename': plan_path.name, 'sha256': rpm.sha(kernel.encode(plan))}
+    current = checked(stage, checksum)
+    kernel.record(stage, 'kernel-retention-resume-' + plan['id'] + '-authorization-' + digest(current) + '.json',
+                  {'schema': 1, 'plan': plan_ref, 'authorization': current})
+    kernel.record(stage, 'kernel-retention-resume-' + plan['id'] + '-intent.json',
+                  {'schema': 1, 'plan': plan_ref, 'authorization': plan['authorization']})
+    prepared = manager.authorized_update_prepare(stage, plan_path)
+    if prepared.get('ok') is not True or prepared.get('plan_sha256') != plan_ref['sha256']:
+        retain.refuse('compound_preparation_failed')
+    checked(stage, checksum)
+    retain.load_resume(stage, plan_ref, runner=runner)
+    accepted = manager.authorized_update_accept(stage, plan_path)
+    if (accepted.get('ok') is not True or accepted.get('direction') != 'forward'
+            or accepted.get('plan_sha256') != plan_ref['sha256']):
+        retain.refuse('compound_acceptance_failed')
+    proof = aide_updates.retained_plan_acceptance(stage, plan_path, manager=manager)
+    if proof['database_sha256'] != accepted.get('database_sha256') or proof['plan_sha256'] != plan_ref['sha256']:
+        retain.refuse('compound_published_evidence_changed')
+    checked(stage, checksum)
+    retain.load_resume(stage, plan_ref, runner=runner)
+    result = {'schema': 1, 'status': 'integrity_reconciled', 'plan': plan_ref, 'boot_ref': boot_ref,
+              'authority_ref': authority_ref, 'boot_id': plan['boot_id'], 'kernel': original['acceptance']['kernel'],
+              'retention_plan_sha256': checksum, 'aide': proof, 'release_accepted': False}
+    name = 'kernel-retention-resume-' + plan['id'] + '-result.json'
+    kernel.record(stage, name, result)
+    compound_ref = {'filename': name, 'sha256': rpm.sha(kernel.encode(result))}
+    retain.validate_boot_completion(stage, boot_ref, compound_ref, runner=runner)
+    boot = kernel_boot.complete_retention_resume(stage, boot_ref, compound_ref, runner=runner)
+    return {'ok': True, 'status': 'integrity_reconciled', 'compound_ref': compound_ref,
+            'boot': boot, 'release_accepted': False}
+
+
+def finish_later_boot(stage, compound_ref, *, accepted, runner=run):
+    """Append completion only after real fresh lifecycle acceptance and backup."""
+    require_linux_root()
+    stage = Path(stage)
+    result = retain._reference(stage, compound_ref, retain.RESUME_RESULT)
+    retain.validate_boot_completion(stage, result['boot_ref'], compound_ref, runner=runner)
+    approved = retain.acceptance(stage, accepted, runner)
+    value, acceptance_sha, _ = kernel.read_acceptance(stage)
+    original, checksum = retain.load_historical_plan(stage)
+    if (approved['boot_id'] != result['boot_id'] or approved['kernel'] != result['kernel']
+            or approved['recovery_kernel'] != original['acceptance']['recovery_kernel']
+            or value.get('retention_integrity_sha256') != compound_ref['sha256']
+            or checksum != result['retention_plan_sha256'] or acceptance_sha != approved['receipt_sha256']):
+        retain.refuse('resumed_final_acceptance_changed')
+    completion = {'schema': 1, 'status': 'complete', 'compound_ref': compound_ref,
+                  'original_plan_sha256': checksum, 'acceptance_sha256': acceptance_sha,
+                  'boot_id': result['boot_id'], 'database_sha256': result['aide']['database_sha256'],
+                  'retained_kernels': original['retained_kernels']}
+    token = retain.RESUME_RESULT.fullmatch(compound_ref['filename'])[1]
+    kernel.record(stage, 'kernel-retention-resume-' + token + '-complete.json', completion)
     return {'ok': True, **completion}

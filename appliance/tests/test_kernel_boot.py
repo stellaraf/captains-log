@@ -1,5 +1,6 @@
 """Private-file boot transaction tests; these do not qualify a native reboot."""
 import copy
+import base64
 import json
 from pathlib import Path
 import tempfile
@@ -566,6 +567,181 @@ class BootTransactionTests(unittest.TestCase):
         self.call(boot.commit_candidate, health=self.health())
         self.assertEqual(boot.accepted_transitions(self.stage, runner=self.runner)['boot_id'], self.boot_id)
         self.assertFalse(boot._result_path(self.stage, unexecuted).exists())
+
+    def retention_fixture(self):
+        """Inject retention provenance at its boundary, not boot/inventory logic.
+
+        Retention's RPM/signature fixtures live in its own suite. These tests use
+        the real shared inventory resolver and real compound completion reader;
+        the AIDE chain fixture below supplies that independent boundary only.
+        """
+        from nebulalog_manager import kernel_retention as retention, aide_updates
+        self.promote()
+        self.initial_acceptance = boot.accepted_transitions(self.stage, runner=self.runner)
+        self.next_candidate_boot('cccccccc-cccc-cccc-cccc-cccccccccccc')
+        self.live_inventory = ['retained-exact']
+        self.retention_authorities = {}
+        original_read_text = Path.read_text
+        def read_text(path, *args, **kwargs):
+            if str(path) == '/proc/sys/kernel/random/boot_id':
+                return self.boot_id
+            return original_read_text(path, *args, **kwargs)
+        def authority(stage, reference, *, historical=False, **kwargs):
+            self.assertEqual(stage, self.stage)
+            boot.exact(reference, {'filename', 'sha256'})
+            path = self.stage / reference['filename']
+            if path.parent != self.stage or not path.is_file() or boot.rpm.sha(path.read_bytes()) != reference['sha256']:
+                raise Refused('fixture_retention_authority_changed')
+            value = json.loads(path.read_bytes())
+            if value != self.retention_authorities.get(value['boot_id']):
+                raise Refused('fixture_retention_authority_changed')
+            if not historical and value['boot_id'] != self.boot_id:
+                raise Refused('fixture_retention_authority_stale')
+            return value
+        def compound(stage, reference, **kwargs):
+            path = self.stage / reference['filename']
+            value = json.loads(path.read_bytes())
+            if boot.rpm.sha(path.read_bytes()) != reference['sha256']:
+                raise Refused('fixture_compound_plan_changed')
+            return value, reference['sha256']
+        self.aide_chain = Mock(return_value={'published': True})
+        for context in (patch.object(boot.kernel, 'load_plan', return_value=(self.candidate, PLAN_SHA)),
+                        patch.object(Path, 'read_text', new=read_text),
+                        patch.object(boot.rpm, 'inventory', side_effect=lambda runner: ('', [], list(self.live_inventory))),
+                        patch.object(retention, 'validate_boot_authority', side_effect=authority),
+                        patch.object(retention, 'load_resume', side_effect=compound),
+                        patch.object(aide_updates, 'retained_plan_acceptance', self.aide_chain)):
+            context.start()
+            self.addCleanup(context.stop)
+        return self.observe_retention()
+
+    def observe_retention(self, **changes):
+        value = {'schema': 1, 'stage': str(self.stage), 'operation_sha256': boot._operation_sha(self.stage),
+                 'candidate_plan_sha256': PLAN_SHA,
+                 'installed_sha256': boot.rpm.sha((self.stage / 'kernel-installed.json').read_bytes()),
+                 'boot_id': self.boot_id, 'kernel': NEW, 'recovery_kernel': OLD,
+                 'retention_plan_sha256': 'e' * 64, 'after_inventory': ['retained-exact'],
+                 'grub_observed': self.description(self.env),
+                 'grub_observed_raw': base64.b64encode(self.env.read_bytes()).decode(), **changes}
+        self.retention_authorities[self.boot_id] = value
+        name = 'kernel-retention-observation-' + self.boot_id + '.json'
+        (self.stage / name).write_bytes(boot.kernel.encode(value))
+        return {'filename': name, 'sha256': boot.rpm.sha(boot.kernel.encode(value))}
+
+    def compound_fixture(self, plan):
+        """Retain a distinct compound plan/result and bind the actual boot ref."""
+        token = plan['id']
+        boot_ref = boot._plan_reference(plan)
+        compound = {'id': token, 'boot_ref': boot_ref, 'authority_ref': plan['retention_authority'],
+                    'boot_id': plan['boot_id'], 'retention_plan_sha256': 'e' * 64}
+        name = 'kernel-retention-resume-' + token + '-plan.json'
+        (self.stage / name).write_bytes(boot.kernel.encode(compound))
+        reference = {'filename': name, 'sha256': boot.rpm.sha(boot.kernel.encode(compound))}
+        boot.bind_retention_integrity(self.stage, boot_ref, reference, runner=self.runner)
+        result = {'schema': 1, 'status': 'integrity_reconciled', 'plan': reference, 'boot_ref': boot_ref,
+                  'authority_ref': plan['retention_authority'], 'boot_id': plan['boot_id'], 'kernel': NEW,
+                  'retention_plan_sha256': 'e' * 64, 'aide': {'entry': {'id': 'synthetic', 'sha256': 'e' * 64}},
+                  'release_accepted': False}
+        name = 'kernel-retention-resume-' + token + '-result.json'
+        (self.stage / name).write_bytes(boot.kernel.encode(result))
+        return {'filename': name, 'sha256': boot.rpm.sha(boot.kernel.encode(result))}, reference
+
+    def test_retention_requires_explicit_authority_and_keeps_original_inventory_strict(self):
+        authority = self.retention_fixture()
+        with self.assertRaisesRegex(Refused, 'package_inventory_changed'):
+            self.call(boot.verify_postboot)
+        with self.assertRaises(Refused):
+            boot.plan_retention_resume(self.stage, {'after_inventory': self.live_inventory}, runner=self.runner)
+        with self.assertRaisesRegex(Refused, 'authority_changed'):
+            boot.plan_retention_resume(self.stage, {**authority, 'sha256': 'f' * 64}, runner=self.runner)
+        self.live_inventory.append('unrelated-extra-package')
+        with self.assertRaisesRegex(Refused, 'package_inventory_changed'):
+            boot.plan_retention_resume(self.stage, authority, runner=self.runner)
+        self.assertEqual(boot._current(self.stage)[1]['phase'], 'commit')
+
+    def test_retention_authority_cannot_rebind_candidate_or_observed_grub(self):
+        self.retention_fixture()
+        for change in ({'candidate_plan_sha256': 'f' * 64}, {'operation_sha256': 'f' * 64},
+                       {'installed_sha256': 'f' * 64}, {'grub_observed_raw': base64.b64encode(block(variables())).decode()}):
+            with self.subTest(change=change):
+                authority = self.observe_retention(**change)
+                with self.assertRaises(Refused):
+                    boot.plan_retention_resume(self.stage, authority, runner=self.runner)
+                self.assertEqual(boot._current(self.stage)[1]['phase'], 'commit')
+
+    def test_retention_observation_never_accepts_a_boot_only_integrity_delta(self):
+        authority = self.retention_fixture()
+        calls, raw = self.prepare.call_count, self.env.read_bytes()
+        path, plan = boot.plan_retention_resume(self.stage, authority, runner=self.runner)
+        self.assertEqual(boot.plan_retention_resume(self.stage, authority, runner=self.runner), (path, plan))
+        self.assertFalse(boot._result_path(self.stage, plan).exists())
+        self.assertEqual(self.prepare.call_count, calls)
+        self.assertEqual(self.env.read_bytes(), raw)
+        for function in (boot.verify_postboot, boot.resume_candidate):
+            with self.subTest(function=function), self.assertRaises(Refused): self.call(function)
+        for phase in ('prepare', 'forward'):
+            with self.assertRaisesRegex(Refused, 'compound_integrity_plan_required'):
+                boot.allowed_integrity_report({}, plan, phase)
+            with self.assertRaisesRegex(Refused, 'compound_integrity_plan_required'):
+                boot.integrity_snapshot(None, plan, phase)
+
+    def test_compound_completion_requires_real_chain_and_keeps_original_proof_hashes(self):
+        authority = self.retention_fixture()
+        _, plan = boot.plan_retention_resume(self.stage, authority, runner=self.runner)
+        reference, compound = self.compound_fixture(plan)
+        boot_ref = boot._plan_reference(plan)
+        self.aide_chain.side_effect = Refused('fixture_missing_published_aide_entry')
+        with self.assertRaisesRegex(Refused, 'published_aide_entry'):
+            boot.complete_retention_resume(self.stage, boot_ref, reference, runner=self.runner)
+        self.assertFalse(boot._result_path(self.stage, plan).exists())
+        self.aide_chain.side_effect = None
+        result = boot.complete_retention_resume(self.stage, boot_ref, reference, runner=self.runner)
+        self.assertNotIn('aide', result)
+        self.assertEqual(result['retention_integrity'], reference)
+        self.assertEqual(boot.complete_retention_resume(self.stage, boot_ref, reference, runner=self.runner), result)
+        current = boot.accepted_transitions(self.stage, runner=self.runner)
+        self.assertEqual(current['retention_integrity_sha256'], reference['sha256'])
+        for key in ('postboot_sha256', 'promotion_sha256', 'kernel_plan_sha256', 'installed_sha256'):
+            self.assertEqual(current[key], self.initial_acceptance[key])
+        self.assertEqual(current['boot_id'], self.boot_id)
+        self.assertEqual(boot.read_retention_integrity_binding(self.stage, boot_ref), compound)
+        self.assertEqual(self.call(boot.commit_candidate, health=self.health()), result)
+
+    def test_later_boot_binds_prior_compound_even_before_boot_result(self):
+        authority = self.retention_fixture()
+        _, first = boot.plan_retention_resume(self.stage, authority, runner=self.runner)
+        _, compound = self.compound_fixture(first)
+        self.assertFalse(boot._result_path(self.stage, first).exists())
+        self.next_candidate_boot('dddddddd-dddd-dddd-dddd-dddddddddddd')
+        next_authority = self.observe_retention()
+        _, second = boot.plan_retention_resume(self.stage, next_authority, runner=self.runner)
+        self.assertEqual(second['previous_retention_plan'], compound)
+        proof = boot.validate_retention_resume(self.stage, boot._plan_reference(second), runner=self.runner)
+        self.assertEqual(proof['previous_retention_plan'], compound)
+        self.assertFalse(boot._result_path(self.stage, first).exists())
+
+    def test_unlinked_retention_observation_is_retained_without_inventing_compound_work(self):
+        authority = self.retention_fixture()
+        _, first = boot.plan_retention_resume(self.stage, authority, runner=self.runner)
+        self.next_candidate_boot('dddddddd-dddd-dddd-dddd-dddddddddddd')
+        _, second = boot.plan_retention_resume(self.stage, self.observe_retention(), runner=self.runner)
+        self.assertEqual(second['previous']['id'], first['id'])
+        self.assertIsNone(second['previous_retention_plan'])
+        self.assertFalse(boot._result_path(self.stage, first).exists())
+
+    def test_compound_result_or_environment_drift_refuses_final_proof(self):
+        authority = self.retention_fixture()
+        _, plan = boot.plan_retention_resume(self.stage, authority, runner=self.runner)
+        reference, _ = self.compound_fixture(plan)
+        boot.complete_retention_resume(self.stage, boot._plan_reference(plan), reference, runner=self.runner)
+        self.env.write_bytes(block({**boot.parse_environment(self.env.read_bytes()), 'unexpected': '1'}))
+        with self.assertRaises(Refused): boot.accepted_transitions(self.stage, runner=self.runner)
+        self.env.write_bytes(base64.b64decode(plan['after_raw']))
+        path = self.stage / reference['filename']
+        result = json.loads(path.read_bytes());result['aide'] = {'ok': True}
+        path.write_bytes(boot.kernel.encode(result))
+        with self.assertRaisesRegex(Refused, 'compound_integrity_reference_changed'):
+            boot.accepted_transitions(self.stage, runner=self.runner)
 
 
 if __name__ == '__main__':

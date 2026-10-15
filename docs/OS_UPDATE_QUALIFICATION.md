@@ -35,6 +35,16 @@ The recipe permits a fourth complete kernel set temporarily; another kernel
 installation is refused until accepted retention returns the inventory to three.
 Mixed kernel and unrelated package transactions remain unsupported.
 
+The temporary kernel-default protection setting is published by an atomic,
+same-directory replacement with exact owner, mode, ACL/xattr and SELinux
+metadata. Immutable preimages, postimages and temporary-file identities bind
+interruption recovery. A separate durable RPM-command sentinel distinguishes a
+new schema-2 operation that never started RPM from an attempted command. Only
+the former can perform its first execution after recovery; sentinel-present,
+partial-inventory and legacy ambiguous operations remain held. Focused tests
+exercise failures before and after replacement, changed identities and the
+once-only execution boundary. Native interruption acceptance remains pending.
+
 Before requesting a reboot, lifecycle verifies the retained backup, local
 authentication and the intended candidate initramfs's encrypted-storage unlock
 configuration. It stops services, syncs storage and arms one boot of the new
@@ -62,6 +72,31 @@ An erase intent is never replayed automatically. Missing provenance and partial
 erasure retain maintenance and recovery evidence. A refreshed backup keeps the
 original operation's maintenance gate active and publishes an immutable intent
 before updating its two journal references.
+
+A later boot after an exactly completed erase now has a separate recovery
+path. It revalidates the signed retained plan, exact remaining inventory,
+protected kernels and qualified GRUB transition. A compound AIDE plan allows
+only the original deletions, their permitted parent-directory metadata changes
+and the measured GRUB environment change. Its authority links the original
+erase intent and preparation, current backup and immutable boot-plan ancestry.
+Recovery can retain a database already copied before interruption; it never
+copies an unpublished historical database or reruns RPM. Fresh full scans must
+pass before a new acceptance is published. A second reboot traverses only that
+explicit ancestry, including an intermediate plan that was never prepared.
+
+The optional `retention_integrity_sha256` acceptance field binds the published
+compound AIDE evidence. Older immutable acceptances retain their original bytes
+and provide no such authority. Runtime checks, final current-boot acceptance,
+retention completion and another runtime postcheck precede maintenance release.
+Kernel acceptance records establish the verified kernel and runtime checks;
+they do not establish appliance-wide finalization. The operation journal and
+maintenance gate remain pending until retention and its postcheck complete,
+including when a crash leaves a new kernel acceptance already published.
+Source tests cover the real AIDE report/database chain and lifecycle ordering;
+native interrupted-erase recovery remains unqualified. A retained plan with no
+erase intent from an earlier boot requires a new execution-generation workflow,
+which is not yet implemented. An attempted but unchanged or partial inventory
+remains held rather than automatically repeating the erase.
 
 Factory builds now capture the exact installed four-package kernel set, its
 signed RPM bytes and installed inventory. Sealing and initial AIDE enrollment
@@ -94,15 +129,17 @@ The following cases remain explicit qualification or implementation gaps:
 
 - Interruption between the GRUB temporary-file creation and replacement, and
   the complete candidate-kernel boot/promotion path on a configured appliance.
-- A later boot during retention, including partially erased packages and an
-  earlier acceptance generation.
+- Native qualification of later-boot exact-erasure recovery and its earlier
+  acceptance generations; supported recovery for partial erasure and an
+  unattempted plan from an earlier boot remains unfinished.
 - A late vendor boot-success timer change after a measured phase snapshot.
 - Ordinary-reboot integrity reconciliation before the first kernel update and
   after a fully completed update/retention. The current reboot-completion path
   returns `not_pending` in these states, while the AIDE policy still monitors
   GRUB environment changes. No separate ordinary-boot transition currently
   accepts legitimate flag changes into the retained integrity chain.
-- Power loss while writing the temporary kernel-default protection setting.
+- Native interruption qualification of atomic kernel-default protection and
+  its once-only RPM-command boundary.
 - Retry or rollback of an unaccepted candidate after a verified fallback boot.
   That state is reported as `kernel_recovery_required` with retry held; it must
   not become an endless automatic reboot loop or a successful-update claim.

@@ -411,3 +411,115 @@ class KernelLifecycleTests(TestCase):
         self.assertEqual(result["status"], "complete")
         self.boot["verify_postboot"].assert_not_called()
         self.boot["commit_candidate"].assert_not_called()
+
+    def later_retention_fixture(self):
+        stage, latest, transaction = self.retention_fixture()
+        old_path = self.acceptance_path(stage)
+        self.original_acceptance = (old_path, old_path.read_bytes())
+        self.old_acceptance_sha = hashlib.sha256(old_path.read_bytes()).hexdigest()
+        self.manager.boot_id.return_value = 'cccccccc-cccc-cccc-cccc-cccccccccccc'
+        self.proof = {**self.proof, 'boot_id': self.manager.boot_id(),
+                      'resume_sha256': 'd' * 64, 'retention_integrity_sha256': 'e' * 64}
+        self.boot['accepted_transitions'].return_value = self.proof
+        self.calls.clear()
+        self.manager.health.reset_mock()
+        from nebulalog_manager import kernel_retention as retain
+        (stage / retain.PLAN).write_text('{}')
+        (stage / retain.INTENT).write_text('{}')
+        original = {'boot_id': 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'operation_sha256': '1' * 64}
+        self.recovered = {'ok': True, 'status': 'integrity_reconciled', 'release_accepted': False,
+                          'compound_ref': {'filename': 'kernel-retention-resume-' + 'c' * 32 + '-result.json',
+                                           'sha256': 'e' * 64}}
+        def recover(directory, *, authorize, runner):
+            self.assertEqual(directory, stage)
+            value = authorize(directory, 'a' * 64)
+            self.assertEqual(value['boot_id'], self.manager.boot_id())
+            self.assertEqual(value['operation_sha256'], original['operation_sha256'])
+            self.assertEqual(value['retention_plan_sha256'], 'a' * 64)
+            self.assertEqual(value['backup_stage'], str(stage))
+            self.calls.append('reconcile')
+            return self.recovered
+        def finish(directory, reference, *, accepted, runner):
+            self.assertEqual(reference, self.recovered['compound_ref'])
+            approved = accepted(directory)
+            self.assertEqual(approved['boot_id'], self.manager.boot_id())
+            self.assertTrue(self.acceptance_path(stage).exists())
+            self.calls.append('finish')
+            return {'ok': True, 'status': 'complete'}
+        for name, kwargs in (
+            ('kernel_retention.load_historical_plan', {'return_value': (original, 'a' * 64)}),
+            ('kernel_retention_integration.recover_later_boot', {'side_effect': recover}),
+            ('kernel_retention_integration.finish_later_boot', {'side_effect': finish}),
+            ('kernel_integrity.retain_three', {'side_effect': AssertionError('must never replay erase')}),
+        ):
+            context = patch('nebulalog_adapters.lifecycle.' + name, **kwargs)
+            mock = context.start(); self.addCleanup(context.stop)
+            if name.endswith('recover_later_boot'): self.recover_later = mock
+            if name.endswith('finish_later_boot'): self.finish_later = mock
+        return stage
+
+    def test_later_boot_retention_reconciles_before_health_acceptance_and_gate_release(self):
+        stage = self.later_retention_fixture()
+        def gate(active, directory):
+            if not active:
+                journal = json.loads((self.root / 'manager/os-transaction.json').read_text())
+                self.assertEqual(journal['kernel_retention'], 'pending')
+                self.assertEqual(journal['kernel_finalization'], 'complete')
+                self.calls.append('release-gate')
+        self.manager.maintenance.side_effect = gate
+        self.assertEqual(self.manager.reboot_complete()['status'], 'complete')
+        self.assertEqual(self.calls, ['reconcile', 'health', 'clear-pending', 'health', 'finish', 'health', 'release-gate'])
+        accepted, _, _ = self.read_acceptance(stage)
+        self.assertEqual(accepted['previous_acceptance_sha256'], self.old_acceptance_sha)
+        self.assertEqual(accepted['retention_integrity_sha256'], 'e' * 64)
+        self.assertEqual(self.original_acceptance[0].read_bytes(), self.original_acceptance[1])
+        self.boot['verify_postboot'].assert_not_called()
+        self.boot['commit_candidate'].assert_not_called()
+
+    def test_later_boot_failed_health_never_finalizes_or_releases_maintenance(self):
+        stage = self.later_retention_fixture()
+        self.manager.health.side_effect = None
+        self.manager.health.return_value = {'ok': True, 'checks': {name: name != 'ingestion' for name in REQUIRED_CHECKS}}
+        with self.assertRaisesRegex(Refused, 'Later-boot kernel retention'):
+            self.manager.reboot_complete()
+        self.finish_later.assert_not_called()
+        self.assertFalse(self.acceptance_path(stage).exists())
+        self.assertTrue(all(call.args == (True, stage) for call in self.manager.maintenance.call_args_list))
+
+    def test_later_boot_final_receipt_retry_does_not_fall_back_to_same_boot_erase(self):
+        stage = self.later_retention_fixture()
+        finish = self.finish_later.side_effect
+        self.finish_later.side_effect = OSError('power loss before completion receipt')
+        with self.assertRaises(Refused): self.manager.reboot_complete()
+        new_bytes = self.acceptance_path(stage).read_bytes()
+        self.finish_later.side_effect = finish
+        self.assertEqual(self.manager.reboot_complete()['status'], 'complete')
+        self.assertEqual(self.acceptance_path(stage).read_bytes(), new_bytes)
+        self.assertEqual(self.original_acceptance[0].read_bytes(), self.original_acceptance[1])
+        self.assertEqual(self.recover_later.call_count, 2)
+
+    def test_later_boot_reconciliation_cannot_claim_release_acceptance(self):
+        stage = self.later_retention_fixture()
+        self.recovered['release_accepted'] = True
+        with self.assertRaises(Refused): self.manager.reboot_complete()
+        self.manager.health.assert_not_called()
+        self.finish_later.assert_not_called()
+        self.assertFalse(self.acceptance_path(stage).exists())
+
+    def test_unattempted_old_boot_retention_plan_is_held_without_erase_or_recovery(self):
+        stage = self.later_retention_fixture()
+        from nebulalog_manager import kernel_retention as retain
+        (stage / retain.INTENT).unlink()
+        with self.assertRaisesRegex(Refused, 'Later-boot kernel retention') as caught:
+            self.manager.reboot_complete()
+        self.assertIn('new execution generation', str(caught.exception.__cause__))
+        self.recover_later.assert_not_called()
+        self.finish_later.assert_not_called()
+        self.assertTrue(all(call.args == (True, stage) for call in self.manager.maintenance.call_args_list))
+
+    def test_legacy_current_acceptance_preserves_its_missing_optional_field(self):
+        stage, _, _ = self.retention_fixture()
+        previous = self.acceptance_path(stage).read_bytes()
+        self.boot['accepted_transitions'].return_value = {**self.proof, 'retention_integrity_sha256': None}
+        self.manager._kernel_finalize(stage, {name: True for name in REQUIRED_CHECKS})
+        self.assertEqual(self.acceptance_path(stage).read_bytes(), previous)

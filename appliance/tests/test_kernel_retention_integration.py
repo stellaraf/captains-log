@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from nebulalog_manager import aide, aide_updates, kernel_integrity
+from nebulalog_manager import kernel_boot
 from nebulalog_manager import kernel_retention_integration as integration
 from nebulalog_manager.common import Refused
 from test_kernel_retention import headers, projection, VERSIONS, OLDEST, CURRENT, RECOVERY, BOOT, SHA
@@ -29,6 +30,169 @@ class Fixtures(unittest.TestCase):
 
     def write(self, path, value):
         Path(path).write_bytes(integration.kernel.encode(value))
+
+
+class ProvisionalRecoveryTests(Fixtures):
+    def setUp(self):
+        super().setUp()
+        self.manager = Mock()
+        self.latest = {'stage': str(self.stage), 'boot_id': BOOT}
+        self.journal = {**self.latest, 'state': 'complete', 'kernel_retention': 'pending'}
+        self.patch(integration, 'context', side_effect=lambda *args: (None, self.latest, self.journal))
+        self.patch(integration, 'owned_directory', side_effect=lambda path, **kw: path)
+        self.patch(integration.retain, 'load_historical_plan', return_value=({'operation_sha256': SHA}, 'b' * 64))
+        self.patch(integration.retain, 'boot_id', return_value='bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb')
+        self.backup = self.patch(kernel_integrity, 'checked_backup', return_value='c' * 64)
+        self.value = {'ok': True, 'stage': str(self.stage), 'boot_id': integration.retain.boot_id(),
+                      'backup_stage': str(self.stage), 'backup_sha256': 'c' * 64,
+                      'operation_sha256': SHA, 'retention_plan_sha256': 'b' * 64}
+        self.authorize = Mock(return_value=self.value)
+
+    def check(self):
+        return integration.provisional_authorization(self.stage, 'b' * 64,
+                                                       authorize=self.authorize, manager=self.manager)
+
+    def test_original_backup_is_reverified_not_trusted_from_callback(self):
+        self.assertEqual(self.check(), self.value)
+        self.backup.assert_called_once_with(self.stage)
+        self.backup.return_value = 'd' * 64
+        with self.assertRaisesRegex(Refused, 'backup_inventory'): self.check()
+
+    def test_wrong_boot_operation_owner_pending_state_or_backup_refuses(self):
+        original = copy.deepcopy(self.value)
+        for changed in ({'boot_id': BOOT}, {'stage': '/foreign'}, {'ok': False},
+                        {'operation_sha256': 'd' * 64}, {'retention_plan_sha256': 'd' * 64},
+                        {'backup_stage': str(self.stage.parent / ('2' * 32))}):
+            self.authorize.return_value = {**original, **changed}
+            with self.subTest(changed=changed), self.assertRaises(Refused): self.check()
+        self.authorize.return_value = original
+        self.journal['kernel_retention'] = 'complete'
+        with self.assertRaisesRegex(Refused, 'operation_changed'): self.check()
+
+    def test_refreshed_backup_requires_exact_immutable_two_journal_intent(self):
+        backup = self.root / ('2' * 32); backup.mkdir()
+        self.value['backup_stage'] = str(backup)
+        self.latest['recovery_backup_stage'] = str(backup)
+        self.journal['recovery_backup_stage'] = str(backup)
+        intent = {'schema': 1, 'owner_stage': str(self.stage), 'boot_id': BOOT,
+                  'previous': str(self.stage), 'backup': str(backup), 'inventory_sha256': 'c' * 64}
+        path = self.stage / ('recovery-backup-' + backup.name + '.json'); self.write(path, intent)
+        reference = {'filename': path.name, 'sha256': integration.rpm.sha(path.read_bytes())}
+        self.write(self.stage / 'recovery-backup-current.json', reference)
+        self.assertEqual(self.check(), self.value)
+        self.journal['recovery_backup_stage'] = str(self.stage)
+        with self.assertRaisesRegex(Refused, 'owner_changed'): self.check()
+        self.journal['recovery_backup_stage'] = str(backup)
+        intent['owner_stage'] = str(backup); self.write(path, intent)
+        reference['sha256'] = integration.rpm.sha(path.read_bytes())
+        self.write(self.stage / 'recovery-backup-current.json', reference)
+        with self.assertRaisesRegex(Refused, 'intent_changed'): self.check()
+
+
+class LaterBootOrchestrationTests(Fixtures):
+    def setUp(self):
+        super().setUp()
+        self.manager = Mock()
+        self.patch(aide, 'Aide', return_value=self.manager)
+        self.patch(integration, 'require_linux_root')
+        self.patch(integration, 'context', return_value=(None, {}, {}))
+        self.current_boot = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+        self.original = {'acceptance': projection(), 'retained_kernels': VERSIONS[1:]}
+        self.patch(integration.retain, 'load_historical_plan', return_value=(self.original, SHA))
+        self.patch(integration.retain, 'erase_intent')
+        self.authorization = {'ok': True, 'stage': str(self.stage), 'boot_id': self.current_boot,
+                              'backup_stage': str(self.stage), 'backup_sha256': '3' * 64,
+                              'operation_sha256': '4' * 64, 'retention_plan_sha256': SHA}
+        self.checked = self.patch(integration, 'provisional_authorization', return_value=self.authorization)
+        self.authority = {'filename': 'observation.json', 'sha256': 'b' * 64}
+        self.observer = self.patch(integration.retain, 'observe_boot_authority', return_value=self.authority)
+        self.boot_path = self.stage / ('kernel-boot-' + '5' * 32 + '-plan.json')
+        self.boot_plan = {'boot_id': self.current_boot}
+        self.boot_ref = {'filename': self.boot_path.name, 'sha256': integration.rpm.sha(integration.kernel.encode(self.boot_plan))}
+        self.boot_prepare = self.patch(kernel_boot, 'plan_retention_resume', create=True,
+                                       return_value=(self.boot_path, self.boot_plan))
+        self.plan = {'id': '6' * 32, 'boot_id': self.current_boot, 'authorization': self.authorization}
+        self.path = self.stage / ('kernel-retention-resume-' + self.plan['id'] + '-plan.json')
+        self.write(self.path, self.plan)
+        self.plan_ref = {'filename': self.path.name, 'sha256': integration.rpm.sha(self.path.read_bytes())}
+        self.patch(integration.retain, 'prepare_resume', return_value=(self.path, self.plan))
+        self.patch(integration.retain, 'load_resume', return_value=(self.plan, self.plan_ref['sha256']))
+        self.complete_validator = self.patch(integration.retain, 'validate_boot_completion')
+        self.boot_complete = self.patch(kernel_boot, 'complete_retention_resume', create=True,
+                                        return_value={'outcome': 'candidate'})
+        self.proof = {'entry': {'id': '7', 'sha256': '7' * 64}, 'original_enrollment_sha256': '8' * 64,
+                      'plan_sha256': self.plan_ref['sha256'], 'prepared_sha256': '9' * 64, 'database_sha256': 'd' * 64}
+        self.prove = self.patch(aide_updates, 'retained_plan_acceptance', create=True, return_value=self.proof)
+        self.manager.authorized_update_prepare.return_value = {'ok': True, 'plan_sha256': self.plan_ref['sha256']}
+        self.manager.authorized_update_accept.return_value = {'ok': True, 'direction': 'forward',
+            'plan_sha256': self.plan_ref['sha256'], 'database_sha256': self.proof['database_sha256']}
+        self.events = []
+        self.records = {}
+        def record(stage, name, value):
+            if name in self.records and self.records[name] != value: raise Refused('immutable changed')
+            self.events.append(name); self.records[name] = copy.deepcopy(value); self.write(stage / name, value)
+        self.patch(integration.kernel, 'record', side_effect=record)
+        self.runner = Mock(side_effect=AssertionError('Recovery must not execute an RPM command'))
+        self.authorize = Mock()
+
+    def recover(self):
+        return integration.recover_later_boot(self.stage, authorize=self.authorize, runner=self.runner)
+
+    def test_aide_acceptance_precedes_boot_result_and_never_claims_final_acceptance(self):
+        def boot_complete(*args, **kw):
+            self.manager.authorized_update_accept.assert_called_once()
+            self.prove.assert_called_once()
+            self.assertTrue(any(name.endswith('-result.json') for name in self.events))
+            return {'outcome': 'candidate'}
+        self.boot_complete.side_effect = boot_complete
+        result = self.recover()
+        self.assertFalse(result['release_accepted'])
+        self.assertEqual(result['status'], 'integrity_reconciled')
+        self.assertNotIn(integration.COMPLETE, self.records)
+        self.runner.assert_not_called()
+
+    def test_ambiguous_or_partial_erasure_never_reaches_aide_or_boot_planning(self):
+        self.observer.side_effect = Refused('partial_erase')
+        with self.assertRaisesRegex(Refused, 'partial_erase'): self.recover()
+        self.boot_prepare.assert_not_called()
+        self.manager.authorized_update_prepare.assert_not_called()
+        self.boot_complete.assert_not_called()
+        self.runner.assert_not_called()
+
+    def test_rejected_or_unpublished_aide_result_keeps_evidence_without_boot_acceptance(self):
+        self.manager.authorized_update_accept.return_value['ok'] = False
+        with self.assertRaisesRegex(Refused, 'compound_acceptance'): self.recover()
+        self.boot_complete.assert_not_called()
+        self.assertTrue(any(name.endswith('-intent.json') for name in self.events))
+        self.assertFalse(any(name.endswith('-result.json') for name in self.events))
+        self.manager.authorized_update_accept.return_value['ok'] = True
+        self.prove.side_effect = Refused('no published chain')
+        with self.assertRaisesRegex(Refused, 'published chain'): self.recover()
+        self.boot_complete.assert_not_called()
+
+    def test_retry_with_new_backup_keeps_original_plan_intent_and_result(self):
+        first = self.recover()
+        original = copy.deepcopy(self.records)
+        self.checked.return_value = {**self.authorization, 'backup_sha256': 'f' * 64}
+        second = self.recover()
+        self.assertEqual(first, second)
+        for name, value in original.items(): self.assertEqual(self.records[name], value)
+        self.assertEqual(len([name for name in self.records if '-authorization-' in name]), 2)
+        self.runner.assert_not_called()
+
+    def test_final_completion_requires_fresh_acceptance_bound_to_this_compound_result(self):
+        result = self.recover()
+        approved = {**projection(), 'boot_id': self.current_boot}
+        self.patch(integration.retain, 'acceptance', return_value=approved)
+        value = {'retention_integrity_sha256': result['compound_ref']['sha256']}
+        self.patch(integration.kernel, 'read_acceptance', return_value=(value, approved['receipt_sha256'], 'generation.json'))
+        completion = integration.finish_later_boot(self.stage, result['compound_ref'], accepted=Mock(), runner=self.runner)
+        self.assertEqual(completion['status'], 'complete')
+        self.assertEqual(completion['retained_kernels'], VERSIONS[1:])
+        value['retention_integrity_sha256'] = None
+        with self.assertRaisesRegex(Refused, 'final_acceptance'):
+            integration.finish_later_boot(self.stage, result['compound_ref'], accepted=Mock(), runner=self.runner)
+
 
 
 class InventoryTests(unittest.TestCase):

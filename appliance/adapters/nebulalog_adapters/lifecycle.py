@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 from urllib.request import build_opener, HTTPSHandler, ProxyHandler, Request
 import uuid
 
-from nebulalog_manager import aide, kernel_boot, kernel_integrity, kernel_updates, os_payload
+from nebulalog_manager import aide, kernel_boot, kernel_integrity, kernel_retention, kernel_retention_integration, kernel_updates, os_payload
 from nebulalog_manager.backup import _encrypted_staging
 from nebulalog_manager.baseline import Baseline, _json as baseline_json, rule_results
 from nebulalog_manager.common import CommandFailed, Refused, atomic_json, audit, locked, require_linux_root, trusted_file
@@ -999,6 +999,10 @@ class Lifecycle:
         if os.path.lexists(pointer):
             retained, previous, _ = kernel_updates.read_acceptance(stage)
             if retained["boot_id"] == proof["boot_id"]:
+                # Older immutable generations predate the optional compound
+                # proof. Absence means no authority; preserve their bytes.
+                if "retention_integrity_sha256" not in retained and acceptance.get("retention_integrity_sha256") is None:
+                    acceptance.pop("retention_integrity_sha256", None)
                 if {key: value for key, value in retained.items() if key != "previous_acceptance_sha256"} != acceptance:
                     raise Refused("Current kernel acceptance differs from its retained proof")
                 previous = retained["previous_acceptance_sha256"]
@@ -1008,6 +1012,20 @@ class Lifecycle:
         atomic_json(pointer, {"boot_id": proof["boot_id"], "sha256": hashlib.sha256(kernel_updates.encode(acceptance)).hexdigest()})
         return kernel_updates.mark_complete(stage, acceptance, runner=self.cmd)
 
+    def _kernel_retention_acceptance(self, stage, backup_stage, directory):
+        if directory != stage:
+            raise Refused("Kernel retention acceptance belongs to another operation")
+        value, checksum, _ = kernel_updates.read_acceptance(stage)
+        proof = kernel_boot.accepted_transitions(stage, runner=self.cmd)
+        if any(value.get(key) != item for key, item in proof.items()) or value["boot_id"] != self.boot_id():
+            raise Refused("Kernel retention requires the exact current accepted boot")
+        kernel_integrity.checked_backup(backup_stage)
+        health = self.health(stage, os_health=True)
+        if health.get("ok") is not True or any(health.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS):
+            raise Refused("Kernel retention requires fresh complete runtime acceptance")
+        return {"ok": True, "kernel": value["kernel"], "recovery_kernel": value["recovery_kernel"],
+                "boot_id": value["boot_id"], "receipt_sha256": checksum, "install_plan_sha256": value["kernel_plan_sha256"]}
+
     def _kernel_retain(self, stage, latest, transaction):
         journal = self.data / "manager/os-transaction.json"
         transaction = {**transaction, "kernel_retention": "pending", "finalization": "pending"}
@@ -1016,18 +1034,7 @@ class Lifecycle:
         try:
             latest, transaction, backup_stage = self._os_recovery_backup(stage, latest, transaction)
             def accepted(directory):
-                if directory != stage:
-                    raise Refused("Kernel retention acceptance belongs to another operation")
-                value, checksum, _ = kernel_updates.read_acceptance(stage)
-                proof = kernel_boot.accepted_transitions(stage, runner=self.cmd)
-                if any(value.get(key) != item for key, item in proof.items()) or value["boot_id"] != self.boot_id():
-                    raise Refused("Kernel retention requires the exact current accepted boot")
-                kernel_integrity.checked_backup(backup_stage)
-                health = self.health(stage, os_health=True)
-                if health.get("ok") is not True or any(health.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS):
-                    raise Refused("Kernel retention requires fresh complete runtime acceptance")
-                return {"ok": True, "kernel": value["kernel"], "recovery_kernel": value["recovery_kernel"],
-                        "boot_id": value["boot_id"], "receipt_sha256": checksum, "install_plan_sha256": value["kernel_plan_sha256"]}
+                return self._kernel_retention_acceptance(stage, backup_stage, directory)
             result = kernel_integrity.retain_three(stage, accepted=accepted, runner=self.cmd)
             if result.get("ok") is not True:
                 raise Refused("Kernel retention did not verify its final inventory")
@@ -1041,6 +1048,56 @@ class Lifecycle:
             raise Refused("Kernel retention requires recovery; maintenance and retained kernels are preserved") from exc
         atomic_json(journal, {**transaction, "kernel_retention": "complete", "finalization": "complete"})
         return result
+
+    def _kernel_retention_resume(self, stage, latest, transaction, current_boot):
+        """Reconcile proven erasure after reboot, with no package execution."""
+        journal = self.data / "manager/os-transaction.json"
+        latest_path = self.data / "manager/os-latest.json"
+        transaction = {**transaction, "kernel_retention": "pending", "finalization": "pending"}
+        atomic_json(journal, transaction)
+        self.maintenance(True, stage)
+        try:
+            if not os.path.lexists(stage / kernel_retention.INTENT):
+                raise Refused("Unattempted retention plan requires a new execution generation")
+            latest, transaction, backup_stage = self._os_recovery_backup(stage, latest, transaction)
+            original, checksum = kernel_retention.load_historical_plan(stage)
+            if original["boot_id"] == current_boot or self.boot_id() != current_boot:
+                raise Refused("Retention recovery requires the exact later boot")
+            def authorize(directory, plan_sha):
+                if directory != stage or plan_sha != checksum or self.boot_id() != current_boot:
+                    raise Refused("Retention recovery authorization belongs to another operation")
+                return {"ok": True, "stage": str(stage), "boot_id": current_boot,
+                        "backup_stage": str(backup_stage), "backup_sha256": kernel_integrity.checked_backup(backup_stage),
+                        "operation_sha256": original["operation_sha256"], "retention_plan_sha256": checksum}
+            recovered = kernel_retention_integration.recover_later_boot(stage, authorize=authorize, runner=self.cmd)
+            if (recovered.get("ok") is not True or recovered.get("status") != "integrity_reconciled"
+                    or recovered.get("release_accepted") is not False):
+                raise Refused("Retention recovery did not reconcile the exact integrity change")
+            health = self.health(stage, os_health=True)
+            if health.get("ok") is not True or any(health.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS):
+                raise Refused("Retention recovery requires all current runtime checks")
+            self._kernel_finalize(stage, health["checks"])
+            result = kernel_retention_integration.finish_later_boot(stage, recovered["compound_ref"],
+                accepted=lambda directory: self._kernel_retention_acceptance(stage, backup_stage, directory), runner=self.cmd)
+            if result.get("ok") is not True or result.get("status") != "complete":
+                raise Refused("Retention recovery completion was not verified")
+            postcheck = self.health(stage, os_health=True)
+            if postcheck.get("ok") is not True or any(postcheck.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS):
+                raise Refused("Retention recovery runtime postcheck failed")
+            latest = {**latest, "state": "reboot_completed", "observed_boot_id": current_boot}
+            atomic_json(latest_path, latest)
+            transaction = {**transaction, "state": "complete", "kernel_finalization": "complete",
+                           "observed_boot_id": current_boot, "reboot_pending": False}
+            atomic_json(journal, transaction)
+            self.maintenance(False, stage)
+        except Exception as exc:
+            self.maintenance(True, stage)
+            atomic_json(journal, {**transaction, "kernel_retention": "failed", "finalization": "failed",
+                                 "retention_error": type(exc).__name__})
+            raise Refused("Later-boot kernel retention requires recovery; maintenance remains active") from exc
+        atomic_json(journal, {**transaction, "kernel_retention": "complete", "finalization": "complete"})
+        return self.receipt(stage, "reboot-complete", boot_id=current_boot, checks=postcheck["checks"],
+                            status="complete", reboot_pending=False, retention=result)
 
     def unlock_readiness(self, candidate_kernel=None):
         if self.config.get("unattended_reboot") is not True:
@@ -1190,9 +1247,15 @@ class Lifecycle:
                     and transaction.get("kernel_retention") not in ("pending", "failed")):
                 return {"ok": True, "status": "not_pending"}
             stage, current_boot = self._reboot_binding(latest, transaction, new_boot=True)
-            if transaction.get("kernel_finalization") == "complete" and transaction.get("kernel_retention") in ("pending", "failed"):
+            if (transaction.get("kernel_retention") in ("pending", "failed")
+                    and os.path.lexists(stage / "kernel-acceptance-current.json")):
+                self.maintenance(True, stage)
+                if os.path.lexists(stage / kernel_retention.PLAN):
+                    retained_plan, _ = kernel_retention.load_historical_plan(stage)
+                    if retained_plan["boot_id"] != current_boot:
+                        return self._kernel_retention_resume(stage, latest, transaction, current_boot)
                 acceptance, _, _ = kernel_updates.read_acceptance(stage)
-                if acceptance["boot_id"] == current_boot:
+                if acceptance["boot_id"] == current_boot and transaction.get("kernel_finalization") == "complete":
                     retained = self._kernel_retain(stage, latest, transaction)
                     return self.receipt(stage, "reboot-complete", boot_id=current_boot, checks=acceptance["checks"],
                                         status="complete", reboot_pending=False, retention=retained)

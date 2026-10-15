@@ -20,7 +20,7 @@ import stat
 import uuid
 
 from . import os_payload as rpm, security
-from .common import Refused, run, require_linux_root
+from .common import Refused, run, require_linux_root, atomic_json
 from .host_job_storage import digest, exact, strict_json
 
 NAMES = frozenset(('kernel', 'kernel-core', 'kernel-modules', 'kernel-modules-core'))
@@ -257,50 +257,146 @@ def verify_install_hooks():
         refuse('unqualified_grub_default_policy')
 
 
-def _replace_configuration(expected, replacement):
-    """Write only this fixed config, preserving its enrolled owner/mode/xattrs."""
-    path = Path(KERNEL_CONFIG)
-    if rpm.read(path, 65536) != expected:
-        refuse('kernel_configuration_changed')
-    before = path.lstat()
-    fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
+def _identity(path):
+    info = Path(path).lstat()
+    return {'device': info.st_dev, 'inode': info.st_ino}
+
+
+def _sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        info = os.fstat(fd)
-        if (info.st_dev, info.st_ino) != (before.st_dev, before.st_ino):
-            refuse('kernel_configuration_replaced')
-        written = 0
-        while written < len(replacement):
-            count = os.write(fd, replacement[written:])
-            if count <= 0:
-                refuse('kernel_configuration_write_failed')
-            written += count
-        os.ftruncate(fd, len(replacement))
         os.fsync(fd)
     finally:
         os.close(fd)
-    if rpm.read(path, 65536) != replacement:
+
+
+def _configuration_description(plan, raw):
+    return {**plan['mutable_before'][KERNEL_CONFIG], 'sha256': rpm.sha(raw), 'bytes': len(raw)}
+
+
+def _finish_configuration(stage, intent, *, vendor_replaced=False):
+    """Publish only a fully synced replacement; interrupted live bytes stay intact.
+
+    The vendor postin already replaces this inode using sed -i. Our AIDE plan
+    authorizes that exact path, but preserves its owner/mode/complete xattrs.
+    Before publication we also bind both source and replacement inode identity.
+    """
+    token = intent['id']
+    path = Path(KERNEL_CONFIG)
+    temporary = path.parent / ('.captains-log-kernel-' + token)
+    prepared_path = stage / ('kernel-default-' + token + '-prepared.json')
+    result_path = stage / ('kernel-default-' + token + '-result.json')
+    after = bytes.fromhex(intent['after_raw'])
+    actual = describe(path)
+    prepared = strict_json(rpm.read(prepared_path, 8192)) if os.path.lexists(prepared_path) else None
+    if prepared is not None:
+        exact(prepared, {'schema', 'intent_sha256', 'identity'})
+        if prepared['schema'] != 1 or prepared['intent_sha256'] != rpm.sha(encode(intent)):
+            refuse('kernel_configuration_preparation_changed')
+    if os.path.lexists(result_path):
+        result = strict_json(rpm.read(result_path, 8192))
+        if (prepared is None or result != {'schema': 1, 'intent_sha256': rpm.sha(encode(intent)), 'identity': prepared['identity']}
+                or actual != intent['after'] or not vendor_replaced and _identity(path) != prepared['identity']
+                or os.path.lexists(temporary)):
+            refuse('kernel_configuration_publication_changed')
+        return
+    if actual == intent['after'] and prepared is not None and _identity(path) == prepared['identity']:
+        if os.path.lexists(temporary):
+            refuse('kernel_configuration_duplicate_replacement')
+        # Rename may have completed before its directory fsync/result receipt.
+        _sync_directory(path.parent)
+    else:
+        if actual != intent['before'] or _identity(path) != intent['before_identity']:
+            refuse('kernel_configuration_changed')
+        if prepared is None and os.path.lexists(temporary):
+            raw = rpm.read(temporary, 65536)
+            metadata = describe(temporary)
+            if (metadata['kind'] != 'file' or metadata['mode'] not in (0o600, intent['after']['mode'])
+                    or not after.startswith(raw)):
+                refuse('kernel_configuration_unowned_temporary')
+            # Preserve the actual interrupted bytes/metadata before discarding
+            # this intent's unpublished, incomplete temporary inode.
+            evidence = {'schema': 1, 'intent_sha256': rpm.sha(encode(intent)), 'raw': raw.hex(),
+                        'metadata': metadata, 'identity': _identity(temporary)}
+            record(stage, 'kernel-default-interrupted-' + rpm.sha(encode(evidence)) + '.json', evidence)
+            temporary.unlink()
+            _sync_directory(path.parent)
+        if prepared is None:
+            fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, 'wb') as out:
+                out.write(after)
+                out.flush()
+                os.fchown(out.fileno(), intent['after']['uid'], intent['after']['gid'])
+                os.fchmod(out.fileno(), intent['after']['mode'])
+                for key, value in intent['xattrs'].items():
+                    os.setxattr(temporary, key, bytes.fromhex(value), follow_symlinks=False)
+                os.fsync(out.fileno())
+            if describe(temporary) != intent['after']:
+                refuse('kernel_configuration_replacement_metadata_changed')
+            _sync_directory(path.parent)
+            prepared = {'schema': 1, 'intent_sha256': rpm.sha(encode(intent)), 'identity': _identity(temporary)}
+            record(stage, prepared_path.name, prepared)
+        if (not os.path.lexists(temporary) or describe(temporary) != intent['after']
+                or _identity(temporary) != prepared['identity']
+                or describe(path) != intent['before'] or _identity(path) != intent['before_identity']):
+            refuse('kernel_configuration_replaced')
+        os.replace(temporary, path)
+        _sync_directory(path.parent)
+    if describe(path) != intent['after'] or _identity(path) != prepared['identity']:
         refuse('kernel_configuration_write_not_verified')
+    record(stage, result_path.name, {'schema': 1, 'intent_sha256': rpm.sha(encode(intent)), 'identity': prepared['identity']})
 
 
-def pin_default(plan):
+def _configuration_transition(stage, plan, phase, *, vendor_replaced=False):
+    stage = Path(stage)
+    original = plan['kernel_configuration'].encode()
+    pinned = default_policy(plan['kernel_configuration']).encode()
+    wanted = pinned if phase == 'pin' else original
+    pointer = stage / 'kernel-default-current.json'
+    if os.path.lexists(pointer):
+        reference = strict_json(rpm.read(pointer, 8192))
+        exact(reference, {'id', 'sha256'})
+        if not re.fullmatch(r'[0-9a-f]{32}', str(reference['id'])):
+            refuse('kernel_configuration_pointer_changed')
+        raw = rpm.read(stage / ('kernel-default-' + reference['id'] + '-intent.json'), rpm.MAX_XML)
+        intent = strict_json(raw)
+        exact(intent, {'schema', 'id', 'plan_sha256', 'phase', 'before', 'after', 'before_raw', 'after_raw', 'before_identity', 'xattrs'})
+        target = pinned if intent['phase'] == 'pin' else original
+        before = bytes.fromhex(intent['before_raw'])
+        attributes = {key: rpm.sha(bytes.fromhex(value)) for key, value in intent['xattrs'].items()}
+        if (raw != encode(intent) or rpm.sha(raw) != reference['sha256'] or intent['id'] != reference['id']
+                or intent['schema'] != 1 or intent['plan_sha256'] != rpm.sha(encode(plan))
+                or intent['phase'] not in {'pin', 'restore'} or before not in (original, pinned)
+                or intent['after_raw'] != target.hex() or intent['before'] != _configuration_description(plan, before)
+                or intent['after'] != _configuration_description(plan, target)
+                or digest(attributes) != intent['after']['xattrs_sha256']):
+            refuse('kernel_configuration_intent_changed')
+        _finish_configuration(stage, intent, vendor_replaced=vendor_replaced)
+    current = rpm.read(KERNEL_CONFIG, 65536)
+    if current not in (original, pinned) or describe(KERNEL_CONFIG) != _configuration_description(plan, current):
+        refuse('kernel_configuration_changed')
+    if current == wanted:
+        return
+    token = uuid.uuid4().hex
+    attrs = {key: os.getxattr(KERNEL_CONFIG, key, follow_symlinks=False).hex()
+             for key in sorted(os.listxattr(KERNEL_CONFIG, follow_symlinks=False))}
+    intent = {'schema': 1, 'id': token, 'plan_sha256': rpm.sha(encode(plan)), 'phase': phase,
+              'before_raw': current.hex(), 'after_raw': wanted.hex(), 'before_identity': _identity(KERNEL_CONFIG),
+              'before': _configuration_description(plan, current), 'after': _configuration_description(plan, wanted), 'xattrs': attrs}
+    if digest({key: rpm.sha(bytes.fromhex(value)) for key, value in attrs.items()}) != intent['before']['xattrs_sha256']:
+        refuse('kernel_configuration_attributes_changed')
+    record(stage, 'kernel-default-' + token + '-intent.json', intent)
+    atomic_json(pointer, {'id': token, 'sha256': rpm.sha(encode(intent))})
+    _finish_configuration(stage, intent)
+
+
+def pin_default(stage, plan, *, vendor_replaced=False):
     verify_install_hooks()
-    original = plan['kernel_configuration'].encode()
-    pinned = default_policy(plan['kernel_configuration']).encode()
-    current = rpm.read(KERNEL_CONFIG, 65536)
-    if current not in (original, pinned):
-        refuse('kernel_configuration_changed')
-    if current != pinned:
-        _replace_configuration(current, pinned)
+    _configuration_transition(stage, plan, 'pin', vendor_replaced=vendor_replaced)
 
 
-def restore_default_policy(plan):
-    original = plan['kernel_configuration'].encode()
-    pinned = default_policy(plan['kernel_configuration']).encode()
-    current = rpm.read(KERNEL_CONFIG, 65536)
-    if current not in (original, pinned):
-        refuse('kernel_configuration_changed')
-    if current != original:
-        _replace_configuration(current, original)
+def restore_default_policy(stage, plan):
+    _configuration_transition(stage, plan, 'restore', vendor_replaced=True)
 
 
 def describe(path):
@@ -618,22 +714,34 @@ def execute_cached(stage, *, authorize, authorize_recovery=None, runner=run):
     runner(command(stage, plan, True), timeout=180)
     if authorize_execution(stage, plan, plan_sha, authorize) != authorization:
         refuse('execution_context_changed')
-    record(stage, 'kernel-apply-intent.json', {'schema': 1, 'plan_sha256': plan_sha, 'authorization': authorization})
+    intent = {'schema': 2, 'plan_sha256': plan_sha, 'authorization': authorization}
+    record(stage, 'kernel-apply-intent.json', intent)
+    _run_rpm_once(stage, plan, plan_sha, intent, authorization, runner=runner)
+    return recover_generated(stage, authorize=authorize_recovery or authorize, runner=runner)
+
+
+def _run_rpm_once(stage, plan, plan_sha, intent, authorization, *, runner):
+    sentinel = stage / 'kernel-rpm-command.json'
+    if intent['schema'] != 2 or os.path.lexists(sentinel):
+        refuse('rpm_command_already_attempted_or_ambiguous')
     # The pinned vendor hook honors UPDATEDEFAULT=no. Persist it before RPM can
     # execute any scriptlet, so SIGKILL/power loss also leaves the old default.
-    # On failure it remains pinned until the guarded recovery path completes.
-    pin_default(plan)
+    pin_default(stage, plan)
+    if (rpm.inventory(runner)[2] != plan['before_inventory']
+            or runner(['/usr/sbin/grubby', '--default-kernel']) != '/boot/vmlinuz-' + plan['old_kernel']):
+        refuse('precommand_inventory_or_default_changed')
+    record(stage, sentinel.name, {'schema': 1, 'plan_sha256': plan_sha,
+                                 'intent_sha256': rpm.sha(encode(intent)), 'authorization': authorization})
     try:
         runner(command(stage, plan), timeout=3600)
     finally:
         # Vendor kernel-install changes the default. Even a partial/scriptlet
         # failure must not leave an unaccepted kernel as the persistent default.
         runner(['/usr/sbin/grubby', '--set-default=/boot/vmlinuz-' + plan['old_kernel']])
-    return recover_generated(stage, authorize=authorize_recovery or authorize, runner=runner)
 
 
 def recover_generated(stage, *, authorize, runner=run):
-    """Resume only a fully installed payload; never replay RPM or erase packages."""
+    """Resume an owned pin or complete payload, without replaying an RPM attempt."""
     require_linux_root()
     stage = Path(stage)
     plan, plan_sha = load_plan(stage)
@@ -642,7 +750,7 @@ def recover_generated(stage, *, authorize, runner=run):
     original = intent['authorization']
     exact(original, {'ok', 'plan_sha256', 'backup_sha256', 'aide_preparation_sha256', 'boot_id'})
     current = authorize_execution(stage, plan, plan_sha, authorize, recovery=True)
-    if (intent['schema'] != 1 or intent['plan_sha256'] != plan_sha or original['ok'] is not True
+    if (type(intent['schema']) is not int or intent['schema'] not in (1, 2) or intent['plan_sha256'] != plan_sha or original['ok'] is not True
             or original['plan_sha256'] != plan_sha or original['boot_id'] != plan['boot_id']
             or not SHA.fullmatch(str(original['backup_sha256']))
             or original['aide_preparation_sha256'] != current['aide_preparation_sha256']
@@ -654,7 +762,46 @@ def recover_generated(stage, *, authorize, runner=run):
     if current != original:
         record(stage, 'kernel-recovery-authorization-' + rpm.sha(encode(current)) + '.json',
                {'schema': 1, 'intent_sha256': rpm.sha(encode(intent)), 'authorization': current})
-    if rpm.inventory(runner)[2] != plan['after_inventory']:
+    inventory_xml, _, inventory = rpm.inventory(runner)
+    sentinel = stage / 'kernel-rpm-command.json'
+    if intent['schema'] == 2 and not os.path.lexists(sentinel):
+        # Schema 2 distinguishes a pin interrupted BEFORE any RPM command from
+        # an ambiguous interrupted command. Legacy schema 1 never permits this.
+        if inventory != plan['before_inventory'] or rpm.sha(inventory_xml.encode()) != plan['inventory_sha256']:
+            refuse('precommand_inventory_changed')
+        rpm.platform(runner)
+        verify_space(plan['space_requirements'])
+        if rpm.sha(rpm.read(rpm.KEY, 65536)) != plan['key_sha256']:
+            refuse('vendor_trust_changed')
+        for item in plan['packages']:
+            path = stage / 'kernel-packages' / item['rpm']
+            raw = rpm.read(path)
+            if (rpm.sha(raw) != item['sha256'] or len(raw) != item['bytes']
+                    or rpm.signature(path, stage / 'kernel-keydb', runner) != item['signature']):
+                refuse('retained_rpm_changed')
+        verify_preserved(plan)
+        if any(os.path.lexists(path) for path in plan['generated']):
+            refuse('candidate_output_created_before_install')
+        runner(command(stage, plan, True), timeout=180)
+        if authorize_execution(stage, plan, plan_sha, authorize, recovery=True) != current:
+            refuse('execution_context_changed')
+        _run_rpm_once(stage, plan, plan_sha, intent, current, runner=runner)
+        inventory = rpm.inventory(runner)[2]
+    if intent['schema'] == 2:
+        attempted = strict_json(rpm.read(sentinel, 8192))
+        exact(attempted, {'schema', 'plan_sha256', 'intent_sha256', 'authorization'})
+        permission = attempted['authorization']
+        exact(permission, {'ok', 'plan_sha256', 'backup_sha256', 'aide_preparation_sha256', 'boot_id'})
+        if (type(attempted['schema']) is not int or attempted['schema'] != 1 or attempted['plan_sha256'] != plan_sha
+                or attempted['intent_sha256'] != rpm.sha(encode(intent)) or permission['ok'] is not True
+                or permission['plan_sha256'] != plan_sha or permission['aide_preparation_sha256'] != original['aide_preparation_sha256']
+                or not SHA.fullmatch(str(permission['backup_sha256']))):
+            refuse('rpm_command_sentinel_changed')
+        if permission != original:
+            evidence = strict_json(rpm.read(stage / ('kernel-recovery-authorization-' + rpm.sha(encode(permission)) + '.json'), 8192))
+            if evidence != {'schema': 1, 'intent_sha256': rpm.sha(encode(intent)), 'authorization': permission}:
+                refuse('rpm_command_authorization_changed')
+    if inventory != plan['after_inventory']:
         refuse('partial_package_install_requires_recovery')
     verify_payload(plan, runner=runner, allow_missing_generated=True)
     result_path = stage / 'kernel-installed.json'
@@ -667,7 +814,7 @@ def recover_generated(stage, *, authorize, runner=run):
         return result
     # Regenerate under the qualified tools after payload validation. The receipt
     # is never created by blindly recording arbitrary files observed after RPM.
-    pin_default(plan)
+    pin_default(stage, plan, vendor_replaced=True)
     runner(['/usr/bin/env', 'GRUB_UPDATE_DEFAULT_KERNEL=false', '/usr/bin/kernel-install', 'add', plan['kernel'],
             '/lib/modules/' + plan['kernel'] + '/vmlinuz'], timeout=1800)
     runner(['/usr/sbin/depmod', '-a', plan['kernel']], timeout=180)
@@ -676,7 +823,7 @@ def recover_generated(stage, *, authorize, runner=run):
     runner(['/usr/sbin/grubby', '--set-default=/boot/vmlinuz-' + plan['old_kernel']])
     if runner(['/usr/sbin/grubby', '--default-kernel']) != '/boot/vmlinuz-' + plan['old_kernel']:
         refuse('recovery_default_not_restored')
-    restore_default_policy(plan)
+    restore_default_policy(stage, plan)
     verify_payload(plan, runner=runner)
     generated = generated_snapshot(plan, runner=runner)
     mutable = {path: describe(path) for path in plan['mutable_before']}
@@ -709,7 +856,38 @@ def check_integrity_report(report, delta):
         refuse('unrelated_integrity_change')
 
 
-def verify_postboot(stage, *, runner=run):
+def postboot_inventory(candidate_stage, *, owner_stage=None, retention_authority=None, runner=run):
+    """Resolve the frozen inventory, or an independently verified exact erase.
+
+    A supplied digest/list never authorizes an inventory change. The retention
+    validator reloads its immutable authority and original signed erase proof.
+    """
+    candidate_stage = Path(candidate_stage)
+    plan, checksum = load_plan(candidate_stage)
+    raw = rpm.read(candidate_stage / 'kernel-installed.json', rpm.MAX_XML)
+    installed = strict_json(raw)
+    if installed.get('plan_sha256') != checksum:
+        refuse('candidate_install_binding_changed')
+    if retention_authority is None:
+        return plan['after_inventory']
+    if owner_stage is None:
+        refuse('retention_owner_required')
+    from . import kernel_retention
+    owner_stage = Path(owner_stage)
+    resolved, owner_plan, owner_checksum, owner_installed = load_candidate(owner_stage)
+    if (resolved != candidate_stage or owner_plan != plan or owner_checksum != checksum or owner_installed != installed):
+        refuse('retention_candidate_binding_changed')
+    authority = kernel_retention.validate_boot_authority(owner_stage, retention_authority, runner=runner)
+    if (authority.get('candidate_plan_sha256') != checksum or authority.get('installed_sha256') != rpm.sha(raw)
+            or authority.get('operation_sha256') != rpm.sha(rpm.read(owner_stage / 'operation.json', 8192))
+            or authority.get('boot_id') != Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+            or authority.get('kernel') != plan['kernel'] or authority.get('recovery_kernel') != plan['old_kernel']
+            or not isinstance(authority.get('after_inventory'), list)):
+        refuse('retention_boot_authority_changed')
+    return authority['after_inventory']
+
+
+def verify_postboot(stage, *, owner_stage=None, retention_authority=None, runner=run):
     """Bind the candidate boot before lifecycle health can release maintenance."""
     plan, plan_sha = load_plan(stage)
     installed = strict_json(rpm.read(Path(stage) / 'kernel-installed.json', rpm.MAX_XML))
@@ -721,7 +899,8 @@ def verify_postboot(stage, *, runner=run):
     if (installed.get('plan_sha256') != plan_sha or boot == plan['boot_id']
             or runner(['/usr/bin/uname', '-r']) != plan['kernel']
             or Path('/proc/sys/kernel/tainted').read_text().strip() != '0'
-            or rpm.inventory(runner)[2] != plan['after_inventory']):
+            or rpm.inventory(runner)[2] != postboot_inventory(stage, owner_stage=owner_stage,
+                                                            retention_authority=retention_authority, runner=runner)):
         refuse('candidate_boot_not_proven')
     verify_payload(plan, runner=runner)
     if generated_snapshot(plan, runner=runner) != installed['generated']:
@@ -763,7 +942,9 @@ def _acceptance_file(stage, filename):
         refuse('invalid_acceptance_boot_identity')
     raw = rpm.read(Path(stage) / filename, 65536)
     value = strict_json(raw)
-    exact(value, ACCEPTANCE_FIELDS)
+    # Earlier immutable generations omit this newly introduced optional proof.
+    # Validate both exact schemas without normalizing or rewriting their bytes.
+    exact(value, ACCEPTANCE_FIELDS | ({'retention_integrity_sha256'} if 'retention_integrity_sha256' in value else set()))
     if (type(value['schema']) is not int or value['schema'] != 1 or value['boot_id'] != name[1]
             or value['finalization'] != 'complete' or type(value['checks']) is not dict
             or set(value['checks']) != REQUIRED_CHECKS or any(value['checks'][key] is not True for key in REQUIRED_CHECKS)
@@ -773,8 +954,8 @@ def _acceptance_file(stage, filename):
     for field in ('operation_sha256', 'kernel_plan_sha256', 'installed_sha256', 'postboot_sha256', 'promotion_sha256'):
         if not SHA.fullmatch(str(value[field])):
             refuse('invalid_acceptance_binding')
-    for field in ('resume_sha256', 'previous_acceptance_sha256'):
-        if value[field] is not None and not SHA.fullmatch(str(value[field])):
+    for field in ('resume_sha256', 'previous_acceptance_sha256', 'retention_integrity_sha256'):
+        if value.get(field) is not None and not SHA.fullmatch(str(value[field])):
             refuse('invalid_acceptance_binding')
     if raw != encode(value):
         refuse('noncanonical_acceptance_record')
@@ -859,9 +1040,11 @@ def load_candidate(stage):
 def mark_complete(stage, acceptance, *, runner=run):
     """Retain exact accepted pointer before atomically clearing only our pending.
 
-    The lifecycle caller owns manager/update locks and invokes this only after
-    durable maintenance finalization. A retry can resolve the completed pointer
-    after unlink; it never adopts or removes another operation's candidate.
+    The lifecycle caller owns manager/update locks and supplies durable kernel
+    boot/runtime acceptance. The operation journal may keep maintenance active
+    for retention recovery; this helper never releases that gate. A retry can
+    resolve the completed pointer after unlink; it never adopts or removes
+    another operation's candidate.
     """
     from . import kernel_boot
     stage = Path(stage)
