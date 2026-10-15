@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import ExitStack
 import copy
 import hashlib
 import ipaddress
@@ -16,6 +17,7 @@ from pathlib import Path
 import re
 import secrets
 import ssl
+import stat
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, quote, urlsplit
@@ -167,6 +169,86 @@ class Bootstrap:
         info = json.loads(self.runner(["podman", "info", "--format", "json"]))
         if Path(info["store"]["graphRoot"]) != self.paths.data / "containers":
             raise Refused("Podman graphroot must be on the encrypted data mount before creating containers or secrets")
+
+    def _storage_maintenance(self):
+        """Create the fresh host fence once; retained gates are evidence, not defaults."""
+        from .image_bundle import strict_json
+
+        fresh = set(self.state.get("completed", [])) <= {"directories"}
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+        def directory(info, mode=None):
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
+                    or info.st_mode & 0o022 or mode is not None and stat.S_IMODE(info.st_mode) != mode):
+                raise Refused("Storage maintenance directory must be root-owned with safe permissions")
+
+        try:
+            with ExitStack() as stack:
+                def opened(name, flags, **kwargs):
+                    fd = os.open(name, flags, **kwargs)
+                    stack.callback(os.close, fd)
+                    return fd
+
+                data = opened(self.paths.data, directory_flags)
+                directory(os.fstat(data))
+                try:
+                    manager = opened("manager", directory_flags, dir_fd=data)
+                except FileNotFoundError:
+                    if not fresh:
+                        raise Refused("Existing runtime lost its storage maintenance evidence")
+                    os.mkdir("manager", 0o700, dir_fd=data)
+                    os.fsync(data)
+                    manager = opened("manager", directory_flags, dir_fd=data)
+                directory(os.fstat(manager))
+                created = False
+                try:
+                    gate_dir = opened("storage-maintenance", directory_flags, dir_fd=manager)
+                except FileNotFoundError:
+                    if not fresh:
+                        raise Refused("Existing runtime lost its storage maintenance evidence")
+                    os.mkdir("storage-maintenance", 0o755, dir_fd=manager)
+                    gate_dir = opened("storage-maintenance", directory_flags, dir_fd=manager)
+                    os.fchmod(gate_dir, 0o755)
+                    os.fchown(gate_dir, 0, 0)
+                    os.fsync(manager)
+                    created = True
+                directory(os.fstat(gate_dir), 0o755)
+                if created:
+                    gate = {"schema": 1, "held": False, "delivery_held": False, "operation": None}
+                    raw = (json.dumps(gate, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                    output = opened("gate.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                    dir_fd=gate_dir, mode=0o644)
+                    os.fchmod(output, 0o644)
+                    os.fchown(output, 0, 0)
+                    with os.fdopen(os.dup(output), "wb") as stream:
+                        stream.write(raw)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.fsync(gate_dir)
+                source = opened("gate.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=gate_dir)
+                before = os.fstat(source)
+                if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_gid != 0
+                        or stat.S_IMODE(before.st_mode) != 0o644 or before.st_nlink != 1
+                        or not 1 <= before.st_size <= 4096):
+                    raise Refused("Storage maintenance gate must be a bounded root-owned regular file with mode 0644")
+                raw = os.read(source, 4097)
+                after = os.fstat(source)
+                if len(raw) != before.st_size or any(getattr(before, key) != getattr(after, key)
+                        for key in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")):
+                    raise Refused("Storage maintenance gate changed while being read")
+                gate = strict_json(raw)
+                if (not isinstance(gate, dict) or set(gate) != {"schema", "held", "delivery_held", "operation"}
+                        or type(gate["schema"]) is not int or gate["schema"] != 1
+                        or type(gate["held"]) is not bool or type(gate["delivery_held"]) is not bool
+                        or gate["held"] and (not isinstance(gate["operation"], str)
+                            or not re.fullmatch(r"[a-f0-9]{64}", gate["operation"]))
+                        or not gate["held"] and (gate["delivery_held"] or gate["operation"] is not None)):
+                    raise Refused("Storage maintenance gate has an invalid schema or operation owner")
+        except OSError as exc:
+            raise Refused("Storage maintenance evidence is missing or unsafe; bootstrap cannot reset it") from exc
+        if created:
+            self.runner(["restorecon", "-RF", str(self.paths.data / "manager/storage-maintenance")])
+        return gate
 
     def _certificates(self):
         names = {self.setup["hostname"], "localhost", "keycloak", "clickhouse"}
@@ -471,6 +553,12 @@ class Bootstrap:
         self.runner(["systemctl", "restart", "nebulalog-edge.service"], timeout=180)
         self._wait(lambda: self._request("https://localhost/api/health"), timeout=180)
 
+    def _schema_revision(self):
+        from .update_enrollment import UpdateEnrollment
+        descriptor, _, _ = UpdateEnrollment(data=self.paths.data, etc=self.paths.etc,
+            share=INITIAL_RELEASE.parent, runner=self.runner, firstboot=self.firstboot)._descriptor()
+        return descriptor["schema_revision"]
+
     def _lifecycle(self):
         path = self.configuration / "lifecycle.json"
         from .image_bundle import strict_json
@@ -492,12 +580,14 @@ class Bootstrap:
         package_key = trusted_file(ROCKY_PACKAGE_KEY)
         if not 1 <= package_key.stat().st_size <= 65536 or hashlib.sha256(package_key.read_bytes()).hexdigest() != trust["rocky_key_sha256"]:
             raise Refused("Rocky package key differs from the trust verified at image installation")
-        value = {"schema": 1, "api_url": "http://127.0.0.1:8080", "issuer": "https://" + self.setup["hostname"] + "/realms/nebulalog", "ca_file": str(self.tls / "ca.crt"), "schema_revision": "1", "compliance_policy": str(self.configuration / "security-policy.json"), "auth_probe": {"client_id": "nebulalog", "redirect_uri": "https://" + self.setup["hostname"] + "/health-oidc", "username": "nebulalog-health", "password": self.runtime["health_password"], "totp_secret": self.runtime["health_totp"], "totp_algorithm": "SHA256", "totp_digits": 6, "totp_period": 30}}
+        value = {"schema": 1, "api_url": "http://127.0.0.1:8080", "issuer": "https://" + self.setup["hostname"] + "/realms/nebulalog", "ca_file": str(self.tls / "ca.crt"), "schema_revision": self._schema_revision(), "compliance_policy": str(self.configuration / "security-policy.json"), "auth_probe": {"client_id": "nebulalog", "redirect_uri": "https://" + self.setup["hostname"] + "/health-oidc", "username": "nebulalog-health", "password": self.runtime["health_password"], "totp_secret": self.runtime["health_totp"], "totp_algorithm": "SHA256", "totp_digits": 6, "totp_period": 30}}
         value["rocky_key_sha256"] = trust["rocky_key_sha256"]
         if path.exists():
             current = self._read(path)
             if current.get("auth_probe") != value["auth_probe"]:
                 raise Refused("Lifecycle identity configuration changed")
+            if current.get("schema_revision") != value["schema_revision"]:
+                raise Refused("Existing lifecycle schema differs; firstboot cannot perform an application upgrade")
             if current.get("rocky_key_sha256") not in (None, trust["rocky_key_sha256"]):
                 raise Refused("Existing lifecycle package trust differs; firstboot cannot rotate or reset trust")
             # Preserve installed adapter settings and operator policy on retries.
@@ -549,7 +639,7 @@ class Bootstrap:
             raise Refused("Installed-release host generation differs from measured factory code")
         for name, image in expected.items():
             component = components[name]
-            if not isinstance(component, dict) or component.get("image") != self.pins[image] or component.get("schema_revision") != "1" or not isinstance(component.get("version"), str) or not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,79}", component["version"]):
+            if not isinstance(component, dict) or component.get("image") != self.pins[image] or component.get("schema_revision") != self._schema_revision() or not isinstance(component.get("version"), str) or not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,79}", component["version"]):
                 raise Refused("Installed-release component evidence differs from the runtime candidate")
         if current.get("version") != components["nebulalog"]["version"]:
             raise Refused("Installed-release application version is inconsistent")
@@ -608,7 +698,7 @@ class Bootstrap:
         self.firstboot.gate()
         with locked(self.bootstrap / "runtime.lock"):
             self._load(setup_path, secrets_path)
-            for name, operation in (("directories", self._directories), ("certificates", self._certificates), ("images", self._images), ("environment", self._environment), ("realm", self._realm), ("postgresql", self._postgres), ("migrations", self._migrate), ("identity", self._identity), ("lifecycle", self._lifecycle), ("edge", self._edge), ("installed-release", self._installed_release)):
+            for name, operation in (("directories", self._directories), ("storage-maintenance", self._storage_maintenance), ("certificates", self._certificates), ("images", self._images), ("environment", self._environment), ("realm", self._realm), ("postgresql", self._postgres), ("migrations", self._migrate), ("identity", self._identity), ("lifecycle", self._lifecycle), ("edge", self._edge), ("installed-release", self._installed_release)):
                 self._stage(name, operation)
             result = self._evidence()
             if not all(result["checks"].get(key) is True for key in RUNTIME_CHECKS):

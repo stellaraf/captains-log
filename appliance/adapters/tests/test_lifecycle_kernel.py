@@ -121,19 +121,22 @@ class KernelLifecycleTests(TestCase):
         journal = self.root / "manager/os-transaction.json"
         def gate(active, directory):
             if not active:
-                self.assertEqual(json.loads(journal.read_text())["kernel_finalization"], "pending")
-                self.assertFalse(self.acceptance_path(stage).exists())
+                self.assertEqual(json.loads(journal.read_text())["kernel_finalization"], "complete")
+                self.assertTrue(self.acceptance_path(stage).exists())
                 self.calls.append("release-gate")
         self.manager.maintenance.side_effect = gate
         def finish(directory, acceptance, **kwargs):
-            self.assertEqual(json.loads(journal.read_text())["finalization"], "complete")
+            self.assertEqual(json.loads(journal.read_text())["finalization"], "pending")
             self.assertEqual(json.loads(self.acceptance_path(stage).read_text()), acceptance)
             self.calls.append("clear-pending")
             return {"ok": True}
         self.mark_complete.side_effect = finish
         result = self.manager.reboot_complete()
         self.assertEqual(result["status"], "complete")
-        self.assertEqual(self.calls, ["postboot", "health", "promote", "release-gate", "clear-pending"])
+        # The retention boundary is injected here. Public/storage release is
+        # tested below using the real retention coordinator after its receipt.
+        self.assertEqual(self.calls, ["postboot", "health", "promote", "clear-pending"])
+        self.assertNotIn(False, [call.args[0] for call in self.manager.maintenance.call_args_list])
         self.assertEqual(json.loads(journal.read_text())["kernel_finalization"], "complete")
         self.assertEqual(self.boot["commit_candidate"].call_args.kwargs["health"]["kernel"], self.kernel)
 
@@ -368,7 +371,9 @@ class KernelLifecycleTests(TestCase):
         journal = self.root / "manager/os-transaction.json"
         transaction = {**json.loads(journal.read_text()), "state": "complete", "finalization": "complete", "kernel_finalization": "complete", "kernel_retention": "pending"}
         atomic_json(journal, transaction)
-        latest = json.loads((self.root / "manager/os-latest.json").read_text())
+        latest = {**json.loads((self.root / "manager/os-latest.json").read_text()),
+                  "state": "reboot_completed", "observed_boot_id": self.manager.boot_id()}
+        atomic_json(self.root / "manager/os-latest.json", latest)
         self.manager._kernel_retain = fixtures.Lifecycle._kernel_retain.__get__(self.manager)
         context = patch("nebulalog_adapters.lifecycle.kernel_integrity.checked_backup", side_effect=self.manager.checked_backup)
         context.start()
@@ -378,6 +383,16 @@ class KernelLifecycleTests(TestCase):
     def test_retention_checks_current_acceptance_backup_and_health_before_and_after(self):
         stage, latest, transaction = self.retention_fixture()
         approved = []
+        self.manager.storage_maintenance.reset_mock()
+        def barrier(owner, **flags):
+            value = json.loads((self.root / "manager/os-transaction.json").read_text())
+            self.assertEqual(value["kernel_retention"], "complete")
+            self.assertEqual(value["kernel_finalization"], "complete")
+            self.assertEqual(value["finalization"], "pending")
+            self.assertEqual(self.manager.health.call_count, 2)
+            self.assertEqual(owner, stage)
+            self.assertFalse(flags["held"])
+        self.manager.storage_maintenance.side_effect = barrier
         def retain(directory, *, accepted, runner):
             approved.append(accepted(directory))
             return {"ok": True, "status": "complete"}
@@ -386,6 +401,7 @@ class KernelLifecycleTests(TestCase):
         self.assertEqual(approved[0]["kernel"], self.kernel)
         self.assertEqual(approved[0]["recovery_kernel"], self.old)
         self.assertEqual(self.manager.health.call_count, 2)
+        self.manager.storage_maintenance.assert_called_once()
         self.manager.maintenance.assert_called_with(False, stage)
         self.assertEqual(json.loads((self.root / "manager/os-transaction.json").read_text())["kernel_retention"], "complete")
 
@@ -463,7 +479,7 @@ class KernelLifecycleTests(TestCase):
         def gate(active, directory):
             if not active:
                 journal = json.loads((self.root / 'manager/os-transaction.json').read_text())
-                self.assertEqual(journal['kernel_retention'], 'pending')
+                self.assertEqual(journal['kernel_retention'], 'complete')
                 self.assertEqual(journal['kernel_finalization'], 'complete')
                 self.calls.append('release-gate')
         self.manager.maintenance.side_effect = gate

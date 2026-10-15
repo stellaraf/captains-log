@@ -19,6 +19,8 @@ type ClickHouse struct {
 	Client              *http.Client
 }
 
+type clickHouseQueryIDKey struct{}
+
 type queryProfile uint8
 
 const (
@@ -42,6 +44,9 @@ func (c *ClickHouse) request(ctx context.Context, sql string, params map[string]
 	}
 	q := u.Query()
 	q.Set("database", "nebulalog")
+	if id, ok := ctx.Value(clickHouseQueryIDKey{}).(string); ok {
+		q.Set("query_id", id)
+	}
 	if strings.HasPrefix(strings.TrimSpace(sql), "CREATE DATABASE") {
 		q.Set("database", "default")
 	}
@@ -113,6 +118,22 @@ func (c *ClickHouse) Exec(ctx context.Context, sql string, params map[string]str
 	_, e = io.Copy(io.Discard, r)
 	return e
 }
+
+// An ambiguous response must never be retried as the same destructive action.
+// query_id is diagnostic identity, not a server-side idempotency key.
+func (c *ClickHouse) ExecWithQueryID(ctx context.Context, sql string, params map[string]string, id string) error {
+	if !emergencyUUID.MatchString(id) {
+		return errors.New("invalid query identity")
+	}
+	return c.Exec(context.WithValue(ctx, clickHouseQueryIDKey{}, id), sql, params)
+}
+func (c *ClickHouse) InsertRowsWithQueryID(ctx context.Context, rows []map[string]any, id string) error {
+	if !emergencyUUID.MatchString(id) {
+		return errors.New("invalid query identity")
+	}
+	return c.InsertRows(context.WithValue(ctx, clickHouseQueryIDKey{}, id), rows)
+}
+
 func (c *ClickHouse) Rows(ctx context.Context, sql string, params map[string]string) ([]map[string]any, error) {
 	return c.rows(ctx, sql, params, queryDefault)
 }

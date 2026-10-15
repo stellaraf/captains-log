@@ -29,6 +29,14 @@ database passwords. PostgreSQL is addressed over its container Unix socket as
 uid999/role `postgres`; the two databases are `nebulalog` and `keycloak`. ClickHouse
 uid101 reads `/etc/nebulalog/clickhouse-client.xml` inside its container.
 
+The fixed additive application migration uses a separately identified Podman
+client supervised by systemd. It shares the PostgreSQL container's network,
+authenticates over loopback SCRAM using the existing `nebulalog-pg-password`
+secret mounted uid999/mode0400, and uses the exact image ID resolved from the
+protected PostgreSQL Quadlet. The password is read inside that client and never
+appears in host arguments or receipts. Native execution of this path is still
+under qualification.
+
 ## Runtime configuration
 
 First boot writes `/var/lib/nebulalog/configuration/lifecycle.json` as root0600.
@@ -39,7 +47,7 @@ an image, source repository, unencrypted `/etc`, command line or status receipt.
 ```json
 {
   "schema": 1,
-  "schema_revision": "1",
+  "schema_revision": "2",
   "api_url": "http://127.0.0.1:8080",
   "issuer": "https://logs.example.test/realms/nebulalog",
   "ca_file": "/var/lib/nebulalog/configuration/tls/ca.crt",
@@ -88,11 +96,11 @@ error type. Inspect protected receipts for details.
 | Hook | Required effect and evidence |
 | --- | --- |
 | `update-preflight` | Verify encrypted paths, immutable previous pins, host controls, running services, real local MFA, supported versions and reserve. |
-| `update-backup` | Publish maintenance; stop API/Keycloak writers; dump and validate both PostgreSQL databases; preserve canonical config permissions/ownership and original Quadlets; hash the inventory. Ingest remains running. On failure restore writers or retain maintenance with an explicit failed recovery receipt. |
+| `update-backup` | Publish host/database storage holds; stop API/Keycloak writers; dump and validate both PostgreSQL databases; preserve schema provenance, config permissions/ownership and original Quadlets; hash the inventory. Keep ingest receiving into WAL only if its running image is bound to the gate-aware release; otherwise stop it. On failure restore writers or retain maintenance with an explicit failed recovery receipt. |
 | `update-prepare` | Import signed OCI archives with `skopeo copy --preserve-digests`; require exact inspected RepoDigest; stage only changed `Image=` lines. |
-| `update-activate` | Stop known services gracefully, sync encrypted data, atomically replace prepared Quadlets, reload/start and retain maintenance. |
+| `update-activate` | Stop known writers, verify the live schema, sync encrypted data and replace prepared Quadlets. Run only the reviewed schema transition if declared and required; verify its committed receipt before starting candidate writers. Resume delivery for health checks while destructive cleanup remains held. |
 | `update-health` | Require API, HTTPS UI, PostgreSQL, ClickHouse, fresh local password+OTP, Keycloak, FIPS signals, SELinux, LUKS, firewall and policy SCAP checks; send a unique TCP514 canary and prove it persisted in ClickHouse. |
-| `update-rollback` | Failed activation: validate backups, restore original configuration/pins and both PostgreSQL databases after bounded readiness. Later operator rollback of a committed same-schema release: restore changed image pins only, preserving subsequent users, metadata and config. ClickHouse log data and WAL are never rewound from a metadata backup. |
+| `update-rollback` | Before activation: require a durable preactivation journal, original unchanged-runtime backup intent and a settled storage barrier; restart old services without restoring partial dumps. Failed activation: fence the retained migration executor, validate backups and record restore intent before restoring configuration/pins and both PostgreSQL databases. Reconcile actual schema provenance before publishing restore completion and resuming writers. A completed restore cannot replay. Later operator rollback preserves the current additive schema, users, metadata and config while restoring changed image pins. ClickHouse log data and WAL are never rewound from a metadata backup. |
 | `update-finalize` | Require durable `committed`/`rolled_back` and complete health receipt, then release maintenance. |
 
 The shared manager transaction lock serializes storage, OS and component work;

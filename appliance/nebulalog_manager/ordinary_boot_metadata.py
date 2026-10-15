@@ -37,7 +37,9 @@ EFI = ('/boot/efi/EFI/BOOT/BOOTX64.EFI', '/boot/efi/EFI/BOOT/fbx64.efi',
        '/boot/efi/EFI/rocky/grubx64.efi', '/boot/efi/EFI/rocky/mmx64.efi',
        '/boot/efi/EFI/rocky/shim.efi', '/boot/efi/EFI/rocky/shimx64-rocky.efi',
        '/boot/efi/EFI/rocky/shimx64.efi')
-TARGETS = frozenset(TMPFILES + EFI)
+EFI_DIRECTORIES = ('/boot/efi/EFI/BOOT', '/boot/efi/EFI/rocky')
+EFI_TARGETS = EFI + EFI_DIRECTORIES
+TARGETS = frozenset(TMPFILES + EFI_TARGETS)
 MAX_COMPRESSED = 128 * 1024 * 1024
 MAX_UNCOMPRESSED = 128 * 1024 * 1024
 MAX_LINE = 256 * 1024
@@ -59,6 +61,8 @@ ATTR = {'filename': 1 << 0, 'linkname': 1 << 1, 'perm': 1 << 2,
 KNOWN_MASK = sum(ATTR.values())
 REGULAR_MASK = KNOWN_MASK & ~ATTR['linkname']
 EFI_MASK = REGULAR_MASK & ~ATTR['acl']
+EFI_DIRECTORY_MASK = EFI_MASK & ~(ATTR['size'] | ATTR['ctime'] | ATTR['mtime'] |
+                                   ATTR['linkcount'] | ATTR['sha512'])
 SYMLINK_MASK = KNOWN_MASK & ~(ATTR['sha512'] | ATTR['acl'])
 
 
@@ -218,14 +222,17 @@ def _row(line):
 
 
 def _qualified(path, row):
-    expected_mask = EFI_MASK if path in EFI else SYMLINK_MASK if path == '/etc/os-release' else REGULAR_MASK
-    expected_type = stat.S_IFLNK if path == '/etc/os-release' else stat.S_IFREG
+    directory = path in EFI_DIRECTORIES
+    expected_mask = EFI_DIRECTORY_MASK if directory else EFI_MASK if path in EFI else SYMLINK_MASK if path == '/etc/os-release' else REGULAR_MASK
+    expected_type = stat.S_IFDIR if directory else stat.S_IFLNK if path == '/etc/os-release' else stat.S_IFREG
     if (row['attr'] != expected_mask or stat.S_IFMT(row['mode']) != expected_type
-            or row['uid'] != 0 or row['gid'] != 0 or row['lcount'] != 1
+            or row['uid'] != 0 or row['gid'] != 0 or row['lcount'] != (0 if directory else 1)
+            or directory and (stat.S_IMODE(row['mode']) != 0o700
+                              or any(row[key] != 0 for key in ('size', 'ctime', 'mtime')))
             or expected_type == stat.S_IFREG and row['mode'] & 0o7022
             or expected_type == stat.S_IFLNK and stat.S_IMODE(row['mode']) != 0o777
             or path == '/etc/os-release' and row['target'] != b'../usr/lib/os-release'
-            or expected_type == stat.S_IFREG and row['target'] is not None
+            or expected_type in {stat.S_IFREG, stat.S_IFDIR} and row['target'] is not None
             or expected_mask & ATTR['acl'] and (row['acl'] is None or row['acl']['access'] is None
                                                or row['acl']['default'] is not None)):
         refuse('unqualified_target_row')
@@ -238,7 +245,7 @@ def _qualified(path, row):
         refuse('unsupported_target_xattr_name')
     acl = None if row['acl'] is None else {
         key: None if value is None else base64.b64encode(value).decode() for key, value in row['acl'].items()}
-    return {'kind': 'symlink' if expected_type == stat.S_IFLNK else 'file',
+    return {'kind': 'directory' if directory else 'symlink' if expected_type == stat.S_IFLNK else 'file',
             'mode': stat.S_IMODE(row['mode']), 'uid': row['uid'], 'gid': row['gid'],
             'bytes': row['size'], 'inode': row['inode'], 'nlink': row['lcount'],
             'ctime_s': row['ctime'], 'mtime_s': row['mtime'], 'attributes': row['attr'],
@@ -292,15 +299,15 @@ def parse_database(raw, *, expected_sha256):
 
 def validate_change_summary(path, summary, *, row, attribute):
     """Check a single pinned summary; this does not permit a file transition."""
-    wanted = 'inode' if path in EFI else 'ctime' if path in TMPFILES else None
-    expected_mask = EFI_MASK if path in EFI else SYMLINK_MASK if path == '/etc/os-release' else REGULAR_MASK
+    wanted = 'inode' if path in EFI_TARGETS else 'ctime' if path in TMPFILES else None
+    expected_mask = EFI_DIRECTORY_MASK if path in EFI_DIRECTORIES else EFI_MASK if path in EFI else SYMLINK_MASK if path == '/etc/os-release' else REGULAR_MASK
     if wanted is None or attribute != wanted or row.get('attributes') != expected_mask:
         refuse('unqualified_summary_target')
     # Vendor report.c order: type/link/size/blocks/p/u/g/a/m/c/i/n/hash/ACL/X/S/E/caps.
     bits = (35, 1, 5, 10, 2, 3, 4, 6, 8, 7, 9, 11, 31, 21, 33, 32, 36, 37)
     expected = ''.join(('=' if index == 2 else '.') if expected_mask & (1 << bit) else ' '
                        for index, bit in enumerate(bits))
-    expected = ('l' if path == '/etc/os-release' else 'f') + expected[1:]
+    expected = ('d' if path in EFI_DIRECTORIES else 'l' if path == '/etc/os-release' else 'f') + expected[1:]
     offset, marker = (10, 'i') if attribute == 'inode' else (9, 'c')
     expected = expected[:offset] + marker + expected[offset + 1:]
     if summary != expected:

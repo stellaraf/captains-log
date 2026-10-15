@@ -40,9 +40,41 @@ First boot records the measured versions and immutable OCI identities of the ins
 
 `nebulalog update install` uses the same manifest/signature/bundle options. It verifies supported versions and disk reserve, copies/reverifies immutable staging files, records a durable transaction journal and invokes **fixed locally installed root-owned adapters**, never a downloaded hook name. Preflight and PostgreSQL/configuration backups precede component activation. Postchecks require API, Web, ClickHouse, PostgreSQL, Keycloak, local auth, ingestion, FIPS, SELinux, LUKS, firewall and compliance. Failure invokes rollback and repeats health checks; any failed recovery is recorded as `recovery_required`. A release sequence high-water mark survives rollback.
 
-The [installed lifecycle adapters](../appliance/adapters/README.md) implement these operations using bounded systemd, Podman/Skopeo, PostgreSQL and ClickHouse commands. They accept same-schema, explicitly reversible immutable OCI changes; database major/schema migrations and baseline/SCAP content changes are refused pending separate qualification. Keycloak changes also require signed, candidate-bound real browser evidence for local MFA, AD/LDAPS+MFA, Okta/Entra/generic SAML and generic OIDC. The routine health probe independently proves fresh local password+OTP with PKCE and authenticated VIEWER access; it does not substitute for remote-provider browser evidence.
+The [installed lifecycle adapters](../appliance/adapters/README.md) implement these operations using bounded systemd, Podman/Skopeo, PostgreSQL and ClickHouse commands. They accept same-schema, explicitly reversible immutable OCI changes. Current development source also implements the fixed schema-1-to-2 transition described below; other schema changes, database major upgrades and baseline/SCAP content changes remain refused. Keycloak changes also require signed, candidate-bound real browser evidence for local MFA, AD/LDAPS+MFA, Okta/Entra/generic SAML and generic OIDC. The routine health probe independently proves fresh local password+OTP with PKCE and authenticated VIEWER access; it does not substitute for remote-provider browser evidence.
 
-Metadata backups and all credentials remain on the encrypted data mount. API/identity writers are quiesced while ingestion continues receiving. A failed activation restores validated metadata/configuration and original image pins; a later operator rollback preserves post-commit users/configuration/data and changes only the release's image pins. ClickHouse log history and WAL are not rewound by metadata restore. An unrecovered backup failure records `recovery_required` and retains maintenance.
+Emergency storage protection introduces application schema **2**. Build provenance,
+factory enrollment and release assembly now bind the declared revision to the
+complete, reviewed set of PostgreSQL, ClickHouse and step-up migration file hashes.
+Changed or additional SQL cannot be labelled as a schema-1 update. The source
+includes a persistent host storage gate, a matching database gate and a tested
+PostgreSQL lock barrier. They distinguish pausing destructive cleanup from pausing
+log delivery, and retain the host hold when database acknowledgement is lost.
+
+The fixed schema-1-to-2 executor and component lifecycle integration are implemented
+and undergoing native qualification. The executor compares the complete catalog
+against reviewed SQL, records an immutable operation before dispatch and verifies
+the actual committed catalog and marker in a separate transaction. A lost
+acknowledgement never authorizes replay. Recovery removes the exact client container
+and terminates its tagged PostgreSQL execution before any metadata restore.
+
+Existing installations need a compatible coordinator update before a migration
+release: lifecycle hooks run through the previously accepted host generation.
+That bridge must retain the old schema-1 application and its Quadlet templates;
+it must not claim schema 1 for the new schema-2 source. A later operator application
+rollback preserves the additive database schema, users and current data. Actual
+schema provenance is stored separately from the installation's lifecycle settings
+and remains bound to the original migration receipt and verified backup. Preserve
+that entire release stage while the provenance references it. An interrupted
+immediate restore resumes only from its exact backup and continuous host hold;
+a completed restore is not replayed after writers have resumed.
+
+Real PostgreSQL and coordinator interruption tests have passed. Native
+Podman/systemd transport, combined release installation and OS hold finalization
+are still being qualified; these changes are not deployed or accepted as a complete
+self-update path. A fresh schema-2 install or successful package assembly does not
+prove the existing-installation upgrade/rollback path.
+
+Metadata backups and all credentials remain on the encrypted data mount. API/identity writers are quiesced. A verified gate-aware collector continues receiving into durable WAL with database delivery paused; a legacy or unverified collector is stopped for a consistent backup. A failed activation restores validated metadata/configuration and original image pins; a later operator rollback preserves post-commit users/configuration/data and changes only the release's image pins. ClickHouse log history and WAL are not rewound by metadata restore. Unresolved ClickHouse removal or insertion evidence blocks metadata changes. An unrecovered backup failure records `recovery_required` and retains maintenance.
 
 Component completion is durable before `update-finalize` releases maintenance. If release fails, the accepted software remains installed; status exposes pending finalization and blocks new work. `nebulalog update finalize` repeats retained signature/exact transaction hash checks and current health, then retries only maintenance release. Installation expiry may have elapsed for this recovery-only action, which never activates software or restores data. The operator rollback command also re-verifies retained metadata and requires a reversible release plus complete health; expired metadata remains refused for rollback/new installation, and altered metadata is always refused. **Adapter and engine unit coverage is implemented; installed-guest upgrade/rollback qualification is still pending.** GitHub delivery is implemented in source and still requires real-release guest acceptance.
 
@@ -68,6 +100,17 @@ A deferred reboot is checked again at the next maintenance window even if there 
 If the process is interrupted while preparing to reboot, `nebulalog update os-recover` can restore the operation's services on the same boot. It verifies the retained backup and package/AIDE state before starting services, then requires all runtime checks before releasing maintenance. It neither installs packages again nor requests a reboot. A transaction that already requested a reboot follows the separate new-boot completion path; the recovery command cannot reinterpret it as an interrupted preparation.
 
 For an interrupted component transaction, `nebulalog update recover` verifies the retained release signature and transaction, restores through the previous host coordinator, and requires fresh health checks before releasing maintenance. This command can restore configuration and release pins from the interrupted operation; completed transactions use `finalize` instead. Pending OS recovery must finish first. The appliance status publishes the applicable fixed recovery command.
+
+If backup or preparation stopped before activation, recovery uses the durable
+preactivation journal and the original protected backup intent to verify that
+configuration, permissions, image pins and actual database schema are unchanged.
+It settles the storage barrier and restarts the previous services without
+restoring partial database dumps. Incomplete backup files remain available for
+diagnosis. Any candidate migration/activation evidence, changed runtime, foreign
+maintenance owner or unresolved storage action refuses this path. Full health
+checks and durable transaction completion still precede maintenance release.
+Older interrupted transactions without this proof require their complete verified
+backup; missing evidence never authorizes a guessed restore or gate release.
 
 Native x86_64 UEFI/Secure Boot build work is present; tested vTPM enrollment and unattended encrypted-storage reboot on both selected hypervisors remain required. The GitHub transaction also carries compatible management-software generations with exact AIDE renewal; baseline/SCAP policy migrations, checker changes and broad OS package recipes remain separate unfinished work. These are explicit candidate limitations, not accepted all-software update coverage.
 

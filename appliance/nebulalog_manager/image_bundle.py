@@ -26,6 +26,96 @@ PINS_PATH = Path("/etc/nebulalog/images.json")
 DATA_DIRECTORY = Path("/var/lib/nebulalog")
 
 
+class ApplicationSchema:
+    """Reviewed source identities; declarations never authorize live SQL.
+
+    Keep this namespace in the existing image-bundle module so a bridge release
+    remains verifiable by the previous generation's fixed host file catalog.
+    """
+
+    LEGACY_REVISION = "1"
+    CURRENT_REVISION = "2"
+    ADDITIVE_UPGRADE = "postgres-emergency-storage-1-to-2"
+    SCHEMAS = {
+        "1": {
+            "migrations/postgres.sql": "122e2791afa29563db6f80aa248d604f87428e06e70818f2bf467aa58d07eefa",
+            "migrations/clickhouse.sql": "fd84d9a576b8e850e0a33625c13f422901736d23475b8b97c4b71840ef1d91ce",
+            "migrations/host_stepup.sql": "b78e4e65ca8dc35593803fb89cfe1af76521495ca8cabdf9a174c86be6936b56",
+        },
+        "2": {
+            "migrations/postgres.sql": "90af76769233c482f186b6d7827abe0eab84e44192afbf81dfe48aeb71d7c217",
+            "migrations/clickhouse.sql": "fd84d9a576b8e850e0a33625c13f422901736d23475b8b97c4b71840ef1d91ce",
+            "migrations/host_stepup.sql": "b78e4e65ca8dc35593803fb89cfe1af76521495ca8cabdf9a174c86be6936b56",
+        },
+    }
+
+    # Fixed host-installed SQL; never load a release-provided SQL path or hook.
+    LEGACY_POSTGRES_SQL = 'CREATE TABLE IF NOT EXISTS saved_filters (\n id uuid PRIMARY KEY, owner_id text NOT NULL, name text NOT NULL CHECK(length(name) BETWEEN 1 AND 128),\n description text NOT NULL DEFAULT \'\', query text NOT NULL, log_type text NOT NULL DEFAULT \'traffic\',\n columns jsonb NOT NULL DEFAULT \'[]\', time_range text NOT NULL DEFAULT \'1h\', sort text NOT NULL DEFAULT \'received_at\',\n favorite boolean NOT NULL DEFAULT false, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()\n);\nCREATE INDEX IF NOT EXISTS saved_filters_owner ON saved_filters(owner_id);\nCREATE TABLE IF NOT EXISTS layouts (owner_id text NOT NULL, log_type text NOT NULL, layout jsonb NOT NULL, PRIMARY KEY(owner_id,log_type));\nCREATE TABLE IF NOT EXISTS firewalls (\n serial text PRIMARY KEY, device_name text NOT NULL DEFAULT \'\', sender_ip text NOT NULL DEFAULT \'\',\n friendly_name text NOT NULL DEFAULT \'\', site text NOT NULL DEFAULT \'\', tags jsonb NOT NULL DEFAULT \'[]\', notes text NOT NULL DEFAULT \'\',\n panos_version text NOT NULL DEFAULT \'\', first_seen timestamptz NOT NULL DEFAULT now(), last_seen timestamptz NOT NULL DEFAULT now()\n);\nCREATE TABLE IF NOT EXISTS settings (key text PRIMARY KEY, value jsonb NOT NULL);\nINSERT INTO settings(key,value) VALUES(\'retention\',\'{"global_days":90,"per_type":{"traffic":60,"threat":365,"url":90,"authentication":365,"configuration":365,"system":365}}\') ON CONFLICT DO NOTHING;\nCREATE TABLE IF NOT EXISTS audit_events(id bigserial PRIMARY KEY, occurred_at timestamptz NOT NULL DEFAULT now(), actor text NOT NULL, action text NOT NULL, target text NOT NULL, detail jsonb NOT NULL DEFAULT \'{}\');\nCREATE TABLE IF NOT EXISTS export_jobs (\n id uuid PRIMARY KEY, owner_id text NOT NULL, status text NOT NULL, rows bigint NOT NULL DEFAULT 0, bytes bigint NOT NULL DEFAULT 0,\n error text NOT NULL DEFAULT \'\', request jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), expires_at timestamptz NOT NULL DEFAULT now()+interval \'24 hours\'\n);\nCREATE TABLE IF NOT EXISTS storage_samples(sampled_at timestamptz NOT NULL DEFAULT now(), database_bytes bigint NOT NULL, events bigint NOT NULL, PRIMARY KEY(sampled_at));\n\nALTER TABLE saved_filters ADD COLUMN IF NOT EXISTS sort_order text NOT NULL DEFAULT \'desc\' CHECK(sort_order IN (\'asc\',\'desc\'));\n\nCREATE TABLE IF NOT EXISTS user_preferences (\n owner_id text PRIMARY KEY,\n theme text NOT NULL DEFAULT \'system\' CHECK(theme IN (\'system\',\'light\',\'dark\')),\n density text NOT NULL DEFAULT \'compact\' CHECK(density IN (\'compact\',\'comfortable\')),\n rail_collapsed boolean NOT NULL DEFAULT false,\n updated_at timestamptz NOT NULL DEFAULT now()\n);\n'
+    ADDITIVE_POSTGRES_SQL = '\n-- Emergency retention is separate from expiry assigned to future arrivals.\nINSERT INTO settings(key,value) VALUES(\'storage_emergency\',\'{"revision":1,"enabled":true,"trigger_percent":95,"recover_percent":90,"minimum_days":{"traffic":1,"url":7,"threat":30,"wildfire":30,"dns":30,"data":30,"hip":30,"globalprotect":30,"iptag":30,"userid":30,"decryption":30,"tunnel":30,"configuration":30,"system":30,"authentication":30}}\') ON CONFLICT DO NOTHING;\nINSERT INTO settings(key,value) VALUES(\'storage_emergency_maintenance\',\'{"schema":1,"held":false,"delivery_held":false,"operation":null}\') ON CONFLICT DO NOTHING;\nCREATE TABLE IF NOT EXISTS storage_emergency_state (\n singleton boolean PRIMARY KEY CHECK(singleton), value jsonb NOT NULL\n);\nINSERT INTO storage_emergency_state(singleton,value) VALUES(true,\'{"state":"not_observed","observed_at":null,"message":"Waiting for the first verified ClickHouse disk observation","emergency_active":false,"insert_exclusions":0}\') ON CONFLICT DO NOTHING;\nCREATE TABLE IF NOT EXISTS storage_emergency_actions (\n id uuid PRIMARY KEY, state text NOT NULL CHECK(state IN (\'prepared\',\'executing\',\'uncertain\',\'awaiting_cleanup\',\'completed\',\'cancelled\')),\n plan jsonb NOT NULL, message text NOT NULL DEFAULT \'\', created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), completed_at timestamptz\n);\nCREATE UNIQUE INDEX IF NOT EXISTS storage_emergency_one_pending ON storage_emergency_actions((true)) WHERE completed_at IS NULL;\nCREATE TABLE IF NOT EXISTS storage_emergency_inserts (\n id uuid PRIMARY KEY, table_uuid uuid NOT NULL, partitions jsonb NOT NULL, query_id uuid NOT NULL UNIQUE, created_at timestamptz NOT NULL DEFAULT now()\n);\n'
+    HOST_STEPUP_SQL = "-- Short-lived server-only OAuth transactions. State is SHA-256 hashed before\n-- insertion; nonce and PKCE verifier are never copied to audit/job records.\nCREATE TABLE IF NOT EXISTS host_stepup_pending (\n state_hash text PRIMARY KEY CHECK (state_hash ~ '^[a-f0-9]{64}$'),\n nonce text NOT NULL CHECK (nonce ~ '^[A-Za-z0-9_-]{43,128}$'),\n pkce_verifier text NOT NULL CHECK (pkce_verifier ~ '^[A-Za-z0-9._~-]{43,128}$'),\n policy_digest text NOT NULL CHECK (policy_digest ~ '^[a-f0-9]{64}$'),\n actor_issuer text NOT NULL CHECK (octet_length(actor_issuer) BETWEEN 1 AND 2048 AND actor_issuer !~ '[[:cntrl:]]'),\n actor_subject text NOT NULL CHECK (octet_length(actor_subject) BETWEEN 1 AND 512 AND actor_subject !~ '[[:cntrl:]]'),\n actor_client_id text NOT NULL CHECK (octet_length(actor_client_id) BETWEEN 1 AND 512 AND actor_client_id !~ '[[:cntrl:]]'),\n actor_session_digest text NOT NULL CHECK (actor_session_digest ~ '^[a-f0-9]{64}$'),\n installation_id text NOT NULL CHECK (installation_id ~ '^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'),\n operation text NOT NULL CHECK (operation ~ '^[a-z][a-z0-9_.]{0,127}$'),\n plan_id text NOT NULL CHECK (plan_id ~ '^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'),\n plan_digest text NOT NULL CHECK (plan_digest ~ '^[a-f0-9]{64}$'),\n resource_revision text NOT NULL CHECK (resource_revision ~ '^[a-f0-9]{64}$'),\n binding_expires_at timestamptz NOT NULL CHECK (isfinite(binding_expires_at)),\n created_at timestamptz NOT NULL CHECK (isfinite(created_at) AND created_at >= '1970-01-01T00:00:00Z'),\n expires_at timestamptz NOT NULL CHECK (isfinite(expires_at)),\n CHECK (expires_at > created_at AND expires_at <= created_at + interval '120 seconds'),\n CHECK (expires_at <= binding_expires_at)\n);\nCREATE INDEX IF NOT EXISTS host_stepup_pending_expiry ON host_stepup_pending (expires_at, state_hash);\n"
+
+    @staticmethod
+    def reviewed_sql():
+        legacy = ApplicationSchema.LEGACY_POSTGRES_SQL
+        additive = ApplicationSchema.ADDITIVE_POSTGRES_SQL
+        stepup = ApplicationSchema.HOST_STEPUP_SQL
+        expected = ApplicationSchema.SCHEMAS
+        for body, digest in ((legacy, expected["1"]["migrations/postgres.sql"]),
+                             (legacy + additive, expected["2"]["migrations/postgres.sql"]),
+                             (stepup, expected["2"]["migrations/host_stepup.sql"])):
+            if hashlib.sha256(body.encode()).hexdigest() != digest:
+                raise Refused("Installed migration SQL differs from its reviewed source identity")
+        return legacy, additive, stepup
+
+    @staticmethod
+    def schema_digest(revision):
+        if not isinstance(revision, str) or revision not in ApplicationSchema.SCHEMAS:
+            raise Refused("Application schema revision has no reviewed source contract")
+        return hashlib.sha256(json.dumps(ApplicationSchema.SCHEMAS[revision], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    @staticmethod
+    def source_revision(files):
+        if not isinstance(files, dict) or any(not isinstance(name, str) for name in files):
+            raise Refused("Application schema needs a complete source inventory")
+        migrations = {name: value for name, value in files.items() if name.startswith("migrations/")}
+        for revision, expected in ApplicationSchema.SCHEMAS.items():
+            if migrations == expected:
+                return revision
+        raise Refused("Migration source differs from every reviewed application schema; qualify a new revision")
+
+    @staticmethod
+    def bind_source(files, revision):
+        observed = ApplicationSchema.source_revision(files)
+        if revision != observed:
+            raise Refused("Declared application schema revision differs from the actual migration source")
+        return ApplicationSchema.schema_digest(observed)
+
+    @staticmethod
+    def declaration(files, revision, migration="none"):
+        digest = ApplicationSchema.bind_source(files, revision)
+        if migration not in ("none", ApplicationSchema.ADDITIVE_UPGRADE) or migration == ApplicationSchema.ADDITIVE_UPGRADE and revision != ApplicationSchema.CURRENT_REVISION:
+            raise Refused("Application migration is not a reviewed fixed transition")
+        return {"schema_revision": revision, "schema_sha256": digest, "database_migration": migration}
+
+    @staticmethod
+    def transition(change, installed_revision):
+        """Validate only the declaration; this does not authorize SQL or activation."""
+        target = change.get("schema_revision")
+        digest = ApplicationSchema.schema_digest(target)
+        if change.get("schema_sha256") != digest:
+            # Retained schema-1 releases predate the fingerprint field. Their legacy
+            # same-schema path is needed to install the migration-capable coordinator.
+            if not (target == installed_revision == ApplicationSchema.LEGACY_REVISION and "schema_sha256" not in change):
+                raise Refused("Release schema fingerprint differs from its reviewed source contract")
+        migration = change.get("database_migration")
+        if migration == "none" and target == installed_revision:
+            return "none"
+        if (migration == ApplicationSchema.ADDITIVE_UPGRADE and installed_revision == ApplicationSchema.LEGACY_REVISION
+                and target == ApplicationSchema.CURRENT_REVISION and change.get("rollback_safe") is True):
+            return ApplicationSchema.ADDITIVE_UPGRADE
+        raise Refused("Application schema change requires a supported explicit migration")
+
+
 def _object(pairs):
     value = {}
     for key, item in pairs:

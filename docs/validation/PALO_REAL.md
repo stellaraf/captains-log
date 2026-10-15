@@ -50,7 +50,38 @@ The existing forwarding profile already selected **All Logs** for WildFire and s
 
 Four source package test suites passed. A separate isolated full-parser check passed five controlled cases: benign, grayware, malware, and phishing `THREAT/wildfire` events remained WildFire Submissions; `THREAT/wildfire-virus` remained Threat. These were synthetic variations of a sanitized native Threat fixture, **not real WildFire captures**, and none were injected into the collector or event database.
 
-The reporting settings apply to future qualifying events; they do not backfill earlier unlogged submissions. A subsequent native WildFire event still needs to be matched to its stored record to establish live submission delivery. Follow the [complete forwarding setup](../FIREWALL_SETUP.md), including the [required WildFire reporting settings](../FIREWALL_SETUP.md#5-include-benign-and-grayware-wildfire-files), instead of treating upload or verdict counters as log-delivery evidence.
+The reporting settings apply to future qualifying events; they do not backfill earlier unlogged submissions. At this September checkpoint, a subsequent native WildFire event had not yet been matched to its stored record. Follow the [complete forwarding setup](../FIREWALL_SETUP.md), including the [required WildFire reporting settings](../FIREWALL_SETUP.md#5-include-benign-and-grayware-wildfire-files), instead of treating upload or verdict counters as log-delivery evidence.
+
+### October 15 historical WildFire comparison
+
+A read-only audit at **2026-10-15 19:05 UTC** found **1,495 parsed
+`THREAT/wildfire` records** in the preceding 30 days. Nine native firewall
+submissions from October 3 matched stored events by serial and sequence across
+**17 fields each, with all 153 comparisons matching**. Those comparisons include
+the verdict/category, file digest/type, addresses and ports, rule/action, and
+session. This is actual historical submission evidence, not generated fixtures.
+
+The running firewall still enabled benign and grayware reporting, forwarded
+WildFire with **All Logs** over **TLS/6514**, and used an analysis profile covering
+any supported file type/application in both directions on the associated rules.
+Existing inspection-bypass rules had no WildFire Analysis association; session
+logging on those rules does not establish file-inspection coverage. The audit
+did not change inspection policy, upload samples, or generate alerts.
+
+The latest native submission was October 13. The default one-hour query correctly
+returned zero; the equivalent 30-day query returned the 1,495 historical records.
+Twenty newer native records in the latest 100 were absent from the collector,
+and no category had stored arrivals during October 9–14. This is consistent with
+a collection gap, but the audit did not independently establish historical
+runtime uptime or the cause of every missing record. It is not evidence of
+uninterrupted or lossless delivery.
+
+The private audit receipt has SHA-256
+`4d180c1d350e54c88c4df63da6e56ef426fe8b445353c08cc2a5ad67a452f4f7`.
+Raw data and configuration remain outside Git. A fresh post-reconnection
+WildFire submission, authenticated category UI, and CSV export still need
+verification. This advances historical native parsing/delivery evidence only;
+it does not close the complete appliance release gate.
 
 ## Field correctness beyond the parse flag
 

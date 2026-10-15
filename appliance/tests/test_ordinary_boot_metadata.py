@@ -18,15 +18,16 @@ def b64(value):
 
 def fixture_row(path):
     link = path == '/etc/os-release'
-    efi = path in metadata.EFI
+    directory = path in metadata.EFI_DIRECTORIES
+    efi = path in metadata.EFI_TARGETS
     label = b'system_u:object_r:dosfs_t:s0' if efi else b'system_u:object_r:etc_t:s0'
     return dict(zip(metadata.FIELDS, (
         path, '../usr/lib/os-release' if link else '0',
-        '120777' if link else '100700' if efi else '100644', '0', '0', '21' if link else '7',
-        '1760000000', '1750000000', '73', '1',
-        str(metadata.EFI_MASK if efi else metadata.SYMLINK_MASK if link else metadata.REGULAR_MASK),
+        '40700' if directory else '120777' if link else '100700' if efi else '100644', '0', '0', '0' if directory else '21' if link else '7',
+        '0' if directory else '1760000000', '0' if directory else '1750000000', '73', '0' if directory else '1',
+        str(metadata.EFI_DIRECTORY_MASK if directory else metadata.EFI_MASK if efi else metadata.SYMLINK_MASK if link else metadata.REGULAR_MASK),
         '0' if link or efi else 'POSIX,' + b64(b'user::rw-\ngroup::r--\nother::r--\n') + ',0',
-        '0' if link else b64(hashlib.sha512(b'fixture').digest()), b64(label),
+        '0' if link or directory else b64(hashlib.sha512(b'fixture').digest()), b64(label),
         '1,security.selinux,' + b64(label + b'\0'),
     )))
 
@@ -60,7 +61,7 @@ class MetadataDatabaseTests(unittest.TestCase):
 
     def test_exact_rows_keep_seconds_and_full_security_values(self):
         result = parse(compressed())
-        self.assertEqual(result['entry_count'], 18)
+        self.assertEqual(result['entry_count'], 20)
         self.assertEqual(set(result['rows']), metadata.TARGETS)
         issue = result['rows']['/etc/issue']
         self.assertEqual((issue['inode'], issue['ctime_s'], issue['mtime_s']), (73, 1760000000, 1750000000))
@@ -73,6 +74,7 @@ class MetadataDatabaseTests(unittest.TestCase):
         self.assertIsNone(link['sha512'])
         self.assertEqual(metadata.REGULAR_MASK, 49394224061)
         self.assertEqual(metadata.EFI_MASK, 49392126909)
+        self.assertEqual(metadata.EFI_DIRECTORY_MASK, 47244640797)
         self.assertEqual(metadata.SYMLINK_MASK, 47244643263)
 
     def test_digest_and_compressed_input_limits_are_mandatory(self):
@@ -133,7 +135,7 @@ class MetadataDatabaseTests(unittest.TestCase):
     def test_canonical_filename_encoding_and_duplicate_alias(self):
         rows = [fixture_row(path) for path in sorted(metadata.TARGETS)]
         extra = fixture_row('/usr/share/with%20space%25%2C%FF')
-        self.assertEqual(parse(compressed(text_database(rows + [extra])))['entry_count'], 19)
+        self.assertEqual(parse(compressed(text_database(rows + [extra])))['entry_count'], 21)
         for name in ('/etc/%69ssue', '/etc/%2fissue', '/etc/../issue', '/etc//issue',
                      '/etc/issue/', '/etc/%00issue', '/etc/issue%', '/etc/issue#'):
             self.assert_refused(self.changed_row('name', name))
@@ -148,7 +150,7 @@ class MetadataDatabaseTests(unittest.TestCase):
             self.assert_refused(self.changed_row(field, value))
 
     def test_attribute_mask_exact_for_each_target(self):
-        for path in ('/etc/issue', '/etc/os-release', metadata.EFI[0]):
+        for path in ('/etc/issue', '/etc/os-release', metadata.EFI[0], *metadata.EFI_DIRECTORIES):
             original = int(fixture_row(path)['attr'])
             for bit in range(46):
                 with self.subTest(path=path, bit=bit):
@@ -193,6 +195,7 @@ class MetadataDatabaseTests(unittest.TestCase):
     def test_native_summaries_and_every_other_changed_column(self):
         rows = parse(compressed())['rows']
         cases = [(metadata.EFI[0], 'inode', 'f = ... ..i.. ..  '),
+                 *[(path, 'inode', 'd   ...   i   ..  ') for path in metadata.EFI_DIRECTORIES],
                  ('/etc/issue', 'ctime', 'f = ... .c......  '),
                  ('/etc/os-release', 'ctime', 'l.= ... .c..  ..  ')]
         for path, attribute, summary in cases:
@@ -209,6 +212,26 @@ class MetadataDatabaseTests(unittest.TestCase):
                     metadata.validate_change_summary(path, bad, row=rows[path], attribute=attribute)
         with self.assertRaises(Refused):
             metadata.validate_change_summary('/etc/elsewhere', cases[1][2], row=rows['/etc/issue'], attribute='ctime')
+
+    def test_fixed_directory_rows_require_exact_vendor_zero_columns_and_type(self):
+        for path in metadata.EFI_DIRECTORIES:
+            row = parse(compressed())['rows'][path]
+            self.assertEqual(row['kind'], 'directory')
+            self.assertEqual(row['attributes'], 47244640797)
+            self.assertEqual([row[key] for key in ('bytes', 'ctime_s', 'mtime_s', 'nlink')], [0] * 4)
+            for field, value in [('size', '512'), ('ctime', '1760000000'), ('mtime', '1750000000'),
+                                  ('lcount', '2'), ('perm', '100700'), ('perm', '40755'),
+                                  ('uid', '1'), ('gid', '1'), ('lname', 'elsewhere'),
+                                  ('sha512', b64(b'x' * 64)), ('acl', 'POSIX,eA==,0')]:
+                with self.subTest(path=path, field=field):
+                    self.assert_refused(self.changed_row(field, value, path))
+
+    def test_two_directory_targets_are_required_not_a_generic_directory_exemption(self):
+        for path in metadata.EFI_DIRECTORIES:
+            self.assert_refused(compressed(text_database([fixture_row(p) for p in sorted(metadata.TARGETS) if p != path])))
+        unknown = {**fixture_row(metadata.EFI_DIRECTORIES[0]), 'name': '/boot/efi/EFI/unowned'}
+        parsed = parse(compressed(text_database([fixture_row(p) for p in sorted(metadata.TARGETS)] + [unknown])))
+        self.assertNotIn(unknown['name'], parsed['rows'])
 
 
 class AcceptedDatabaseTests(unittest.TestCase):

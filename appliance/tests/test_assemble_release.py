@@ -40,7 +40,9 @@ class ReleaseTests(unittest.TestCase):
         descriptor = {"schema": 1, "publisher": "Test fixture", "repository": release.REPOSITORY, "key_id": "fixture",
                       "algorithm": "RSA-PSS-SHA256", "spki_sha256": payload.digest(der)}
         for name, raw in ((publisher_inputs.PUBLIC_SOURCE, raw_public), (publisher_inputs.DESCRIPTOR_SOURCE, payload.encoded(descriptor)),
-                          ("go.mod", b"module fixture\n"), ("cmd/nebulalog/main.go", b"package main\n")):
+                          ("go.mod", b"module fixture\n"), ("cmd/nebulalog/main.go", b"package main\n"),
+                          *(("migrations/" + name, (PACKER.parents[1] / "migrations" / name).read_bytes())
+                            for name in ("postgres.sql", "clickhouse.sql", "host_stepup.sql"))):
             path = self.source / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(raw)
@@ -49,7 +51,7 @@ class ReleaseTests(unittest.TestCase):
         self.images = self.root / "images"
         self.pins, self.image_manifest, _ = images.fixture_bundle(self.images, application_source_sha256=release.application_hash(snapshot))
         self.recipe = {"schema": 1, "repository": release.REPOSITORY, "sequence": 2, "version": "0.1.1",
-            "issued_at": "2026-09-01T00:00:00Z", "expires_at": "2027-09-01T00:00:00Z", "schema_revision": "1", "source_commit": COMMIT,
+            "issued_at": "2026-09-01T00:00:00Z", "expires_at": "2027-09-01T00:00:00Z", "schema_revision": "2", "source_commit": COMMIT,
             "components": {name: {"version": "0.1.1", "from_versions": ["0.1.0"]} for name in ("host", "nebulalog")}, "evidence_artifacts": []}
         self.recipe_path = self.root / "recipe.json"
         self.output = self.root / "release"

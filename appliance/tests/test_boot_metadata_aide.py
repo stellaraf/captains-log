@@ -45,13 +45,13 @@ class MetadataAideTests(unittest.TestCase):
         self.boot_generation = 0
         self.native_current = native_fixture.fixture()[1]; self.native_current['boot_id'] = self.initial['boot_id']
         self.refresh_native()
-        # Keep both injected native readers internally consistent on the18 files.
+        # Keep both injected native readers consistent on all 20 targets.
         for path, row in self.native_current['rows'].items():
             item = {'kind': row['kind'], 'uid': row['uid'], 'gid': row['gid'], 'mode': row['mode'],
                     'xattrs_sha256': digest({name: hashlib.sha256(base64.b64decode(raw)).hexdigest()
                                              for name, raw in row['xattrs'].items()})}
             if row['kind'] == 'file': item.update(bytes=row['bytes'], sha256=hashlib.sha256(b'fixture').hexdigest())
-            else: item.update(target=row['target'])
+            elif row['kind'] == 'symlink': item.update(target=row['target'])
             self.initial['artifacts'][path] = item
         self.observed = copy.deepcopy(self.initial)
         self.write_private(self.env, base64.b64decode(self.initial['grub']['raw']))
@@ -95,7 +95,7 @@ class MetadataAideTests(unittest.TestCase):
         if drift:
             for path in database.TMPFILES:
                 self.current_rows[path]['ctime'] = str(1760000000 + self.boot_generation * 100)
-            for path in database.EFI:
+            for path in database.EFI_TARGETS:
                 self.current_rows[path]['inode'] = str(int(self.current_rows[path]['inode']) + 1)
         self.refresh_native()
 
@@ -109,7 +109,7 @@ class MetadataAideTests(unittest.TestCase):
         bits = (35, 1, 5, 10, 2, 3, 4, 6, 8, 7, 9, 11, 31, 21, 33, 32, 36, 37)
         result = list(''.join(('=' if index == 2 else '.') if old['attributes'] & (1 << bit) else ' '
                               for index, bit in enumerate(bits)))
-        result[0] = 'l' if path == '/etc/os-release' else 'f'
+        result[0] = {'symlink': 'l', 'directory': 'd', 'file': 'f'}[new['kind']]
         for key in changed:
             offset, character = markers[key]; result[offset] = character
         return ''.join(result)
@@ -141,8 +141,8 @@ class MetadataAideTests(unittest.TestCase):
                   'databases': {str(output if action == 'init' else source): {'sha512': hashlib.sha512(raw if action == 'init' else old_raw).hexdigest()}}}
         if action != 'init':
             report['number_of_entries'].update(added=len(added), removed=len(removed), changed=len(changed))
-            if added: report['added'] = {path: ('l' if current[path]['kind'] == 'symlink' else 'f') + '+' * 17 for path in sorted(added)}
-            if removed: report['removed'] = {path: ('l' if old[path]['kind'] == 'symlink' else 'f') + '-' * 17 for path in sorted(removed)}
+            if added: report['added'] = {path: {'symlink': 'l', 'directory': 'd', 'file': 'f'}[current[path]['kind']] + '+' * 17 for path in sorted(added)}
+            if removed: report['removed'] = {path: {'symlink': 'l', 'directory': 'd', 'file': 'f'}[old[path]['kind']] + '-' * 17 for path in sorted(removed)}
             if changed: report['changed'] = {path: self.summary(path, old[path], current[path]) for path in sorted(changed)}
         if action in {'init', 'update'}:
             self.assertFalse(output.exists(), 'never overwrite retained DB output')
@@ -167,20 +167,114 @@ class MetadataAideTests(unittest.TestCase):
         for path, raw in self.original.items(): self.assertEqual(path.read_bytes(), raw)
         return result
 
-    def test_actual_ordinary_ownership_records_parser_scans_and_cas_accept_eighteen_changes(self):
+    def assert_directory_evidence(self, value):
+        """AIDE omits these scalars; the immutable native authority does not."""
+        changes = {item['path']: item for item in value['transition']['changes']}
+        for path in database.EFI_DIRECTORIES:
+            row = value['after']['rows'][path]
+            full = value['after']['authority']['directories'][path]
+            self.assertEqual(row['kind'], 'directory')
+            self.assertEqual(row['attributes'], 47244640797)
+            self.assertEqual([row[key] for key in ('bytes', 'nlink', 'ctime_s', 'mtime_s', 'ctime_ns', 'mtime_ns')], [0] * 6)
+            self.assertIsNone(row['sha512']); self.assertIsNone(row['acl'])
+            self.assertEqual(full['bytes'], 4096); self.assertEqual(full['nlink'], 2)
+            self.assertEqual(full['ctime_ns'], 1760000000_000000000)
+            self.assertEqual(full['mtime_ns'], 1750000000_000000000)
+            self.assertEqual(set(full['children']), set(native.DIRECTORY_CHILDREN[path]))
+            self.assertEqual(changes[path]['attribute'], 'inode')
+            self.assertEqual(changes[path]['summary'], 'd   ...   i   ..  ')
+
+    def assert_no_metadata_acceptance(self, update_count=0):
+        self.assertEqual(self.scan_calls.count('update'), update_count)
+        self.assertEqual((self.state / 'aide.db.gz').read_bytes(), self.initial_db)
+        self.assertFalse((self.state / 'authorized/head.json').exists())
+        self.assertEqual(self.scan_calls.count('init'), 1)
+        for path, raw in self.original.items(): self.assertEqual(path.read_bytes(), raw)
+
+    def test_actual_ordinary_ownership_records_parser_scans_and_cas_accept_twenty_changes(self):
         self.assertIsNone(self.pending())
         self.reboot(); stage = self.pending(); self.complete(stage)
         history = updates.accepted_plan_history(manager=self.manager)
         self.assertEqual(len(history['history']), 1)
         value = history['history'][0]['prepared']['metadata'][proof.KEY]
-        self.assertEqual(len(value['transition']['changes']), 18)
+        self.assertEqual(len(value['transition']['changes']), 20)
         self.assertEqual(value['source_boot_id'], native_fixture.OLD_BOOT)
         self.assertEqual(value['after']['boot_id'], native_fixture.NEW_BOOT)
+        self.assert_directory_evidence(value)
         self.assertNotEqual((self.state / 'aide.db.gz').read_bytes(), self.initial_db)
         self.assertEqual(database.parse_database((self.state / 'aide.db.gz').read_bytes(),
                          expected_sha256=history['database_sha256'])['rows'],
                          {path: {key: value for key, value in row.items() if not key.endswith('_ns')}
                           for path, row in self.native_current['rows'].items()})
+
+    def test_directory_full_metadata_drift_refuses_despite_zero_database_columns(self):
+        self.reboot(); stage = self.pending()
+        original = copy.deepcopy(self.native_current)
+        cases = {'mode': 0o755, 'uid': 1, 'gid': 1, 'bytes': 8192, 'nlink': 3,
+                 'ctime_ns': 1760000000_000000001, 'mtime_ns': 1750000000_000000001,
+                 'acl': {'access': 'eA==', 'default': None}, 'xattrs': {'user.extra': 'eA=='}}
+        for path in database.EFI_DIRECTORIES:
+            for field, changed in cases.items():
+                with self.subTest(path=path, field=field):
+                    self.native_current = copy.deepcopy(original)
+                    self.native_current['authority']['directories'][path][field] = changed
+                    # The real DB has no directory timestamp, length or size evidence.
+                    row = self.scanner_rows(self.current_database())[path]
+                    self.assertEqual([row[key] for key in ('bytes', 'nlink', 'ctime_s', 'mtime_s')], [0] * 4)
+                    with self.assertRaises(Refused): self.reconcile(stage)
+                    self.assert_no_metadata_acceptance()
+
+    def test_directory_listing_and_consistent_child_content_drift_refuse(self):
+        self.reboot(); stage = self.pending()
+        original = copy.deepcopy(self.native_current)
+        original_rows = copy.deepcopy(self.current_rows)
+        for path in database.EFI_DIRECTORIES:
+            name = native.DIRECTORY_CHILDREN[path][0]
+            for change in ('added', 'removed', 'content'):
+                with self.subTest(path=path, change=change):
+                    self.native_current = copy.deepcopy(original)
+                    self.current_rows = copy.deepcopy(original_rows)
+                    children = self.native_current['authority']['directories'][path]['children']
+                    if change == 'added': children['unexpected.efi'] = copy.deepcopy(children[name])
+                    elif change == 'removed': del children[name]
+                    else:
+                        checksum = hashlib.sha512(b'changed').digest()
+                        children[name]['sha512'] = checksum.hex()
+                        self.current_rows[path + '/' + name]['sha512'] = base64.b64encode(checksum).decode()
+                        self.refresh_native()
+                        # This is a consistent capture of changed content, not a malformed fixture.
+                        native.validate_snapshot(self.native_current)
+                    with self.assertRaises(Refused): self.reconcile(stage)
+                    self.assert_no_metadata_acceptance()
+
+    def test_same_boot_directory_replacement_cannot_prepare_mutation(self):
+        stage, path, _ = self.host_fixture()
+        for directory in database.EFI_DIRECTORIES:
+            with self.subTest(directory=directory):
+                self.current_rows[directory]['inode'] = '74'
+                self.refresh_native()
+                with self.assertRaises(Refused): updates.prepare(self.manager, stage, path)
+                self.assert_no_metadata_acceptance()
+                self.current_rows[directory]['inode'] = '73'
+
+    def test_same_boot_directory_replacement_after_preparation_refuses(self):
+        self.reboot(); stage = self.pending()
+        updates.prepare(self.manager, stage, stage / core.PLAN)
+        for directory in database.EFI_DIRECTORIES:
+            with self.subTest(directory=directory):
+                self.current_rows[directory]['inode'] = '75'
+                self.refresh_native()
+                with self.assertRaises(Refused): updates.accept(self.manager, stage, stage / core.PLAN)
+                self.assert_no_metadata_acceptance()
+                self.current_rows[directory]['inode'] = '74'
+
+    def test_directory_report_cannot_claim_file_inode_exception(self):
+        self.reboot(); stage = self.pending()
+        def tamper(action, report):
+            if action == 'update': report['changed'][database.EFI_DIRECTORIES[0]] = 'f = ... ..i.. ..  '
+        self.report_hook = tamper
+        with self.assertRaises(Refused): self.reconcile(stage)
+        self.assert_no_metadata_acceptance(update_count=1)
 
     def test_content_drift_refuses_before_scan_or_cas(self):
         self.reboot(); stage = self.pending()
@@ -254,7 +348,8 @@ class MetadataAideTests(unittest.TestCase):
         last = history['history'][-1]['prepared']['metadata'][proof.KEY]
         self.assertEqual(last['pending']['prepared'], pending['prepared'])
         self.assertEqual(last['after']['boot_id'], self.native_current['boot_id'])
-        self.assertEqual(len(last['transition']['changes']), 18)
+        self.assertEqual(len(last['transition']['changes']), 20)
+        self.assert_directory_evidence(last)
         if point == 'ready_output':
             self.assertEqual(last['source_database_sha256'], hashlib.sha256(copied).hexdigest())
             self.assertEqual(last['database_source']['basis'], 'owned-ready-output')
@@ -465,7 +560,7 @@ class KernelMetadataAideTests(unittest.TestCase):
     for _name, _method in kernel_integration.KernelAideIntegrationTests.__dict__.items():
         if callable(_method) and not _name.startswith('test_') and _name not in {'setUp', 'enrolled'}:
             locals()[_name] = _method
-    for _name in ('scan_runner', 'summary', 'refresh_native'):
+    for _name in ('scan_runner', 'summary', 'refresh_native', 'assert_directory_evidence'):
         locals()[_name] = MetadataAideTests.__dict__[_name]
 
     def setUp(self):
@@ -528,7 +623,7 @@ class KernelMetadataAideTests(unittest.TestCase):
         self.native_current['boot_id'] = self.boot_id
         for path in database.TMPFILES:
             self.current_rows[path]['ctime'] = str(1760000000 + self.boot_generation * 100)
-        for path in database.EFI:
+        for path in database.EFI_TARGETS:
             self.current_rows[path]['inode'] = str(int(self.current_rows[path]['inode']) + 1)
         self.refresh_native()
 
@@ -555,11 +650,12 @@ class KernelMetadataAideTests(unittest.TestCase):
         self.assertEqual([row['plan']['phase'] for row in history['history']], ['arm', 'postboot', 'commit'])
         values = [row['prepared']['metadata'][proof.KEY] for row in history['history']]
         self.assertEqual([value['mode'] for value in values], ['mutation', 'observation', 'mutation'])
-        self.assertEqual([len(value['transition']['changes']) for value in values], [0, 18, 0])
+        self.assertEqual([len(value['transition']['changes']) for value in values], [0, 20, 0])
         self.assertEqual(values[1]['source_boot_id'], kernel_fixture.ORIGINAL_BOOT)
         self.assertEqual(values[1]['after']['boot_id'], kernel_fixture.NEW_BOOT)
+        self.assert_directory_evidence(values[1])
         parsed = database.parse_database((self.state / 'aide.db.gz').read_bytes(), expected_sha256=history['database_sha256'])
-        self.assertEqual(parsed['entry_count'], 21)
+        self.assertEqual(parsed['entry_count'], 23)
         self.assertEqual(self.manager.check()['state'], 'clean')
         self.assertEqual(self.scan_calls.count('init'), 1)
         self.assertEqual(self.runner(['/usr/sbin/grubby', '--default-kernel']), '/boot/vmlinuz-' + kernel_fixture.NEW)
@@ -574,7 +670,7 @@ class KernelMetadataAideTests(unittest.TestCase):
         self.assertEqual([row['plan']['phase'] for row in history['history']], ['postboot', 'commit'])
         value = history['history'][0]['prepared']['metadata'][proof.KEY]
         self.assertEqual(value['pending']['state'], 'scanning')
-        self.assertEqual(len(value['transition']['changes']), 18)
+        self.assertEqual(len(value['transition']['changes']), 20)
         self.assertEqual(self.scan_calls.count('init'), 1)
 
     def test_schema2_copied_promotion_recovers_on_later_candidate_boot(self):
@@ -592,7 +688,7 @@ class KernelMetadataAideTests(unittest.TestCase):
         value = history['history'][-1]['prepared']['metadata'][proof.KEY]
         self.assertEqual(value['database_source']['basis'], 'owned-ready-output')
         self.assertEqual(value['source_database_sha256'], hashlib.sha256(copied).hexdigest())
-        self.assertEqual(len(value['transition']['changes']), 18)
+        self.assertEqual(len(value['transition']['changes']), 20)
         self.assertEqual(self.manager.check()['state'], 'clean')
         self.assertEqual(self.scan_calls.count('init'), 1)
 
@@ -683,7 +779,7 @@ class KernelMetadataAideTests(unittest.TestCase):
         return kernel_fixture.BootTransactionTests.observe_retention(
             self, retention_plan_sha256=self.original_sha, **changes)
 
-    def test_schema2_retention_compound_accepts_exact_erase_and_eighteen_metadata_changes(self):
+    def test_schema2_retention_compound_accepts_exact_erase_and_twenty_metadata_changes(self):
         self.retention_origin()
         path, plan, observation = self.compound_after_boot()
         self.finish_compound(path, plan, observation)
@@ -692,11 +788,12 @@ class KernelMetadataAideTests(unittest.TestCase):
         self.assertEqual(row['plan']['kind'], 'rocky-kernel-retention-resume-v1')
         value = row['prepared']['metadata'][proof.KEY]
         self.assertEqual(value['mode'], 'observation')
-        self.assertEqual(len(value['transition']['changes']), 18)
+        self.assertEqual(len(value['transition']['changes']), 20)
         self.assertEqual(value['source_boot_id'], kernel_fixture.NEW_BOOT)
         self.assertEqual(value['after']['boot_id'], self.boot_id)
+        self.assert_directory_evidence(value)
         self.assertNotIn(str(self.retired), self.scanner_rows((self.state / 'aide.db.gz').read_bytes()))
-        self.assertEqual(len(self.scanner_rows((self.state / 'aide.db.gz').read_bytes())), 20)
+        self.assertEqual(len(self.scanner_rows((self.state / 'aide.db.gz').read_bytes())), 22)
 
     def test_schema2_retention_copied_output_second_boot_preserves_real_chain(self):
         self.retention_origin()
@@ -719,6 +816,7 @@ class KernelMetadataAideTests(unittest.TestCase):
         value = history['history'][-1]['prepared']['metadata'][proof.KEY]
         self.assertEqual(value['database_source']['basis'], 'owned-ready-output')
         self.assertEqual(value['source_database_sha256'], hashlib.sha256(copied).hexdigest())
-        self.assertEqual(len(value['transition']['changes']), 18)
+        self.assertEqual(len(value['transition']['changes']), 20)
+        self.assert_directory_evidence(value)
         self.assertEqual([row['plan']['kind'] for row in history['history'][-2:]],
                          ['rocky-kernel-retention-resume-v1'] * 2)

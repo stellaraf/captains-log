@@ -36,10 +36,11 @@ HOST_PHASE_CHECKS = {
 
 
 def os_maintenance_pending(transaction):
-    """Kernel recovery is pending even after the old runtime becomes healthy."""
+    """An OS-owned storage hold or kernel recovery survives runtime health."""
     return bool(transaction and (
         transaction.get("state") not in {"complete", "failed", "reboot_aborted"}
         or transaction.get("finalization", "complete") != "complete"
+        or transaction.get("storage_maintenance") in {"held", "release_pending"}
         or any(transaction.get(field, "complete") not in (None, "complete")
                for field in ("kernel_finalization", "kernel_retention", "kernel_rollback"))))
 
@@ -400,7 +401,8 @@ class UpdateManager:
             verify_release(stage / "manifest.json", stage / "manifest.sig", public_key, stage,
                            current_sequence=current["sequence"], runner=self.runner)
             transaction = {"state": "preflight", "sequence": release["sequence"], "previous": current,
-                           "release": str(stage), "manifest_sha256": release["manifest_sha256"]}
+                           "release": str(stage), "manifest_sha256": release["manifest_sha256"],
+                           "activation_started": False}
             if host_update:
                 transaction["host_update"] = True
             def record(state):
@@ -431,6 +433,9 @@ class UpdateManager:
                 if host_update:
                     host_activation.prepare(stage)
                 self._hook("update-prepare", stage)
+                # This is durable before selecting candidate host code or
+                # allowing an adapter to mutate runtime files/databases.
+                transaction["activation_started"] = True
                 record("activating")
                 if host_update:
                     host_activation.select_candidate(stage)
@@ -529,6 +534,29 @@ class UpdateManager:
             if os_maintenance_pending(os_transaction):
                 raise Refused("OS recovery must finish before component recovery")
             stage, _ = self._retained_release(transaction, public_key, recovery=True)
+            intent = stage / "adapter-backup-intent.json"
+            if transaction.get("activation_started") is False and not os.path.lexists(intent):
+                # A crash before preflight finished has not authorized backup,
+                # service stops or candidate selection. Recheck only the fixed
+                # preflight while its original phase/selection remain durable.
+                # Never manufacture a snapshot after any possible runtime effect.
+                forbidden = ("recovery", "prepared-quadlets", "host-runtime", "host-activation.json",
+                    "adapter-backup.json", "adapter-backup-inventory.json", "adapter-backup-recovery.json",
+                    "adapter-storage-maintenance.json", "adapter-prepare.json", "adapter-activate.json",
+                    "adapter-application-schema-intent.json", "adapter-database-restore-intent.json")
+                gate = self.state.parent / "storage-maintenance/gate.json"
+                idle = {"schema": 1, "held": False, "delivery_held": False, "operation": None}
+                observed_gate = json.loads(trusted_file(gate).read_text()) if os.path.lexists(gate) else idle
+                gate_idle = (isinstance(observed_gate, dict) and observed_gate == idle
+                    and type(observed_gate["schema"]) is int and observed_gate["held"] is False
+                    and observed_gate["delivery_held"] is False)
+                if (transaction.get("state") != "preflight"
+                        or os.path.lexists(self.state.parent / "maintenance.json")
+                        or any(os.path.lexists(stage / name) for name in forbidden)
+                        or not gate_idle):
+                    raise Refused("Missing preactivation proof cannot authorize recovery after possible runtime effects")
+                self._hook("update-preflight", stage)
+                trusted_file(intent)
             transaction["state"] = "rolling_back"
             transaction["finalization"] = "pending"
             atomic_json(self.state / "transaction.json", transaction)

@@ -19,7 +19,7 @@ import uuid
 
 from .common import Refused, atomic_json, audit, locked, require_linux_root, run
 from .firstboot import FirstBoot
-from .image_bundle import ImageBundleLoader, run_private, strict_json, verify_bundle
+from .image_bundle import ApplicationSchema as application_schema, ImageBundleLoader, run_private, strict_json, verify_bundle
 from . import publisher_inputs
 
 STATE = Path("/var/lib/nebulalog/manager/updates")
@@ -232,6 +232,7 @@ class UpdateEnrollment:
                     or any(part in (".", "..", ".local", "node_modules", ".git") for part in path.split("/"))
                     or not isinstance(digest, str) or not SHA256.fullmatch(digest)):
                 raise Refused("Unsafe or invalid captured source manifest entry")
+        application_schema.bind_source(manifest["files"], value["schema_revision"])
         publisher_inputs.binding(value["publisher"], manifest["files"])
         return value, _hash(raw), application_source_digest(manifest["files"])
 

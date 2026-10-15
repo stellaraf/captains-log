@@ -17,7 +17,7 @@ The recipe explicitly records the publisher-approved release sequence, timestamp
   "issued_at": "2026-09-09T00:00:00Z",
   "expires_at": "2026-12-09T00:00:00Z",
   "source_commit": "<40-character published source commit>",
-  "schema_revision": "1",
+  "schema_revision": "2",
   "components": {
     "host": {"version": "0.1.1", "from_versions": ["0.1.0"]},
     "nebulalog": {"version": "0.1.1", "from_versions": ["0.1.0"]}
@@ -27,6 +27,8 @@ The recipe explicitly records the publisher-approved release sequence, timestamp
 ```
 
 These values are illustrative, not a current qualified release. Include the actual measured factory host version in `from_versions` when supporting that factory image. Every release includes both host and application assets. The host version must advance, even when only OCI bytes change. Database changes may additionally select `postgresql`, `clickhouse`, and `keycloak`; unselected database images remain installed. PostgreSQL major changes are refused. ClickHouse requires `family`, `tested_minimum`, and `tested_maximum`, with both old and new versions inside that range. Preserve the full measured ClickHouse version, such as `25.3.8.30001.altinityfips`, in `version` and `from_versions`; range bounds are numeric, such as `25.3.8.30001`. Both the publisher and appliance verifier reject family changes, vendor suffix changes and endpoints outside that range. Automatic schema migrations are not accepted.
+
+The example targets the current application schema 2. `ApplicationSchema` in `image_bundle.py` binds the entire `migrations/` inventory to reviewed bytes; a schema-1 declaration with schema-2 SQL is rejected before assembly. The same binding is required by provenance capture and installed-release enrollment. The assembler can describe a reviewed additive transition for qualification, but the runtime still refuses schema changes until the executor and recovery path are accepted. A schema-1 bridge must retain schema-1 application source and image while updating the coordinator within the existing host file catalog. Keep these candidates out of stable release publication until both upgrade and rollback have passed installed-guest testing.
 
 Keycloak additionally requires `qualification_artifact` naming a JSON report with the existing lifecycle schema: exact image, source commit, and successful `real_browser` observations for local password/OTP, AD LDAPS/OTP, Okta SAML, Entra SAML, generic SAML and generic OIDC. Every referenced browser evidence artifact must be listed explicitly in `evidence_artifacts` and supplied in `--evidence-directory`. Only the selected, bounded JSON files are copied. Those browser artifacts become public release assets; supply reviewed, sanitized reports containing no tokens, cookies, passwords, private keys or personal data. The assembler checks schema and binding, not the truth of browser assertions or complete content redaction.
 

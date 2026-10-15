@@ -29,6 +29,8 @@ class StagedSourceTests(unittest.TestCase):
         for prefix in staging.PREFIXES:
             if not any(name.startswith(prefix) for name in staging.REQUIRED):
                 self.write(prefix + "fixture", b"fixture payload\n")
+        for name in ("postgres.sql", "clickhouse.sql", "host_stepup.sql"):
+            self.write("migrations/" + name, (SCRIPTS.parents[1] / "migrations" / name).read_bytes())
         self.write("LICENSE", b"fixture license\n")
         self.write("internal/example.go", b"package example\n")
         self.git("init", "--quiet")
@@ -52,7 +54,7 @@ class StagedSourceTests(unittest.TestCase):
         return path
 
     def capture(self):
-        return capture(self.root, self.bundle, self.provenance, sequence=1, schema_revision="1", private_unsealed=True)
+        return capture(self.root, self.bundle, self.provenance, sequence=1, schema_revision="2", private_unsealed=True)
 
     def stage(self):
         return staging.stage(self.root, self.provenance, self.output)

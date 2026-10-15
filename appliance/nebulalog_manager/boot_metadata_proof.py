@@ -24,7 +24,7 @@ FIELDS = {'schema', 'mode', 'plan_sha256', 'original_enrollment_sha256', 'lineag
           'initial_snapshot_sha256', 'source_boot_id', 'source_head',
           'source_database_sha256', 'database_source', 'after', 'transition'}
 SOURCE_FIELDS = {'basis', 'head', 'observed_head', 'original_enrollment_sha256', 'pending_sha256'}
-BOOT_PHASES = {'arm', 'abort', 'postboot', 'commit', 'resume', 'retry_arm', 'recovery_resume'}
+BOOT_PHASES = {'arm', 'abort', 'postboot', 'commit', 'resume', 'retry_arm', 'recovery_resume', 'rearm'}
 OBSERVATIONS = {'postboot', 'resume', 'recovery_resume'}
 
 

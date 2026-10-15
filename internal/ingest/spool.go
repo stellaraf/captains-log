@@ -51,6 +51,7 @@ type spool struct {
 	bytes      int64
 	pending    uint64
 	closed     bool
+	space      func(*os.File) (spoolSpace, error)
 }
 
 func openSpool(dir string, limit int64) (*spool, error) {
@@ -65,7 +66,7 @@ func openSpool(dir string, limit int64) (*spool, error) {
 		lock.Close()
 		return nil, fmt.Errorf("spool is already owned by another process: %w", err)
 	}
-	s := &spool{dir: dir, limit: limit, lock: lock}
+	s := &spool{dir: dir, limit: limit, lock: lock, space: spoolFilesystemSpace}
 	cleanup := func(err error) (*spool, error) {
 		if s.active != nil {
 			s.active.Close()
@@ -219,11 +220,19 @@ func (s *spool) append(m message) error {
 	if int64(len(record)) > s.limit {
 		return ErrSpoolRecordTooLarge
 	}
-	if s.bytes+int64(len(record)) > s.limit {
+	if s.bytes < 0 || s.bytes > s.limit || int64(len(record)) > s.limit-s.bytes {
 		return ErrSpoolFull
+	}
+	if err = s.checkHeadroom(uint64(len(record))); err != nil {
+		return err
 	}
 	if s.activeSize >= segmentSize {
 		if err = s.rotate(); err != nil {
+			return err
+		}
+		// Inspect the new open file too, rather than assuming its path still
+		// resolves to the filesystem observed before rotation.
+		if err = s.checkHeadroom(uint64(len(record))); err != nil {
 			return err
 		}
 	}

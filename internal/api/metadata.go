@@ -299,6 +299,10 @@ func (s *Server) retention(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
+	if e = store.LockEmergencyPolicy(r.Context(), tx); e != nil {
+		databaseError(w, e)
+		return
+	}
 	_, e = tx.Exec(r.Context(), "UPDATE settings SET value=$1 WHERE key='retention'", b)
 	if e == nil {
 		_, e = tx.Exec(r.Context(), "INSERT INTO audit_events(actor,action,target,detail) VALUES($1,'retention.update','future-arrivals',$2)", auth.Current(r.Context()).ID, b)

@@ -285,8 +285,10 @@ class HostRuntime:
         if self.preserved() != plan["preserved"]:
             raise Refused("Customer configuration or enrolled trust changed during host maintenance")
 
-    def backup(self):
-        self.phase("update-backup")
+    def backup(self, *, preactivation_recovery=False):
+        if preactivation_recovery and self.transaction.get("activation_started") is not False:
+            raise Refused("Host backup recovery requires a preactivation transaction")
+        self.phase("update-rollback" if preactivation_recovery else "update-backup")
         plan = self.checked_plan()
         self._preserved(plan)
         for directory in (self.root, self.root / "old", self.root / "new"):

@@ -80,12 +80,14 @@ class KernelRecoveryLifecycleTests(unittest.TestCase):
 
     def test_retry_preserves_origin_and_records_request_before_reboot(self):
         original = json.loads(self.journal.read_text())["boot_id"]
+        self.manager.storage_maintenance.side_effect = lambda owner, **flags: self.events.append(("storage", flags))
         result = self.manager.kernel_retry()
         self.assertEqual(result["status"], "reboot_requested")
         self.assertFalse(result["release_accepted"])
         self.assertEqual(json.loads(self.journal.read_text())["boot_id"], original)
         self.assertEqual(json.loads(self.latest.read_text())["boot_id"], original)
         self.assertLess(self.events.index("arm"), self.events.index("stop"))
+        self.assertLess(self.events.index(("storage", {"held": True, "delivery_held": True})), self.events.index("stop"))
         self.assertLess(self.events.index("stop"), self.events.index(("systemctl", "reboot")))
         self.manager.maintenance.assert_called_with(True, self.stage)
         self.abort.assert_not_called()
@@ -103,6 +105,8 @@ class KernelRecoveryLifecycleTests(unittest.TestCase):
         transaction = json.loads(self.journal.read_text())
         self.assertEqual(transaction["kernel_finalization"], "recovery_required")
         self.assertEqual(transaction["finalization"], "complete")
+        self.assertEqual(transaction["storage_maintenance"], "held")
+        self.manager.storage_maintenance.assert_called_with(self.stage, held=True, delivery_held=False)
         self.manager.maintenance.assert_called_with(False, self.stage)
 
     def test_failure_after_reservation_cancels_without_published_retry_arm(self):
@@ -171,12 +175,24 @@ class KernelRecoveryLifecycleTests(unittest.TestCase):
 
     def test_rollback_records_verified_disposition_before_releasing_gate(self):
         self.rollback_fixture()
+        self.manager.storage_maintenance.reset_mock()
+        def barrier(owner, **flags):
+            journal = json.loads(self.journal.read_text())
+            self.assertEqual(owner, self.stage)
+            self.assertEqual(journal["state"], "complete")
+            self.assertEqual(journal["kernel_rollback"], "complete")
+            self.assertEqual(journal["kernel_outcome"], "rolled_back")
+            self.assertEqual(journal["health_boot_id"], BOOT)
+            self.assertFalse(flags["held"])
+            self.events.append("storage-release")
+        self.manager.storage_maintenance.side_effect = barrier
         result = self.manager.kernel_rollback()
         self.assertEqual(result["status"], "rolled_back")
         self.assertFalse(result["release_accepted"])
         self.assertLess(self.events.index("prepare_recovery"), self.events.index("start"))
         self.assertLess(self.events.index("start"), self.events.index("remove"))
         self.assertLess(self.events.index("remove"), self.events.index("finish"))
+        self.assertLess(self.events.index("finish"), self.events.index("storage-release"))
         journal = json.loads(self.journal.read_text())
         self.assertEqual(journal["kernel_finalization"], "complete")
         self.assertEqual(journal["kernel_rollback"], "complete")

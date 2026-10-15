@@ -19,6 +19,7 @@ import { HostStorageObservation } from "./HostStorageObservation";
 import { HostStoragePlan } from "./HostStoragePlan";
 import { FreshHostObservation } from "./FreshHostObservation";
 import { SyslogTLSCertificate } from "./SyslogTLSCertificate";
+import { EmergencyStorage } from "./EmergencyStorage";
 function useData<T>(path: string) {
   const [data, setData] = useState<T>();
   const [error, setError] = useState("");
@@ -581,6 +582,7 @@ function StoragePage({ user }: { user: User }) {
         <Loading />
       ) : null}
       <HostStoragePlan user={user} />
+      <EmergencyStorage />
       <section className="retention-section">
         <div className="section-toolbar">
           <div>

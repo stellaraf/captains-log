@@ -12,6 +12,23 @@ Application uses `rpm --upgrade` with the retained package paths, after an exact
 
 The OS integrity plan has its own schema and operation/boot identity. It uses the existing retained AIDE `--update` database chain, including fresh checks, metadata preservation and compare-and-swap recovery. Only the exact planned regular files may change; additions, removals, unrelated paths and ACL/xattr/SELinux changes are refused. The original enrollment and original database remain immutable. A kernel or AIDE checker replacement cannot silently rewrite those original facts.
 
+The OS operation publishes its storage-maintenance owner before backup begins.
+The destructive-storage hold remains active through planning, package changes,
+deferred reboot, failed requests, recovery and pending kernel retention. Delivery
+is held before services stop and reopened for runtime health and the ingest
+canary while destructive cleanup remains suspended. A healthy old runtime can
+therefore serve logs without accepting an unverified candidate or releasing its
+storage hold.
+
+Even a transaction with no available updates performs the full postcheck and
+durable finalization. The existing `update-os-postcheck` hook completes an exact
+stage/boot-bound terminal journal before the scheduler reports finalization.
+Storage release is journaled as pending before the gate changes, and a failed
+release retains retryable finalization evidence. Release requires current-boot
+health and completed acceptance, rollback and retention obligations. A deferred
+retry keeps the original stage owner and refreshes its backup; it does not begin
+a second package transaction or transfer authority to a different operation.
+
 ## Measured native result
 
 On the disposable Rocky 9.8 x86_64 VMware guest, the signed `linux-firmware-whence` package was set to `20260707-161.1.el9_8` as an explicit test fixture, then upgraded by the exact executor to `20260804-161.2.el9_8`. The latter was the original installed version. This changes the real `/usr/share/licenses/linux-firmware-whence/WHENCE` payload. Both versions were downloaded from the official Rocky 9 BaseOS repository and verified against the enrolled Rocky key.
@@ -54,6 +71,18 @@ GRUB changes use the original AIDE enrollment's authorized-change chain. Exact
 abort restores the prior environment bytes. Interrupted arming, promotion and
 subsequent boot observations retain their original intent and proof records;
 they do not rewrite the original operation's boot identity.
+
+After an aborted reboot request, an explicit same-stage rearm can make a new
+one-shot selection on the original, unchanged boot. It requires the exact
+accepted abort, restored GRUB preimage, unchanged candidate and operation,
+fresh backup and full runtime checks. Its immutable generation retains the
+prior abort's AIDE proof; the original arm and abort records are not rewritten.
+Ordinary initial arming still refuses an existing transition. Rearm is limited
+to eight generations and is refused after fallback, explicit retry reservation
+or rollback ownership. A generation cancelled before its intent cannot later
+execute, including after interruption while restoring its predecessor pointer.
+Rearming an unattempted candidate does not consume or add an actual fallback
+retry; verified fallback retains the separate two-attempt limit below.
 
 Final acceptance uses immutable `kernel-acceptance-<boot UUID>.json` generations
 and an atomic current pointer. A later boot links the prior acceptance digest
@@ -199,15 +228,35 @@ these observations to the original enrollment and exact accepted AIDE history.
 Native acceptance of the resulting database transition is still required.
 No AIDE attributes have been disabled to pass this test.
 
+A second isolated native experiment successfully initialized and verified a
+fresh schema-2 enrollment. Its first reboot then stopped before AIDE preparation
+or database replacement: the report also contained inode-only changes on
+`/boot/efi/EFI/BOOT` and `/boot/efi/EFI/rocky`. Both fixed directories retained
+their mode, owner and security metadata. That terminal run, its original
+database and its enrollment remain preserved; no second reboot or forced
+acceptance followed the failure.
+
 New schema-2 enrollment snapshots include the exact vendor tmpfiles writers,
-effective configuration and EFI volume identity. The only additional reboot
-changes eligible for reconciliation are inode changes on nine fixed EFI files
-and ctime changes on nine fixed system/root files inside the successful boot
-tmpfiles invocation. Content, ownership, modes, ACLs, SELinux labels, xattrs,
-link counts and every other monitored attribute must still match. Same-boot
-changes receive no such exception. Historical timestamps come from the
-authenticated AIDE database at its actual second precision, never from a new
-capture or invented nanoseconds.
+effective configuration and EFI volume identity. The source now permits only
+inode changes on the nine fixed EFI files and these two fixed EFI directories,
+plus ctime changes on nine fixed system/root files inside the successful boot
+tmpfiles invocation. The directories must be actual root-owned mode-0700
+directories on the same qualified VFAT volume. Their complete sizes, link
+counts, timestamps, security metadata, exact child names and child contents
+are frozen separately in the initial authority. All must match at every later
+capture; only their inode numbers may change across a new boot. AIDE's native
+directory mask stores zero in unmeasured size, time and link-count columns;
+the parser preserves those zeros and never treats them as measurements.
+
+Content, ownership, modes, ACLs, SELinux labels, xattrs, link counts and every
+other monitored attribute must still match. Same-boot replacements receive no
+exception. Historical timestamps come from the authenticated AIDE database at
+its actual second precision, never from a new capture or invented nanoseconds.
+Existing eighteen-target authorities are unsupported by this extension and
+are never silently recaptured or re-enrolled. Changes to the fixed EFI layout
+or child contents also require an explicit, separately qualified migration.
+The twenty-target extension has source tests; a new isolated native successor
+must still verify its complete reboot and AIDE database transition.
 
 Each preparation retains its native observation, source database/head, typed
 boot ancestry and any interrupted-operation evidence. A copied ready output
@@ -265,6 +314,10 @@ boot and health checks.
 
 Source tests exercise retry cancellation, attempt limits, rollback ownership,
 full integrity history, later-boot recovery and failed post-removal health.
+Same-stage rearm and OS storage-finalization tests execute the production Python
+plan, report, database, compare-and-swap, history and lineage paths on isolated
+Rocky. Their scanner subprocess and native host/RPM/service boundaries are
+injected; these tests do not establish native AIDE or reboot acceptance.
 These commands are not yet accepted on the native appliance. In particular,
 a vendor success-timer change after retry arming can retain maintenance rather
 than automatically cancel the arm; the existing exact evidence and one-shot
@@ -286,6 +339,13 @@ The following cases remain explicit qualification or implementation gaps:
   its once-only RPM-command boundary.
 - Native retry/rollback qualification after verified fallback, including the
   armed success-timer interruption described above.
+- Safe automatic cancellation after an incomplete OS backup or planning failure
+  still needs immutable evidence that no package mutation began. Its exact
+  operation-owned storage hold remains in place until qualified recovery.
+- A later unrelated boot after an initial kernel arm was aborted remains held;
+  it is not classified as a candidate fallback. Same-stage rearm requires the
+  original boot, and this later-boot cancellation observation needs a separate
+  typed recovery path.
 - The complete general vendor update transaction, critical packages and their
   service/generated-file migrations, and native VMware/AHV acceptance.
 

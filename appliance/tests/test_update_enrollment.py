@@ -30,7 +30,7 @@ class InstalledReleaseTests(unittest.TestCase):
         self.data, self.etc, self.share = (self.root / name for name in ("data", "etc", "share"))
         for path in (self.data / "manager", self.data / "tmp", self.etc, self.share):
             path.mkdir(mode=0o700, parents=True)
-        self.source_files = {"cmd/nebulalog/main.go": "a" * 64}
+        self.source_files = {"cmd/nebulalog/main.go": "a" * 64, **enrollment.application_schema.SCHEMAS["1"]}
         self.pins, self.bundle_manifest, self.images = fixture_bundle(self.share / "images", enrollment.application_source_digest(self.source_files))
         atomic_json(self.etc / "images.json", self.pins)
         atomic_json(self.data / "configuration/bootstrap/setup.json", {"installation_id": INSTALLATION})
@@ -111,7 +111,7 @@ class InstalledReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(Refused, "offline bundle"):
             self.manager.verify_build_inputs()
         self.descriptor["bundle_manifest_sha256"] = digest(self.share / "images/manifest.json")
-        atomic_json(self.share / "source-manifest.json", {"schema": 1, "files": {"cmd/nebulalog/main.go": "c" * 64}})
+        atomic_json(self.share / "source-manifest.json", {"schema": 1, "files": {**self.source_files, "cmd/nebulalog/main.go": "c" * 64}})
         self.descriptor["source_snapshot_sha256"] = digest(self.share / "source-manifest.json")
         atomic_json(self.share / "initial-release.json", self.descriptor)
         with self.assertRaisesRegex(Refused, "Application image"):

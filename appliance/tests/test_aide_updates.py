@@ -148,6 +148,36 @@ class AuthorizedAideTests(unittest.TestCase):
         self.assertEqual(self.scan_calls.count("update"), 0)
         self.assert_original()
 
+    def interrupted_preparation_publication(self, boundary):
+        self.authorized_fixture()
+        original = updates._immutable
+        retained = {}
+        def interrupted(manager, path, value, identity):
+            result = original(manager, path, value, identity)
+            matched = (path.parent == self.state / "authorized/prepared" if boundary == "record"
+                       else path.parent == self.state / "authorized" and path.suffix == ".json")
+            if matched:
+                retained[path] = path.read_bytes()
+                raise OSError("interrupted after prepared " + boundary)
+            return result
+        with patch.object(updates, "_immutable", side_effect=interrupted), self.assertRaises(OSError):
+            self.prepare_update()
+        self.assertTrue(retained)
+        self.assertEqual((self.state / "aide.db.gz").read_bytes(), self.initial_db)
+        self.assertTrue(self.prepare_update()["ok"])
+        self.assertTrue(self.prepare_update()["ok"])
+        for path, raw in retained.items(): self.assertEqual(path.read_bytes(), raw)
+        self.assertEqual((self.state / "aide.db.gz").read_bytes(), self.initial_db)
+        self.assertEqual(self.scan_calls.count("init"), 1)
+        self.assertEqual(self.scan_calls.count("update"), 0)
+        self.assert_original()
+
+    def test_prepare_retry_preserves_orphan_record_after_interrupted_pointer_publication(self):
+        self.interrupted_preparation_publication("record")
+
+    def test_prepare_retry_reuses_existing_pointer_without_baseline_replacement(self):
+        self.interrupted_preparation_publication("pointer")
+
     def test_authorized_forward_and_rollback_preserve_original_and_publish_fresh_checks(self):
         self.authorized_fixture()
         self.prepare_update()

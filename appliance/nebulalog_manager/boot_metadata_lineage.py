@@ -159,7 +159,8 @@ def _kernel_chain(stage, reference, get):
         if plan.get('phase') != 'retention_resume':
             get(stage, reference, pending=True)
         extra = ({'retention_authority', 'previous_retention_plan'} if plan.get('phase') == 'retention_resume'
-                 else {'authorization', 'recovery_proof'} if plan.get('phase') == 'retry_arm' else set())
+                 else {'authorization', 'recovery_proof'} if plan.get('phase') == 'retry_arm'
+                 else {'authorization', 'abort_proof'} if plan.get('phase') == 'rearm' else set())
         exact(plan, boot.PLAN_FIELDS | extra)
         _manifest(plan); _uuid(plan['boot_id'])
         if (plan['kind'] != 'kernel-boot-v1' or plan['stage'] != stage or plan['id'] != match[1]
@@ -207,12 +208,12 @@ def _kernel_chain(stage, reference, get):
         else:
             if previous is None:
                 refuse('kernel_origin_missing')
-            wanted = ({'postboot'} if phase == 'commit' else {'commit'} | boot.RESUMES if phase in boot.RESUMES
-                      else boot.RECOVERY if phase in {'retry_arm', 'recovery_resume'} else {'arm', 'retry_arm'})
+            wanted = ({'abort'} if phase == 'rearm' else {'postboot'} if phase == 'commit' else {'commit'} | boot.RESUMES if phase in boot.RESUMES
+                      else boot.RECOVERY if phase in {'retry_arm', 'recovery_resume'} else boot.ARMS)
             same = plan['boot_id'] == previous['boot_id']
             if (previous['phase'] not in wanted or plan['before_raw'] != previous['after_raw']
                     or item['before'] != previous['files'][0]['after']
-                    or phase != 'recovery_resume' and same != (phase in {'abort', 'commit', 'retry_arm'})
+                    or phase != 'recovery_resume' and same != (phase in {'abort', 'commit', 'retry_arm', 'rearm'})
                     or phase == 'abort' and plan['running_kernel'] != plan['old_kernel']
                     or phase in {'commit'} | boot.RESUMES and (plan['running_kernel'] != plan['kernel']
                                                           or previous['running_kernel'] != plan['kernel'])
@@ -238,6 +239,18 @@ def _kernel_chain(stage, reference, get):
                                          'sha256': rpm.sha(kernel.encode(previous))}
                     or proof.get('boot_id') != plan['boot_id']):
                 refuse('retry_recovery_predecessor_changed')
+        if phase == 'rearm':
+            proof = plan['abort_proof']
+            exact(proof, {'boot_ref', 'result_sha256', 'integrity'})
+            _sha(proof['result_sha256'])
+            if (proof['boot_ref'] != {'filename': 'kernel-boot-' + previous['id'] + '-plan.json',
+                                     'sha256': rpm.sha(kernel.encode(previous))}
+                    or plan['boot_id'] != chain[-1]['boot_id'] or plan['running_kernel'] != plan['old_kernel']
+                    or item['before'] != chain[-1]['files'][0]['before']
+                    or sum(item['phase'] == 'rearm' for item in chain[index:]) > boot.MAX_REARMS
+                    or any(item['phase'] not in {'arm', 'abort', 'rearm'} for item in chain[index + 1:])):
+                refuse('rearm_abort_predecessor_changed')
+            boot._authorization_fields(plan['authorization'], Path(stage), plan['boot_id'], plan['old_kernel'])
     return chain
 
 

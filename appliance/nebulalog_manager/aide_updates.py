@@ -846,8 +846,8 @@ def _resume_kernel_pending(manager, state, identity, base, stage, plan_path, pla
         _refuse('kernel_resume_plan_required')
     from . import kernel_boot
     prior, prior_sha = kernel_boot.integrity_predecessor(stage, plan_path)
-    allowed = {'postboot': {'arm', 'retry_arm'}, 'resume': {'commit', 'resume'},
-               'recovery_resume': {'arm', 'retry_arm', 'postboot', 'recovery_resume', 'abort'}}
+    allowed = {'postboot': kernel_boot.ARMS, 'resume': {'commit', 'resume'},
+               'recovery_resume': kernel_boot.ARMS | {'postboot', 'recovery_resume', 'abort'}}
     if prior.get('kind') != 'kernel-boot-v1' or prior.get('phase') not in allowed[plan['phase']]:
         _refuse('kernel_resume_commit_required')
     _, prepared = _prepared(manager, state, identity, stage, prior, prior_sha)

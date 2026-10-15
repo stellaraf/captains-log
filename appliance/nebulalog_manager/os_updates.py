@@ -17,9 +17,10 @@ def _hook(name, runner, *, timeout=3600):
     return result
 
 
-def _runtime_postcheck(runner, stage):
+def _runtime_postcheck(runner, stage, boot_id):
     result = _hook("update-os-postcheck", runner)
-    if result.get("stage") != stage or any(result.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS):
+    if (result.get("stage") != stage or result.get("boot_id") != boot_id
+            or any(result.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS)):
         raise Refused("OS update requires operation-bound runtime and security acceptance")
     return result
 
@@ -46,66 +47,98 @@ def maintain(config: Path, state: Path=Path("/var/lib/nebulalog/manager"), runne
         livepatch.require_settled(state / "updates")
         journal = state / "os-transaction.json"
         previous = json.loads(journal.read_text()) if journal.exists() else None
-        if os_maintenance_pending(previous):
+        resume = bool(previous and previous.get("storage_maintenance") == "held"
+            and previous.get("state") in {"complete", "reboot_aborted"}
+            and previous.get("finalization") == "complete" and previous.get("reboot_pending") is True
+            and all(previous.get(field, "complete") in (None, "complete")
+                    for field in ("kernel_finalization", "kernel_retention", "kernel_rollback")))
+        if os_maintenance_pending(previous) and not resume:
             raise Refused("An interrupted OS transaction or pending reboot requires recovery before another update")
         component_record = state / "updates/transaction.json"
         if component_record.exists():
             component = json.loads(component_record.read_text())
             if component.get("state") not in ("preflight_failed", "committed", "rolled_back") or (component.get("state") in ("committed", "rolled_back") and component.get("finalization") != "complete"):
                 raise Refused("Component maintenance must finish before OS maintenance")
-        transaction = {"state": "preflight", "started_at": datetime.now(timezone.utc).isoformat()}
-        if previous and previous.get("reboot_pending") is True:
+        transaction = dict(previous) if resume else {"state": "preflight", "started_at": datetime.now(timezone.utc).isoformat()}
+        if previous and previous.get("reboot_pending") is True and not resume:
             # Planning/network failures must not erase an earlier deferred reboot.
             transaction.update(reboot_pending=True, prior_reboot_stage=previous.get("stage"))
         def record(value, **details):
             transaction.update(state=value, **details)
             atomic_json(journal, transaction)
             audit(state / "audit.jsonl", "os." + value, **details)
+        def refresh():
+            # Adapters own durable backup references and finalization. Preserve
+            # their operation state across the subprocess boundary.
+            retained = json.loads(trusted_file(journal).read_text())
+            if transaction.get("stage") is not None and retained.get("stage") != transaction["stage"]:
+                raise Refused("OS adapter changed the owning operation")
+            transaction.update(retained)
+        def finalize(**details):
+            record("complete", finalization="pending", recovery_phase="postcheck", **details)
+            try:
+                result = _runtime_postcheck(runner, transaction["stage"], transaction["boot_id"])
+                if result.get("finalized") is not True or type(result.get("storage_released")) is not bool:
+                    raise Refused("OS adapter did not explicitly finalize storage maintenance")
+                refresh()
+                if (transaction.get("state") != "complete" or transaction.get("finalization") != "complete"
+                        or transaction.get("storage_maintenance") != ("released" if result["storage_released"] else "held")):
+                    raise Refused("OS finalization acknowledgement has no matching durable disposition")
+            except Exception as exc:
+                refresh()
+                record("complete", finalization="failed", finalization_error=type(exc).__name__)
+                raise
+            return {"status": transaction["status"], "reboot_pending": transaction["reboot_pending"]}
         if not status(runner)["host_controls_ok"]:
             raise Refused("OS updates require healthy FIPS, SELinux, firewall and auditing controls")
         for name in ("update-os-preflight", "update-os-postcheck", "update-reboot-prepare", "update-reboot-abort"):
             trusted_file(Path("/usr/libexec/nebulalog") / name)
         # The image enforces gpgcheck and repository allowlisting. Never enable a
         # repository or alter trust as part of the update transaction.
-        record("preflight")
+        if resume:
+            record("postcheck", finalization="pending", resuming_deferred=True)
+        else:
+            record("preflight")
         try:
-            backup = _hook("update-os-preflight", runner)
-            if backup.get("postgresql") is not True or backup.get("configuration") is not True:
-                raise Refused("OS maintenance requires verified metadata and configuration backups")
-            stage = backup.get("stage")
-            if not isinstance(stage, str) or not Path(stage).is_absolute():
-                raise Refused("OS maintenance requires an operation-owned backup stage")
-            boot_id = backup.get("boot_id")
-            if not isinstance(boot_id, str) or not re.fullmatch(r"[0-9a-f-]{36}", boot_id):
-                raise Refused("OS maintenance requires the backup boot identity")
-            record("planning", stage=stage, boot_id=boot_id)
-            plan = os_payload.prepare(Path(stage), policy, runner=runner)
-            candidate_reboot = plan.get("reboot_required") is True
-            if candidate_reboot:
-                record("planning", reboot_pending=True, kernel_reboot_required=True)
-            no_updates = plan.get("status") == "no_updates"
-            if no_updates:
-                record("planning", no_updates=True, plan_sha256=None)
-                reboot = _reboot_required(runner)
-                if not reboot and transaction.get("reboot_pending") is not True:
-                    record("complete", status="no_updates", reboot_pending=False)
-                    return {"status": "no_updates", "reboot_pending": False}
-                # A prior update can still require a reboot after DNF has no new
-                # packages. Use this run's fresh backup and full acceptance; do
-                # not replay the earlier RPM installation or its stale backup.
-                record("postcheck", reboot_pending=reboot or transaction.get("reboot_pending") is True)
+            if resume:
+                stage, boot_id = transaction["stage"], transaction["boot_id"]
+                no_updates = transaction.get("no_updates") is True
+                candidate_reboot = transaction.get("kernel_reboot_required") is True
             else:
-                record("updating", plan_sha256=plan["plan_sha256"])
-                os_payload.apply(Path(stage), runner=runner)
-                record("postcheck")
+                backup = _hook("update-os-preflight", runner)
+                refresh()
+                if backup.get("postgresql") is not True or backup.get("configuration") is not True:
+                    raise Refused("OS maintenance requires verified metadata and configuration backups")
+                stage = backup.get("stage")
+                if not isinstance(stage, str) or not Path(stage).is_absolute():
+                    raise Refused("OS maintenance requires an operation-owned backup stage")
+                boot_id = backup.get("boot_id")
+                if not isinstance(boot_id, str) or not re.fullmatch(r"[0-9a-f-]{36}", boot_id):
+                    raise Refused("OS maintenance requires the backup boot identity")
+                if transaction.get("stage") not in (None, stage) or transaction.get("boot_id") not in (None, boot_id):
+                    raise Refused("OS backup acknowledgement belongs to another operation")
+                record("planning", stage=stage, boot_id=boot_id, storage_maintenance="held", finalization="pending")
+                plan = os_payload.prepare(Path(stage), policy, runner=runner)
+                candidate_reboot = plan.get("reboot_required") is True
+                if candidate_reboot:
+                    record("planning", reboot_pending=True, kernel_reboot_required=True)
+                no_updates = plan.get("status") == "no_updates"
+                if no_updates:
+                    record("postcheck", no_updates=True, plan_sha256=None)
+                else:
+                    record("updating", plan_sha256=plan["plan_sha256"])
+                    os_payload.apply(Path(stage), runner=runner)
+                    record("postcheck")
             if not status(runner)["host_controls_ok"]:
                 raise Refused("OS update security postcondition failed; reboot blocked")
-            accepted = _runtime_postcheck(runner, stage)
-            record("postcheck", health=accepted["checks"])
+            accepted = _runtime_postcheck(runner, stage, boot_id)
+            refresh()
+            record("postcheck", health=accepted["checks"], health_boot_id=boot_id)
             reboot = _reboot_required(runner) or candidate_reboot
             record("postcheck", reboot_pending=reboot)
         except Exception as exc:
-            record("recovery_required" if transaction["state"] in ("updating", "postcheck") or (state / "maintenance.json").exists() else "failed",
+            refresh()
+            record("recovery_required" if transaction.get("stage") is not None or (state / "maintenance.json").exists() else "failed",
                    recovery_phase=transaction["state"], error=type(exc).__name__)
             raise
         # Re-evaluate actual current time after a potentially long update.
@@ -114,7 +147,7 @@ def maintain(config: Path, state: Path=Path("/var/lib/nebulalog/manager"), runne
             record("reboot_preparing")
             try:
                 prepared = _hook("update-reboot-prepare", runner)
-                if not prepared.get("boot_id"):
+                if prepared.get("boot_id") != boot_id:
                     raise Refused("Reboot preparation did not record the current boot identity")
             except Exception as exc:
                 if not (state / "maintenance.json").exists():
@@ -122,11 +155,13 @@ def maintain(config: Path, state: Path=Path("/var/lib/nebulalog/manager"), runne
                     # Recheck the current runtime instead of reusing its earlier proof.
                     record("postcheck", reboot_pending=True)
                     try:
-                        accepted = _runtime_postcheck(runner, stage)
+                        accepted = _runtime_postcheck(runner, stage, boot_id)
+                        refresh()
                     except Exception as postcheck_error:
                         record("recovery_required", recovery_phase="postcheck", error=type(postcheck_error).__name__)
                         raise Refused("Reboot preparation failed and current runtime acceptance requires recovery") from postcheck_error
-                    record("complete", status="no_updates" if no_updates else "updated", reboot_pending=True, reboot_blocked=type(exc).__name__)
+                    finalize(status="no_updates" if no_updates else "updated", reboot_pending=True,
+                             reboot_blocked=type(exc).__name__, health=accepted["checks"], health_boot_id=boot_id)
                     raise Refused("OS maintenance passed; reboot remains pending because unlock or preparation requirements were not met") from exc
                 record("recovery_required", recovery_phase="reboot_preparing", error=type(exc).__name__)
                 raise Refused("Reboot preparation failed; review appliance service and unlock state") from exc
@@ -136,17 +171,20 @@ def maintain(config: Path, state: Path=Path("/var/lib/nebulalog/manager"), runne
             except Exception as exc:
                 try:
                     recovered = _hook("update-reboot-abort", runner)
-                    if recovered.get("recovered") is not True or any(recovered.get("health", {}).get(name) is not True for name in REQUIRED_CHECKS):
+                    if (recovered.get("recovered") is not True or recovered.get("finalized") is not True
+                            or recovered.get("boot_id") != boot_id or recovered.get("storage_released") is not False
+                            or any(recovered.get("health", {}).get(name) is not True for name in REQUIRED_CHECKS)):
                         raise Refused("Reboot abort did not provide verified service/authentication recovery")
+                    refresh()
                     record("reboot_aborted", reboot_pending=True)
                 except Exception as recovery_error:
-                    record("recovery_required", error=type(recovery_error).__name__)
+                    refresh()
+                    record("recovery_required", recovery_phase="reboot_abort", error=type(recovery_error).__name__)
                     raise Refused("Reboot request failed and service recovery failed; maintenance remains active") from recovery_error
                 raise Refused("Reboot request failed; appliance services and local authentication were restored and verified") from exc
             return {"status":"reboot_requested"}
         result={"status":"no_updates" if no_updates else "updated","reboot_pending":reboot}
-        record("complete", **result)
-        return result
+        return finalize(**result)
 
 if __name__=="__main__":
     import argparse

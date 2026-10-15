@@ -327,6 +327,80 @@ class TransactionTests(unittest.TestCase):
         with self.assertRaises(Refused):self.install(manager)
         self.assertNotIn("update-activate",calls)
         self.assertEqual(manager.status()["transaction"]["state"],"recovery_required")
+        self.assertIs(manager.status()["transaction"]["activation_started"], False)
+    def test_activation_journal_is_durable_before_candidate_hook(self):
+        manager,calls=self.setup_manager()
+        runner=manager.runner
+        def observe(argv, **kwargs):
+            name=Path(argv[0]).name
+            if name in ("update-backup", "update-prepare", "update-activate"):
+                transaction=json.loads((manager.state/"transaction.json").read_text())
+                self.assertIs(transaction["activation_started"], name == "update-activate")
+            return runner(argv, **kwargs)
+        manager.runner=observe
+        self.assertEqual(self.install(manager)["state"], "committed")
+
+    def interrupted_preflight(self):
+        manager, calls = self.setup_manager()
+        runner = manager.runner
+        def interrupted(argv, **kwargs):
+            if Path(argv[0]).name == "update-preflight": raise KeyboardInterrupt("preflight interrupted")
+            return runner(argv, **kwargs)
+        manager.runner = interrupted
+        with self.assertRaises(KeyboardInterrupt): self.install(manager)
+        self.assertEqual(manager.status()["transaction"]["state"], "preflight")
+        manager.runner = runner
+        return manager, calls
+
+    def recover(self, manager):
+        def trusted(path):
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            return path
+        with patch("nebulalog_manager.updates.require_linux_root"), \
+                patch("nebulalog_manager.updates.trusted_file", side_effect=trusted):
+            return manager.recover(self.public)
+
+    def test_recovery_rechecks_interrupted_preflight_before_restoring_host_or_stopping_services(self):
+        manager, calls = self.interrupted_preflight()
+        runner = manager.runner
+        interrupts = [True, False]
+        def preflight(argv, **kwargs):
+            if Path(argv[0]).name == "update-preflight":
+                self.assertEqual(manager.status()["transaction"]["state"], "preflight")
+                if interrupts.pop(0): raise KeyboardInterrupt("second preflight interruption")
+                atomic_json(Path(argv[1]) / "adapter-backup-intent.json", {"fixture": True})
+            return runner(argv, **kwargs)
+        manager.runner = preflight
+        with self.assertRaises(KeyboardInterrupt): self.recover(manager)
+        self.assertEqual(manager.status()["transaction"]["state"], "preflight")
+        self.assertEqual(calls, [])
+        result = self.recover(manager)
+        self.assertEqual(result["state"], "rolled_back")
+        self.assertEqual(calls, ["update-preflight", "update-rollback", "update-health", "update-finalize"])
+        self.assertEqual(manager.status()["current"]["components"]["nebulalog"]["version"], "0.1.0")
+
+    def test_missing_preflight_intent_never_recaptures_after_possible_effects(self):
+        manager, calls = self.interrupted_preflight()
+        stage = Path(manager.status()["transaction"]["release"])
+        for path in (stage / "recovery", stage / "host-activation.json", stage / "adapter-storage-maintenance.json",
+                     manager.state.parent / "maintenance.json"):
+            with self.subTest(path=path.name):
+                path.write_text("inert possible-effect marker")
+                with self.assertRaisesRegex(Refused, "possible runtime effects"): self.recover(manager)
+                self.assertEqual(calls, [])
+                path.unlink()
+        gate = manager.state.parent / "storage-maintenance/gate.json"
+        for value in ({"schema": 1, "held": True, "delivery_held": True, "operation": "a" * 64},
+                      {"schema": True, "held": False, "delivery_held": False, "operation": None}):
+            atomic_json(gate, value)
+            with self.assertRaisesRegex(Refused, "possible runtime effects"): self.recover(manager)
+            self.assertEqual(calls, [])
+        gate.unlink()
+        transaction = manager.status()["transaction"]; transaction["state"] = "preparing"
+        atomic_json(manager.state / "transaction.json", transaction)
+        with self.assertRaisesRegex(Refused, "possible runtime effects"): self.recover(manager)
+        self.assertEqual(calls, [])
     def test_health_failure_rolls_back_and_keeps_high_watermark(self):
         manager,calls=self.setup_manager("health-once")
         with self.assertRaisesRegex(Refused,"previous application restored"):self.install(manager)
@@ -408,10 +482,13 @@ class TransactionTests(unittest.TestCase):
             self.install(manager)
         self.assertEqual(calls,[])
 
-    def test_kernel_recovery_blocks_every_component_mutation_after_healthy_fallback(self):
+    def test_os_hold_or_kernel_recovery_blocks_every_component_mutation_after_healthy_fallback(self):
         manager, calls = self.setup_manager()
-        for field in ("kernel_finalization", "kernel_retention", "kernel_rollback"):
-            for phase in ("pending", "failed", "recovery_required", "unknown"):
+        phases_by_field = {field: ("pending", "failed", "recovery_required", "unknown")
+                           for field in ("kernel_finalization", "kernel_retention", "kernel_rollback")}
+        phases_by_field["storage_maintenance"] = ("held", "release_pending")
+        for field, phases in phases_by_field.items():
+            for phase in phases:
                 operation = {"state": "complete", "finalization": "complete", field: phase}
                 path = manager.state.parent / "os-transaction.json"
                 atomic_json(path, operation)

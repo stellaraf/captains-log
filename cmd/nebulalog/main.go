@@ -107,6 +107,16 @@ func run() error {
 		slog.Info("database migrations applied")
 		return nil
 	}
+	storagePath := env("STORAGE_MAINTENANCE_PATH", "")
+	required, _ := strconv.ParseBool(env("REQUIRE_FIPS", "false"))
+	if e = store.ValidateStorageMaintenancePath(storagePath, required); e != nil {
+		return e
+	}
+	st.StorageMaintenancePath = storagePath
+	storageContext, stopStorage := context.WithCancel(ctx)
+	storageDone := make(chan struct{})
+	go func() { defer close(storageDone); st.RunEmergencyRetention(storageContext) }()
+	defer func() { stopStorage(); <-storageDone }()
 	var collector *ingest.Collector
 	if role == "all" || role == "ingest" {
 		location, e := time.LoadLocation(env("PANOS_TIMEZONE", "UTC"))

@@ -38,11 +38,23 @@ class OSMaintenanceTests(unittest.TestCase):
         self.calls.append(argv)
         name=Path(argv[0]).name
         if name=="update-os-preflight":return json.dumps({"ok":True,"postgresql":True,"configuration":True,"stage":self.preflight_stage,"boot_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"})
-        if name=="update-os-postcheck":return json.dumps({"ok":True,"stage":self.postcheck_stage,"checks":self.postcheck_checks})
+        if name=="update-os-postcheck":
+            path = self.root / "os-transaction.json"
+            transaction = json.loads(path.read_text())
+            finalizing = transaction["state"] == "complete" and transaction.get("finalization") == "pending"
+            released = finalizing and not transaction.get("reboot_pending")
+            if finalizing:
+                atomic_json(path, {**transaction, "finalization": "complete",
+                                  "storage_maintenance": "released" if released else "held"})
+            return json.dumps({"ok":True,"stage":self.postcheck_stage,"checks":self.postcheck_checks,
+                "boot_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "finalized":finalizing,"storage_released":released})
         if name=="update-reboot-prepare":return json.dumps({"ok":True,"boot_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"})
         if name=="update-reboot-abort":
             if self.abort_fails:raise Refused("simulated failed service restore")
-            return json.dumps({"ok":True,"recovered":True,"health":{} if self.abort_incomplete else {name:True for name in REQUIRED_CHECKS}})
+            path = self.root / "os-transaction.json"
+            atomic_json(path, {**json.loads(path.read_text()), "state": "reboot_aborted", "finalization": "complete", "storage_maintenance": "held"})
+            return json.dumps({"ok":True,"recovered":True,"health":{} if self.abort_incomplete else {name:True for name in REQUIRED_CHECKS},
+                "boot_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "finalized":True,"storage_released":False})
         if argv==["dnf","needs-restarting","--reboothint"] and self.reboot_needed:raise CommandFailed("dnf",1)
         if argv==["systemctl","reboot"] and self.reboot_fails:raise Refused("simulated rejected reboot")
         return ""
@@ -73,7 +85,7 @@ class OSMaintenanceTests(unittest.TestCase):
              patch("nebulalog_manager.os_payload.apply") as apply:
             with self.assertRaisesRegex(Refused, "unsupported scriptlet"):self.run_maintenance()
             apply.assert_not_called()
-        self.assertEqual(json.loads((self.root/"os-transaction.json").read_text())["state"], "failed")
+        self.assertEqual(json.loads((self.root/"os-transaction.json").read_text())["state"], "recovery_required")
         self.assertNotIn(["systemctl", "reboot"], self.calls)
 
     def test_no_updates_does_not_apply_packages_or_request_reboot(self):
@@ -84,6 +96,57 @@ class OSMaintenanceTests(unittest.TestCase):
             apply.assert_not_called()
         self.assertEqual(json.loads((self.root/"os-transaction.json").read_text())["state"], "complete")
         self.assertNotIn(["systemctl", "reboot"], self.calls)
+        self.assertEqual(self.calls.count(["/usr/libexec/nebulalog/update-os-postcheck"]), 2)
+        self.assertEqual(json.loads((self.root/"os-transaction.json").read_text())["storage_maintenance"], "released")
+
+    def test_terminal_record_without_explicit_finalized_ack_cannot_report_success(self):
+        self.reboot_needed = False
+        def runner(argv, **kwargs):
+            result = self.runner(argv, **kwargs)
+            if Path(argv[0]).name == "update-os-postcheck":
+                value = json.loads(result)
+                value.pop("finalized", None)
+                return json.dumps(value)
+            return result
+        with self.assertRaisesRegex(Refused, "explicitly finalize"):
+            maintain(self.policy, self.root, runner=runner)
+        transaction = json.loads((self.root / "os-transaction.json").read_text())
+        self.assertEqual(transaction["state"], "complete")
+        self.assertEqual(transaction["finalization"], "failed")
+
+    def test_finalized_ack_requires_matching_durable_state(self):
+        self.reboot_needed = False
+        def runner(argv, **kwargs):
+            result = self.runner(argv, **kwargs)
+            if Path(argv[0]).name == "update-os-postcheck" and json.loads(result).get("finalized"):
+                path = self.root / "os-transaction.json"
+                atomic_json(path, {**json.loads(path.read_text()), "storage_maintenance": "held"})
+            return result
+        with self.assertRaisesRegex(Refused, "matching durable disposition"):
+            maintain(self.policy, self.root, runner=runner)
+        self.assertEqual(json.loads((self.root / "os-transaction.json").read_text())["finalization"], "failed")
+
+    def test_wrong_boot_health_is_rejected_even_with_all_checks_true(self):
+        def runner(argv, **kwargs):
+            result = self.runner(argv, **kwargs)
+            if Path(argv[0]).name == "update-os-postcheck":
+                return json.dumps({**json.loads(result), "boot_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"})
+            return result
+        with self.assertRaisesRegex(Refused, "operation-bound"):
+            maintain(self.policy, self.root, runner=runner)
+        self.assertNotIn(["systemctl", "reboot"], self.calls)
+
+    def test_adapter_refreshed_backup_reference_survives_scheduler_records(self):
+        self.reboot_needed = False
+        refreshed = self.preflight_stage + "-backup"
+        def runner(argv, **kwargs):
+            result = self.runner(argv, **kwargs)
+            if Path(argv[0]).name == "update-os-postcheck":
+                path = self.root / "os-transaction.json"
+                atomic_json(path, {**json.loads(path.read_text()), "recovery_backup_stage": refreshed})
+            return result
+        self.assertEqual(maintain(self.policy, self.root, runner=runner)["status"], "updated")
+        self.assertEqual(json.loads((self.root / "os-transaction.json").read_text())["recovery_backup_stage"], refreshed)
 
     def test_kernel_candidate_forces_reboot_despite_negative_generic_hint(self):
         self.reboot_needed = False
@@ -107,20 +170,21 @@ class OSMaintenanceTests(unittest.TestCase):
             self.assertEqual(self.run_maintenance(), {'status': 'updated', 'reboot_pending': True})
         self.assertNotIn(['systemctl', 'reboot'], self.calls)
 
-    def test_next_window_retries_deferred_reboot_without_reinstalling_packages(self):
+    def test_next_window_retries_deferred_reboot_under_original_owner_without_replanning(self):
         with patch("nebulalog_manager.os_updates.in_maintenance_window", side_effect=[True, False]):
             self.assertEqual(self.run_maintenance(), {"status": "updated", "reboot_pending": True})
         previous_stage=self.preflight_stage
-        self.preflight_stage=self.postcheck_stage=str(self.root / "os-updates/fresh-backup")
         self.calls.clear()
-        with patch("nebulalog_manager.os_payload.prepare", return_value={"ok": True, "status": "no_updates", "plan_sha256": None}), \
+        with patch("nebulalog_manager.os_payload.prepare") as prepare, \
              patch("nebulalog_manager.os_payload.apply") as apply:
             self.assertEqual(self.run_maintenance(), {"status": "reboot_requested"})
             apply.assert_not_called()
+            prepare.assert_not_called()
         journal=json.loads((self.root / "os-transaction.json").read_text())
-        self.assertEqual(journal["prior_reboot_stage"], previous_stage)
-        self.assertEqual(journal["stage"], self.preflight_stage)
-        self.assertTrue(journal["no_updates"])
+        self.assertNotIn("prior_reboot_stage", journal)
+        self.assertEqual(journal["stage"], previous_stage)
+        self.assertTrue(journal["resuming_deferred"])
+        self.assertNotIn(["/usr/libexec/nebulalog/update-os-preflight"], self.calls)
         self.assertTrue(journal["reboot_pending"])
         self.assertIn(["/usr/libexec/nebulalog/update-os-postcheck"], self.calls)
         self.assertLess(self.calls.index(["/usr/libexec/nebulalog/update-os-postcheck"]),
@@ -278,7 +342,7 @@ class OSMaintenanceTests(unittest.TestCase):
         self.assertEqual(journal["state"],"complete")
         self.assertTrue(journal["reboot_pending"])
         self.assertNotIn(["systemctl","reboot"],self.calls)
-        self.assertEqual(self.calls.count(["/usr/libexec/nebulalog/update-os-postcheck"]),2)
+        self.assertEqual(self.calls.count(["/usr/libexec/nebulalog/update-os-postcheck"]),3)
 
     def test_prepare_refusal_cannot_reuse_health_from_before_service_changes(self):
         def runner(argv,**kwargs):

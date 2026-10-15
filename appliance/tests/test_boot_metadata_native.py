@@ -27,6 +27,18 @@ def description(checksum, mode=0o644):
 
 
 def stable_authority():
+    rows = parse(compressed())['rows']
+    directories = {}
+    for path in db.EFI_DIRECTORIES:
+        children = {}
+        for name in native.DIRECTORY_CHILDREN[path]:
+            row = copy.deepcopy(rows[path + '/' + name]); del row['inode']
+            row.update(ctime_ns=row['ctime_s'] * 1_000_000_000, mtime_ns=row['mtime_s'] * 1_000_000_000)
+            children[name] = row
+        directories[path] = {'kind': 'directory', 'mode': 0o700, 'uid': 0, 'gid': 0,
+                             'bytes': 4096, 'nlink': 2, 'ctime_ns': 1760000000_000000000,
+                             'mtime_ns': 1750000000_000000000, 'acl': None,
+                             'selinux': rows[path]['selinux'], 'xattrs': rows[path]['xattrs'], 'children': children}
     writers = {path: {'owner': owner, 'description': description(checksum, mode)}
                for path, (checksum, owner, mode) in native.WRITERS.items()}
     writers[native.ACL_LINK] = {'owner': native.ACL_OWNER, 'description': {
@@ -39,7 +51,7 @@ def stable_authority():
         for directory, entries in native.CONFIGURATION_PINS.items()},
         'mount': {'target': '/boot/efi', 'fstype': 'vfat', 'options': native.MOUNT_OPTIONS,
                   'uuid': '116A-392B', 'partuuid': '021c7f09-9e81-47d7-81b7-f0ddf5a6dcf8', 'fsroot': '/'},
-        'targets': sorted(db.TARGETS)}
+        'targets': sorted(db.TARGETS), 'directories': directories}
 
 
 def fixture():
@@ -65,7 +77,7 @@ def with_changes():
     for path in db.TMPFILES:
         snapshot['rows'][path]['ctime_s'] = 1760000100
         snapshot['rows'][path]['ctime_ns'] = 1760000100_500000000
-    for path in db.EFI:
+    for path in db.EFI_TARGETS:
         snapshot['rows'][path]['inode'] += 1
     return database, snapshot
 
@@ -75,17 +87,17 @@ class NativeTransitionTests(unittest.TestCase):
         return native.transition(authority or stable_authority(), snapshot,
                                  database=database, source_boot_id=source_boot)
 
-    def test_eighteen_exact_changes_bind_full_authenticated_source_and_capture(self):
+    def test_twenty_exact_changes_bind_full_authenticated_source_and_capture(self):
         database, snapshot = with_changes()
         proof = self.proof(database, snapshot)
-        self.assertEqual(len(proof['changes']), 18)
+        self.assertEqual(len(proof['changes']), 20)
         self.assertEqual(proof['authority_sha256'], digest(snapshot['authority']))
         self.assertEqual(proof['database_sha256'], database['database_sha256'])
         self.assertEqual(proof['database_source'], database['source'])
         self.assertEqual(proof['database_rows_sha256'], digest(database['rows']))
         self.assertEqual(proof['snapshot_sha256'], digest(snapshot))
         for change in proof['changes']:
-            self.assertEqual(change['attribute'], 'inode' if change['path'] in db.EFI else 'ctime')
+            self.assertEqual(change['attribute'], 'inode' if change['path'] in db.EFI_TARGETS else 'ctime')
             db.validate_change_summary(change['path'], change['summary'], row=database['rows'][change['path']],
                                        attribute=change['attribute'])
 
@@ -110,7 +122,7 @@ class NativeTransitionTests(unittest.TestCase):
             value['bytes'] = 99
             value['mtime_s'] = 1759999900
         snapshot['rows']['/etc/issue']['mtime_ns'] = 1759999900_123456789
-        self.assertEqual(len(self.proof(database, snapshot)['changes']), 18)
+        self.assertEqual(len(self.proof(database, snapshot)['changes']), 20)
         database['rows']['/etc/issue']['ctime_ns'] = 1760000000_123456789
         with self.assertRaises(Refused):
             self.proof(database, snapshot)
@@ -316,7 +328,7 @@ class NativeReadTests(unittest.TestCase):
             value = native.capture(runner=lambda argv: self.fail('no unrelated kernel/default query'))
         self.assertEqual(value, snapshot)
         self.assertEqual(stable.call_count, 2)
-        self.assertEqual(target.call_count, 36)
+        self.assertEqual(target.call_count, 40)
 
     def test_capture_refuses_changed_authority_before_producing_observation(self):
         _, snapshot = fixture()

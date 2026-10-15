@@ -294,7 +294,7 @@ func (s *Server) storage(w http.ResponseWriter, r *http.Request) {
 	for key, value := range hostStorageResponse(observed, s.Config.ApplianceStatusPath != "") {
 		forecast[key] = value
 	}
-	forecast["emergency_policy"] = "No automatic destructive emergency purge in this deployment; collector spooling is bounded and exposes overflow."
+	forecast["emergency_policy"] = "Emergency cleanup uses a separate versioned policy and verified controller observation at /api/storage/emergency. These capacity/forecast badges do not prove cleanup is operating; bounded spool pressure remains observable."
 	respond(w, 200, forecast)
 }
 

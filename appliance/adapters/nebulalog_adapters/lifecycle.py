@@ -1,4 +1,4 @@
-"""Real same-schema Podman/Quadlet transactions inside the encrypted Rocky appliance.
+"""Podman/Quadlet transactions and fixed schema upgrades in the Rocky appliance.
 
 This module never executes a path or hook obtained from a release manifest. OCI
 archives are loaded locally and immutable image references are checked before use.
@@ -25,6 +25,7 @@ from nebulalog_manager.baseline import Baseline, _json as baseline_json, rule_re
 from nebulalog_manager.common import CommandFailed, Refused, atomic_json, audit, locked, require_linux_root, trusted_file
 from nebulalog_manager.security import status as security_status, scan
 from nebulalog_manager.updates import digest_file, REQUIRED_CHECKS
+from nebulalog_manager.image_bundle import ApplicationSchema, strict_json
 from .auth import LocalHTTPSHandler, local_auth, response_bytes, tls_context
 from .commands import Commands
 from .host_runtime import HostRuntime
@@ -44,6 +45,22 @@ ORDER = ("postgresql", "clickhouse", "keycloak", "api", "ingest")
 IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]+@sha256:[0-9a-f]{64}")
 IDENTIFIER = re.compile(r"[a-zA-Z_][a-zA-Z_0-9]{0,62}")
 IDENTITY_GATES = frozenset(("local_password_otp", "ad_ldaps_otp", "saml_okta", "saml_entra", "saml_generic", "oidc_generic"))
+STORAGE_LOCK = 4850182995969828167
+STORAGE_OWNER_UID = 0
+STORAGE_OWNER_GID = 0
+
+
+def storage_gate_value(value):
+    if (not isinstance(value, dict) or set(value) != {"schema", "held", "delivery_held", "operation"}
+            or type(value["schema"]) is not int or value["schema"] != 1
+            or type(value["held"]) is not bool or type(value["delivery_held"]) is not bool):
+        raise Refused("Invalid host storage maintenance evidence")
+    if value["held"]:
+        if not isinstance(value["operation"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["operation"]):
+            raise Refused("Invalid host storage maintenance owner")
+    elif value["delivery_held"] or value["operation"] is not None:
+        raise Refused("Inconsistent host storage maintenance evidence")
+    return value
 
 
 def atomic_file(path, body, mode=0o600, owner=None):
@@ -202,6 +219,773 @@ class Lifecycle:
                     finally:
                         os.close(descriptor)
 
+    def application_schema_current(self):
+        """Read actual schema provenance without changing installation settings.
+
+        lifecycle.json belongs to the customer's protected configuration. A
+        completed additive migration therefore has a separate retained pointer;
+        rolling back an application image does not roll this pointer backward.
+        Live catalog verification is still required under the storage barrier.
+        """
+        initial = self.config.get("schema_revision")
+        ApplicationSchema.schema_digest(initial)
+        path = self.data / "manager/application-schema.json"
+        if not os.path.lexists(path):
+            return {"revision": initial, "state": None}
+        value = strict_json(trusted_file(path).read_bytes())
+        if (not isinstance(value, dict) or set(value) != {"schema", "revision", "stage", "receipt_sha256"}
+                or type(value["schema"]) is not int or value["schema"] != 1 or value["revision"] != "2"
+                or not isinstance(value["stage"], str)
+                or not isinstance(value["receipt_sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", value["receipt_sha256"])):
+            raise Refused("Actual application schema provenance is invalid")
+        origin = Path(value["stage"])
+        receipt = self.application_schema_receipt(origin)
+        if (receipt.get("schema_revision") != value["revision"]
+                or digest_file(trusted_file(origin / "adapter-application-schema.json")) != value["receipt_sha256"]):
+            raise Refused("Actual application schema differs from retained migration proof")
+        return {"revision": value["revision"], "state": value}
+
+    def application_schema_accept(self, stage):
+        """Publish only a verified, committed schema outcome under a writer hold."""
+        receipt = self.application_schema_verify(stage)
+        if receipt.get("state") != "complete" or receipt.get("schema_revision") != "2":
+            raise Refused("A completed schema migration is required before activation")
+        value = {"schema": 1, "revision": "2", "stage": str(stage),
+                 "receipt_sha256": digest_file(trusted_file(stage / "adapter-application-schema.json"))}
+        previous = self.application_schema_current()
+        if previous["state"] is not None and previous["state"] != value:
+            raise Refused("Another retained operation owns the actual schema provenance")
+        atomic_json(self.data / "manager/application-schema.json", value)
+        return value
+
+    def application_schema_check(self, stage, snapshot=None):
+        """Verify live catalog against factory or retained migration authority."""
+        value = snapshot if snapshot is not None else self.application_schema_current()
+        if (not isinstance(value, dict) or set(value) != {"revision", "state"}
+                or value["revision"] not in ("1", "2")):
+            raise Refused("Invalid retained application schema snapshot")
+        if value["state"] is None:
+            if value["revision"] != self.config["schema_revision"]:
+                raise Refused("Factory schema snapshot differs from the installed authority")
+            observed = self.application_schema_catalog(stage, value["revision"])
+            if observed.get("markers", []) != []:
+                raise Refused("Factory schema contains unowned migration provenance")
+            return observed
+        state = value["state"]
+        if (not isinstance(state, dict) or set(state) != {"schema", "revision", "stage", "receipt_sha256"}
+                or type(state["schema"]) is not int or state["schema"] != 1
+                or state["revision"] != "2" or value["revision"] != "2"
+                or not isinstance(state["stage"], str)):
+            raise Refused("Retained schema snapshot has no exact migration authority")
+        origin = Path(state["stage"])
+        self.application_schema_receipt(origin)
+        if digest_file(trusted_file(origin / "adapter-application-schema.json")) != state["receipt_sha256"]:
+            raise Refused("Retained schema snapshot receipt changed")
+        return self.application_schema_verify(origin, maintenance_stage=stage)
+
+    def application_schema_restore(self, stage, snapshot):
+        """Restore provenance only after restoring and checking the database."""
+        self.application_schema_check(stage, snapshot)
+        current = self.application_schema_current()
+        if current["state"] not in (None, snapshot["state"]) and current["state"].get("stage") != str(stage):
+            raise Refused("Another schema operation cannot be erased by rollback")
+        path = self.data / "manager/application-schema.json"
+        if snapshot["state"] is not None:
+            atomic_json(path, snapshot["state"])
+        elif os.path.lexists(path):
+            trusted_file(path).unlink()
+            descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        return self.application_schema_current()
+
+    @staticmethod
+    def application_schema_transition(change, revision):
+        # An operator image rollback retains the additive schema. A subsequent
+        # release can declare the same reviewed transition, but cannot replay it.
+        if revision == "2" and change.get("database_migration") == ApplicationSchema.ADDITIVE_UPGRADE:
+            ApplicationSchema.transition(change, "1")
+            return "none"
+        return ApplicationSchema.transition(change, revision)
+
+    def storage_gate_aware_ingest(self):
+        """Only a bound schema-2 application can keep receiving during backup."""
+        path = self.state / "current.json"
+        if not os.path.lexists(path):
+            return False
+        current = strict_json(trusted_file(path).read_bytes())
+        app = current.get("components", {}).get("nebulalog", {})
+        if app.get("schema_revision") != "2" or app.get("schema_sha256") != ApplicationSchema.schema_digest("2"):
+            return False
+        image = app.get("image")
+        if (not isinstance(image, str) or not IMAGE.fullmatch(image)
+                or image_from_quadlet(trusted_file(self.quadlets / "nebulalog-ingest.container").read_text()) != image):
+            return False
+        try:
+            running = self.cmd(["podman", "inspect", "--format", "{{.Image}}", "nebulalog-ingest"])
+            pinned = self.cmd(["podman", "image", "inspect", "--format", "{{.Id}}", image])
+            environment = strict_json(self.cmd(["podman", "inspect", "--format", "{{json .Config.Env}}", "nebulalog-ingest"]))
+            mounts = strict_json(self.cmd(["podman", "inspect", "--format", "{{json .Mounts}}", "nebulalog-ingest"]))
+        except (CommandFailed, Refused, ValueError, TypeError):
+            return False
+        target = "/run/nebulalog-storage-maintenance"
+        if (not isinstance(environment, list) or not all(isinstance(item, str) for item in environment)
+                or [item for item in environment if item.startswith("STORAGE_MAINTENANCE_PATH=")]
+                    != ["STORAGE_MAINTENANCE_PATH=" + target + "/gate.json"]
+                or not isinstance(mounts, list) or not all(isinstance(item, dict) for item in mounts)):
+            return False
+        gate_mounts = [item for item in mounts if item.get("Destination") == target
+                       or isinstance(item.get("Destination"), str) and item["Destination"].startswith(target + "/")]
+        if (len(gate_mounts) != 1 or gate_mounts[0].get("Destination") != target
+                or gate_mounts[0].get("Type") != "bind" or gate_mounts[0].get("RW") is not False
+                or gate_mounts[0].get("Source") != str((self.data / "manager/storage-maintenance").resolve())):
+            return False
+        return bool(re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", running)
+                    and re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", pinned)
+                    and running.removeprefix("sha256:") == pinned.removeprefix("sha256:"))
+
+    def database_restore_context(self, stage, backup):
+        return {"schema": 1, "stage": str(stage),
+                "operation": hashlib.sha256(str(stage).encode()).hexdigest(),
+                "backup_sha256": digest_file(trusted_file(stage / "adapter-backup-inventory.json")),
+                "application_schema": backup["application_schema"],
+                "migration_intent_sha256": digest_file(trusted_file(stage / "adapter-application-schema-intent.json"))
+                    if os.path.lexists(stage / "adapter-application-schema-intent.json") else None}
+
+    def database_restore_status(self, stage, backup):
+        """Authenticate an interrupted restore without relying on DB existence."""
+        context = self.database_restore_context(stage, backup)
+        intent = stage / "adapter-database-restore-intent.json"
+        complete = stage / "adapter-database-restore-complete.json"
+        if not os.path.lexists(intent):
+            if os.path.lexists(complete):
+                raise Refused("Database restore completion has no retained intent")
+            return context, False, False
+        if strict_json(trusted_file(intent).read_bytes()) != context:
+            raise Refused("Database restore intent differs from its verified backup")
+        done = os.path.lexists(complete)
+        if done and strict_json(trusted_file(complete).read_bytes()) != context:
+            raise Refused("Database restore completion differs from its retained intent")
+        if not done:
+            # This must precede republishing the host fence. No service start or
+            # gate release is permitted until this exact restore is complete.
+            gate = storage_gate_value(strict_json(trusted_file(self.data / "manager/storage-maintenance/gate.json").read_bytes()))
+            expected = {"schema": 1, "held": True, "delivery_held": True, "operation": context["operation"]}
+            if gate != expected:
+                raise Refused("Interrupted database restore lost its continuous host hold")
+            if context["migration_intent_sha256"] is not None:
+                schema_context = self._schema_context(stage)
+                executor = self._schema_intent(stage, schema_context)["executor"]
+                if self.cmd(["podman", "ps", "--all", "--no-trunc", "--filter",
+                             "id=" + executor["container_id"], "--format", "{{.ID}}"]):
+                    raise Refused("An interrupted restore's migration client is no longer absent")
+        return context, True, done
+
+    def storage_maintenance(self, stage, *, held, delivery_held=False, host_only=False):
+        """Publish a restore-independent fence, then cross the application lock.
+
+        This primitive does not migrate a schema or release HTTP maintenance.
+        Callers must keep it held across backup, activation, health and restore.
+        Unknown PostgreSQL outcomes leave the durable host fence in force.
+        The caller holds the existing lifecycle transaction lock throughout.
+        """
+        self.guard()
+        if (not stage.is_absolute() or stage.is_symlink()
+                or stage.resolve().parent not in ((self.state / "releases").resolve(),
+                                                  (self.data / "manager/os-updates").resolve())):
+            raise Refused("Storage maintenance needs a protected lifecycle operation")
+        if type(held) is not bool or type(delivery_held) is not bool or not held and delivery_held:
+            raise Refused("Invalid storage maintenance transition")
+        if type(host_only) is not bool or host_only and not (held and delivery_held):
+            raise Refused("A host-only fence can only stop delivery and removal")
+        operation = hashlib.sha256(str(stage.resolve()).encode()).hexdigest()
+        directory = self.data / "manager/storage-maintenance"
+        path = directory / "gate.json"
+        if directory.is_symlink():
+            raise Refused("Storage maintenance directory cannot be a link")
+        try:
+            directory.mkdir(mode=0o755)
+        except FileExistsError:
+            pass
+        else:
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fchown(descriptor, STORAGE_OWNER_UID, STORAGE_OWNER_GID)
+                os.fchmod(descriptor, 0o755)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            parent = os.open(directory.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(parent)
+            finally:
+                os.close(parent)
+        if (directory.stat().st_uid != STORAGE_OWNER_UID or directory.stat().st_gid != STORAGE_OWNER_GID
+                or directory.stat().st_mode & 0o7777 != 0o755):
+            raise Refused("Storage maintenance directory must remain root-owned with mode 0755")
+        previous = None
+        if path.exists() or path.is_symlink():
+            trusted_file(path)
+            if path.stat().st_size > 4096 or path.stat().st_mode & 0o022:
+                raise Refused("Unsafe storage maintenance evidence")
+            previous = storage_gate_value(strict_json(path.read_bytes()))
+            if previous["held"] and previous["operation"] != operation:
+                raise Refused("A different operation owns storage maintenance")
+        elif self.application_schema_current()["revision"] != "1" or not held:
+            raise Refused("Missing host storage maintenance evidence requires recovery")
+        desired = {"schema": 1, "held": held, "delivery_held": delivery_held,
+                   "operation": operation if held else None}
+        if not held and (previous is None or not previous["held"]):
+            journal = stage / "adapter-storage-maintenance.json"
+            retained = strict_json(trusted_file(journal).read_bytes()) if journal.exists() else {}
+            completed = (retained.get("state") == "complete" and retained.get("ok") is True
+                         and retained.get("action") == "storage-maintenance" and retained.get("gate") == desired)
+            interrupted = retained.get("state") == "intent" and retained.get("desired") == desired
+            if retained.get("operation") != operation or not (completed or interrupted):
+                raise Refused("Only the operation holding storage maintenance may release it")
+            # A prior clear may have committed and published idle before its
+            # receipt. Re-arm the host fence and verify the DB under the lock;
+            # the retained exact operation intent permits this one retry only.
+        conservative = {"schema": 1, "held": True, "delivery_held": True, "operation": operation}
+        # This file is not part of the PostgreSQL backup. Readers recheck it
+        # under the same DB lock; a pre-fence in-flight writer must settle first.
+        atomic_file(path, (json.dumps(conservative) + "\n").encode(), 0o644)
+        atomic_json(stage / "adapter-storage-maintenance.json", {
+            "state": "intent", "operation": operation, "desired": desired})
+        if host_only:
+            # Recovery may need to stop a lost migration client before a DB
+            # barrier can finish. This receipt is explicitly not DB completion.
+            return {"ok": True, "action": "storage-host-fence", "operation": operation,
+                    "gate": conservative, "database_barrier": False}
+        encoded = json.dumps(desired, separators=(",", ":"))
+        allow_missing = "true" if self.application_schema_current()["revision"] == "1" else "false"
+        # Operation is generated hex; desired JSON contains only fixed keys,
+        # booleans, null and that hex. No caller SQL, paths or hooks are executed.
+        query = f"""
+SET LOCAL search_path=public,pg_catalog;
+SET LOCAL lock_timeout='60s';
+SET LOCAL statement_timeout='90s';
+DO $gate$
+DECLARE gate jsonb; n bigint;
+BEGIN
+ PERFORM pg_advisory_xact_lock({STORAGE_LOCK});
+ SELECT value INTO gate FROM public.settings WHERE key='storage_emergency_maintenance' FOR UPDATE;
+ IF gate IS NULL THEN
+  IF NOT {allow_missing} THEN RAISE EXCEPTION 'Missing storage maintenance evidence'; END IF;
+ ELSE
+  IF jsonb_typeof(gate) IS DISTINCT FROM 'object' THEN RAISE EXCEPTION 'Invalid storage maintenance evidence'; END IF;
+  IF (SELECT count(*) FROM jsonb_object_keys(gate)) != 4
+   OR NOT gate ?& ARRAY['schema','held','delivery_held','operation']
+   OR jsonb_typeof(gate->'schema') IS DISTINCT FROM 'number'
+   OR gate->>'schema' IS DISTINCT FROM '1'
+   OR jsonb_typeof(gate->'held') IS DISTINCT FROM 'boolean'
+   OR jsonb_typeof(gate->'delivery_held') IS DISTINCT FROM 'boolean'
+   OR (gate->>'held'='false' AND (gate->>'delivery_held'!='false' OR gate->'operation'!='null'::jsonb))
+   OR (gate->>'held'='true' AND (jsonb_typeof(gate->'operation') IS DISTINCT FROM 'string' OR gate->>'operation' IS DISTINCT FROM '{operation}'))
+   THEN RAISE EXCEPTION 'Foreign or malformed storage maintenance evidence'; END IF;
+ END IF;
+ IF to_regclass('public.storage_emergency_actions') IS NOT NULL THEN
+  SELECT count(*) INTO n FROM public.storage_emergency_actions WHERE completed_at IS NULL;
+  IF n != 0 THEN RAISE EXCEPTION 'Pending removal prevents lifecycle metadata changes'; END IF;
+ ELSIF NOT {allow_missing} THEN RAISE EXCEPTION 'Missing emergency action evidence'; END IF;
+ IF to_regclass('public.storage_emergency_inserts') IS NOT NULL THEN
+  SELECT count(*) INTO n FROM public.storage_emergency_inserts;
+  IF n != 0 THEN RAISE EXCEPTION 'Unresolved insertion prevents lifecycle metadata changes'; END IF;
+ ELSIF NOT {allow_missing} THEN RAISE EXCEPTION 'Missing emergency insertion evidence'; END IF;
+ INSERT INTO public.settings(key,value) VALUES('storage_emergency_maintenance','{encoded}'::jsonb)
+ ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value;
+ INSERT INTO public.audit_events(actor,action,target,detail)
+ VALUES('host-lifecycle','storage.emergency.maintenance','{operation}','{encoded}'::jsonb);
+END $gate$;
+SELECT value::text FROM public.settings WHERE key='storage_emergency_maintenance';
+"""
+        result = self.cmd(["podman", "exec", "-i", "--user", "999:999", "nebulalog-postgresql",
+            "psql", "-X", "--username=postgres", "--dbname=nebulalog", "--single-transaction",
+            "--quiet", "--tuples-only", "--no-align", "--set=ON_ERROR_STOP=1"],
+            input=query.encode(), timeout=120)
+        if storage_gate_value(strict_json(result.encode())) != desired:
+            raise Refused("Storage maintenance readback differs; host hold remains in force")
+        atomic_file(path, (json.dumps(desired) + "\n").encode(), 0o644)
+        return self.receipt(stage, "storage-maintenance", state="complete", operation=operation, gate=desired)
+
+    @staticmethod
+    def _schema_catalog(namespace):
+        """Semantic catalog, including executable/security behavior, not live data."""
+        if not IDENTIFIER.fullmatch(namespace):
+            raise Refused("Invalid fixed catalog namespace")
+        query = r"""SELECT jsonb_build_object(
+ 'relations', COALESCE((SELECT jsonb_agg(jsonb_build_array(c.relname,c.relkind,c.relpersistence,
+  pg_get_userbyid(c.relowner),c.relrowsecurity,c.relforcerowsecurity,c.reloptions,c.relacl,
+  c.relam,c.reltablespace,c.relispartition) ORDER BY c.relname)
+  FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='NAMESPACE'), '[]'::jsonb),
+ 'columns', COALESCE((SELECT jsonb_agg(jsonb_build_array(c.relname,a.attnum,a.attname,
+  format_type(a.atttypid,a.atttypmod),a.attnotnull,a.attidentity,a.attgenerated,a.attisdropped,
+  a.attstorage,a.attcompression,a.attoptions,a.attacl,a.attcollation,
+  pg_get_expr(d.adbin,d.adrelid)) ORDER BY c.relname,a.attnum)
+  FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+  LEFT JOIN pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum
+  WHERE n.nspname='NAMESPACE' AND a.attnum>0 AND c.relkind IN ('r','p','v','m','f')), '[]'::jsonb),
+ 'constraints',COALESCE((SELECT jsonb_agg(jsonb_build_array(c.relname,k.conname,k.contype,
+  k.convalidated,k.condeferrable,k.condeferred,k.connoinherit,pg_get_constraintdef(k.oid,true))
+  ORDER BY c.relname,k.conname) FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid
+  JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='NAMESPACE'),'[]'::jsonb),
+ 'indexes',COALESCE((SELECT jsonb_agg(jsonb_build_array(c.relname,i.indisvalid,i.indisready,
+  i.indislive,i.indisreplident,i.indisclustered,pg_get_indexdef(c.oid)) ORDER BY c.relname)
+  FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+  WHERE n.nspname='NAMESPACE'),'[]'::jsonb),
+ 'sequences',COALESCE((SELECT jsonb_agg(jsonb_build_array(c.relname,s.seqtypid,s.seqstart,
+  s.seqincrement,s.seqmax,s.seqmin,s.seqcache,s.seqcycle,
+  (SELECT jsonb_agg(jsonb_build_array(d.deptype,t.relname,a.attname) ORDER BY d.deptype,t.relname,a.attname)
+   FROM pg_depend d JOIN pg_class t ON t.oid=d.refobjid
+   JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=d.refobjsubid
+   WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.refclassid='pg_class'::regclass))
+  ORDER BY c.relname) FROM pg_sequence s JOIN pg_class c ON c.oid=s.seqrelid
+  JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='NAMESPACE'),'[]'::jsonb),
+ 'triggers',COALESCE((SELECT jsonb_agg(jsonb_build_array(c.relname,t.tgname,t.tgenabled,
+  pg_get_triggerdef(t.oid)) ORDER BY c.relname,t.tgname) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid
+  JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='NAMESPACE' AND NOT t.tgisinternal),'[]'::jsonb),
+ 'rules',COALESCE((SELECT jsonb_agg(jsonb_build_array(c.relname,r.rulename,r.ev_enabled,
+  pg_get_ruledef(r.oid)) ORDER BY c.relname,r.rulename) FROM pg_rewrite r JOIN pg_class c ON c.oid=r.ev_class
+  JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='NAMESPACE'),'[]'::jsonb),
+ 'policies',COALESCE((SELECT jsonb_agg(jsonb_build_array(c.relname,p.polname,p.polcmd,p.polpermissive,
+  p.polroles,pg_get_expr(p.polqual,p.polrelid),pg_get_expr(p.polwithcheck,p.polrelid)) ORDER BY c.relname,p.polname)
+  FROM pg_policy p JOIN pg_class c ON c.oid=p.polrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+  WHERE n.nspname='NAMESPACE'),'[]'::jsonb),
+ 'inheritance',COALESCE((SELECT jsonb_agg(jsonb_build_array(c.relname,pn.nspname,p.relname,i.inhseqno)
+  ORDER BY c.relname,i.inhseqno) FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid
+  JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_class p ON p.oid=i.inhparent
+  JOIN pg_namespace pn ON pn.oid=p.relnamespace WHERE n.nspname='NAMESPACE'),'[]'::jsonb),
+ 'extra_objects',(SELECT count(*) FROM (
+  SELECT oprnamespace AS ns FROM pg_operator UNION ALL SELECT opcnamespace FROM pg_opclass
+  UNION ALL SELECT opfnamespace FROM pg_opfamily UNION ALL SELECT collnamespace FROM pg_collation
+  UNION ALL SELECT connamespace FROM pg_conversion UNION ALL SELECT cfgnamespace FROM pg_ts_config
+  UNION ALL SELECT dictnamespace FROM pg_ts_dict UNION ALL SELECT prsnamespace FROM pg_ts_parser
+  UNION ALL SELECT tmplnamespace FROM pg_ts_template) x JOIN pg_namespace n ON n.oid=x.ns WHERE n.nspname='NAMESPACE'),
+ 'functions',(SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='NAMESPACE'),
+ 'extra_types',(SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace
+  WHERE n.nspname='NAMESPACE' AND t.typrelid=0 AND t.typelem=0),
+ 'extensions',(SELECT count(*) FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace WHERE n.nspname='NAMESPACE'))"""
+        # Only the generated schema identifier is normalized. OIDs which encode
+        # relation identity are deliberately represented by qualified names above.
+        inner = query.replace('NAMESPACE', namespace)
+        return "SELECT replace((" + inner + ")::text,'" + namespace + ".','public.')::jsonb"
+
+    @staticmethod
+    def _schema_literal(value):
+        # Every variable value enters as generated hexadecimal UTF-8, never SQL.
+        return "convert_from(decode('" + value.encode().hex() + "','hex'),'UTF8')"
+
+    def _schema_context(self, stage, *, current=True):
+        if current:
+            release, _ = self.release(stage)
+        else:
+            self.guard()
+            if (not stage.is_absolute() or stage.is_symlink() or stage.resolve() != stage
+                    or stage.parent != (self.state / "releases").resolve()):
+                raise Refused("Schema provenance is not an owned canonical release stage")
+            release = strict_json(trusted_file(stage / "manifest.json").read_bytes())
+        backup = self.checked_backup(stage)
+        change = release.get("components", {}).get("nebulalog", {})
+        if (change.get("schema_revision") != "2" or change.get("schema_sha256") != ApplicationSchema.schema_digest("2")
+                or change.get("database_migration") not in ("none", ApplicationSchema.ADDITIVE_UPGRADE)
+                or change.get("rollback_safe") is not True):
+            raise Refused("Operation is not bound to the reviewed application schema")
+        owner = backup.get("owners", {}).get("nebulalog", "")
+        if not isinstance(owner, str) or not IDENTIFIER.fullmatch(owner):
+            raise Refused("Backup has no valid application database owner")
+        legacy, additive, stepup = ApplicationSchema.reviewed_sql()
+        return {"schema": 1, "stage": str(stage.resolve()),
+                "operation": hashlib.sha256(str(stage.resolve()).encode()).hexdigest(),
+                "manifest_sha256": digest_file(trusted_file(stage / "manifest.json")),
+                "backup_sha256": digest_file(trusted_file(stage / "adapter-backup-inventory.json")),
+                "schema_revision": "2", "schema_sha256": ApplicationSchema.schema_digest("2"),
+                "sql_sha256": ApplicationSchema.SCHEMAS["2"]["migrations/postgres.sql"],
+                "additive_sha256": hashlib.sha256(additive.encode()).hexdigest(), "owner": owner}
+
+    def _schema_hold(self, stage, context):
+        path = self.data / "manager/storage-maintenance/gate.json"
+        trusted_file(path)
+        if path.stat().st_size > 4096:
+            raise Refused("Oversized storage maintenance evidence")
+        expected = {"schema": 1, "held": True, "delivery_held": True, "operation": context["operation"]}
+        if storage_gate_value(strict_json(path.read_bytes())) != expected:
+            raise Refused("Schema work requires the exact operation's host delivery hold")
+        for name in ("api", "ingest", "keycloak"):
+            if self.cmd(["systemctl", "show", "--property=ActiveState", "--value", "nebulalog-" + name + ".service"]) != "inactive":
+                raise Refused("All application writers must be stopped before schema work")
+        return expected
+
+    @staticmethod
+    def _schema_record(path, value):
+        raw = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        if path.exists() or path.is_symlink():
+            if trusted_file(path).read_bytes() != raw:
+                raise Refused("Immutable schema operation evidence changed")
+            return hashlib.sha256(raw).hexdigest()
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return hashlib.sha256(raw).hexdigest()
+
+    def _schema_query(self, context, *, migrate=False, gate_operation=None, catalog_only=None):
+        if catalog_only not in (None, "1", "2") or migrate and catalog_only:
+            raise Refused("Invalid catalog-only schema request")
+        legacy, additive, stepup = ApplicationSchema.reviewed_sql()
+        owner = context["owner"]
+        operation = context["operation"]
+        probe = "captainslog_probe_" + operation[:24]
+        marker = self._schema_literal(json.dumps(context, sort_keys=True, separators=(",", ":"))) + "::jsonb"
+        gate_operation = gate_operation or operation
+        if not re.fullmatch(r"[0-9a-f]{64}", gate_operation):
+            raise Refused("Invalid schema maintenance owner")
+        gate = self._schema_literal(json.dumps({"schema": 1, "held": True, "delivery_held": True,
+                                               "operation": gate_operation}, separators=(",", ":"))) + "::jsonb"
+        old_sql = self._schema_literal(legacy)
+        new_sql = self._schema_literal(additive)
+        step_sql = self._schema_literal(stepup)
+        expected_query = self._schema_literal(self._schema_catalog(probe))
+        actual_query = self._schema_literal(self._schema_catalog("public"))
+        # A fresh transaction reconstructs both allowed profiles from fixed SQL.
+        # It never uses live catalog output as the expected schema.
+        return f"""
+SET LOCAL search_path=pg_catalog;
+SET LOCAL lock_timeout='30s'; SET LOCAL statement_timeout='120s';
+CREATE TEMP TABLE captainslog_schema_result(value jsonb) ON COMMIT DROP;
+DO $migration$
+DECLARE old_catalog jsonb; new_catalog jsonb; actual jsonb; found jsonb; profile text; revision text; item record;
+BEGIN
+ PERFORM pg_advisory_xact_lock({STORAGE_LOCK});
+ IF current_setting('server_version_num')::integer / 10000 != 17 THEN RAISE EXCEPTION 'Unqualified PostgreSQL major'; END IF;
+ IF (SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname=current_database()) IS DISTINCT FROM '{owner}'
+ THEN RAISE EXCEPTION 'Application database owner differs from backup'; END IF;
+ IF EXISTS(SELECT FROM pg_event_trigger) OR EXISTS(SELECT FROM pg_default_acl WHERE defaclnamespace IN (0,'public'::regnamespace))
+ THEN RAISE EXCEPTION 'Unqualified DDL hooks or default privileges'; END IF;
+ IF EXISTS(SELECT FROM pg_proc WHERE pronamespace='public'::regnamespace)
+ THEN RAISE EXCEPTION 'Unqualified application functions'; END IF;
+ IF (SELECT nspowner FROM pg_namespace WHERE nspname='public') IS DISTINCT FROM (SELECT oid FROM pg_roles WHERE rolname='pg_database_owner')
+  OR (SELECT count(*) FROM aclexplode((SELECT nspacl FROM pg_namespace WHERE nspname='public'))) != 3
+  OR EXISTS(SELECT FROM aclexplode((SELECT nspacl FROM pg_namespace WHERE nspname='public')) a
+    WHERE a.is_grantable OR a.grantor<>(SELECT oid FROM pg_roles WHERE rolname='pg_database_owner')
+    OR NOT (a.grantee=(SELECT oid FROM pg_roles WHERE rolname='pg_database_owner') AND a.privilege_type IN ('CREATE','USAGE')
+      OR a.grantee=0 AND a.privilege_type='USAGE'))
+ THEN RAISE EXCEPTION 'Public namespace privileges differ from the qualified PG17 profile'; END IF;
+ IF EXISTS(SELECT FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid JOIN pg_class p ON p.oid=i.inhparent
+  WHERE c.relnamespace='public'::regnamespace OR p.relnamespace='public'::regnamespace)
+ THEN RAISE EXCEPTION 'Application table inheritance is not qualified'; END IF;
+ FOR item IN SELECT c.relname FROM pg_class c WHERE c.relnamespace='public'::regnamespace AND c.relkind='r' ORDER BY c.relname LOOP
+  EXECUTE format('LOCK TABLE public.%I IN ACCESS EXCLUSIVE MODE',item.relname);
+ END LOOP;
+ profile := CASE WHEN to_regclass('public.host_stepup_pending') IS NULL THEN 'base' ELSE 'host-stepup' END;
+ EXECUTE 'CREATE SCHEMA {probe} AUTHORIZATION "{owner}"';
+ EXECUTE 'SET LOCAL ROLE "{owner}"';
+ EXECUTE 'SET LOCAL search_path={probe},pg_catalog';
+ EXECUTE {old_sql};
+ IF profile='host-stepup' THEN EXECUTE {step_sql}; END IF;
+ EXECUTE 'SET LOCAL search_path=pg_catalog';
+ EXECUTE {expected_query} INTO old_catalog;
+ EXECUTE 'SET LOCAL search_path={probe},pg_catalog';
+ EXECUTE {new_sql};
+ EXECUTE 'SET LOCAL search_path=pg_catalog';
+ EXECUTE {expected_query} INTO new_catalog;
+ EXECUTE 'DROP SCHEMA {probe} CASCADE';
+ EXECUTE {actual_query} INTO actual;
+ IF actual IS DISTINCT FROM old_catalog AND actual IS DISTINCT FROM new_catalog
+ THEN RAISE EXCEPTION 'Application catalog differs before reading any application data'; END IF;
+ IF (SELECT value FROM public.settings WHERE key='storage_emergency_maintenance') IS DISTINCT FROM {gate}
+ THEN RAISE EXCEPTION 'Database delivery hold differs'; END IF;
+ SELECT value INTO found FROM public.settings WHERE key='application_schema_migration:{operation}';
+ IF {str(migrate).lower()} THEN
+  IF actual IS DISTINCT FROM old_catalog OR found IS NOT NULL
+   OR EXISTS(SELECT FROM public.settings WHERE key='storage_emergency' OR key LIKE 'application_schema_migration:%')
+  THEN RAISE EXCEPTION 'Schema is not the exact unmigrated legacy profile'; END IF;
+  EXECUTE 'SET LOCAL search_path=public,pg_catalog';
+  EXECUTE {new_sql};
+  EXECUTE 'SET LOCAL search_path=pg_catalog';
+  EXECUTE {actual_query} INTO actual;
+  IF actual IS DISTINCT FROM new_catalog THEN RAISE EXCEPTION 'Target catalog differs from fixed SQL'; END IF;
+  INSERT INTO public.settings(key,value) VALUES('application_schema_migration:{operation}',{marker});
+  INSERT INTO public.audit_events(actor,action,target,detail)
+   VALUES('host-lifecycle','application.schema.migrate','{operation}',{marker});
+  found := {marker};
+ END IF;
+ IF '{catalog_only or ''}' IN ('1','2') THEN
+  IF ('{catalog_only or ''}'='1' AND actual IS DISTINCT FROM old_catalog)
+   OR ('{catalog_only or ''}'='2' AND actual IS DISTINCT FROM new_catalog)
+  THEN RAISE EXCEPTION 'Catalog differs from the requested fixed schema'; END IF;
+  revision := '{catalog_only or ''}';
+ ELSIF actual=new_catalog AND found={marker} THEN
+  IF EXISTS(SELECT FROM public.storage_emergency_actions WHERE completed_at IS NULL)
+   OR EXISTS(SELECT FROM public.storage_emergency_inserts)
+  THEN RAISE EXCEPTION 'Unresolved storage evidence prevents schema recovery'; END IF;
+  revision := '2';
+ ELSIF actual=old_catalog AND found IS NULL
+  AND NOT EXISTS(SELECT FROM public.settings WHERE key='storage_emergency' OR key LIKE 'application_schema_migration:%')
+ THEN revision := '1';
+ ELSE RAISE EXCEPTION 'Schema outcome is foreign, partial, or unproven'; END IF;
+ IF revision='1' AND EXISTS(SELECT FROM public.settings WHERE key='storage_emergency' OR key LIKE 'application_schema_migration:%')
+ THEN RAISE EXCEPTION 'Legacy catalog contains foreign or partial migration evidence'; END IF;
+ IF revision='2' THEN
+  IF NOT EXISTS(SELECT FROM public.settings WHERE key='storage_emergency')
+   OR (SELECT count(*) FROM public.storage_emergency_state) != 1
+  THEN RAISE EXCEPTION 'Target schema lacks required emergency policy/state'; END IF;
+  IF EXISTS(SELECT FROM public.storage_emergency_actions WHERE completed_at IS NULL)
+   OR EXISTS(SELECT FROM public.storage_emergency_inserts)
+  THEN RAISE EXCEPTION 'Unresolved storage evidence prevents schema recovery'; END IF;
+ END IF;
+ IF (SELECT count(*) FROM public.settings WHERE key LIKE 'application_schema_migration:%') > 128
+  OR EXISTS(SELECT FROM public.settings WHERE key LIKE 'application_schema_migration:%' AND octet_length(value::text)>8192)
+ THEN RAISE EXCEPTION 'Oversized migration marker inventory'; END IF;
+ RESET ROLE;
+ INSERT INTO pg_temp.captainslog_schema_result VALUES(jsonb_build_object('revision',revision,
+  'catalog',actual,'marker',found,'profile',profile) ||
+  CASE WHEN '{catalog_only or ''}' IN ('1','2') THEN jsonb_build_object('markers',
+   (SELECT COALESCE(jsonb_agg(jsonb_build_object('key',key,'value',value) ORDER BY key),'[]'::jsonb)
+    FROM public.settings WHERE key LIKE 'application_schema_migration:%')) ELSE '{{}}'::jsonb END);
+END $migration$;
+SELECT value::text FROM pg_temp.captainslog_schema_result;
+"""
+
+    def _schema_psql(self, query):
+        return self.cmd(["podman", "exec", "-i", "--user", "999:999", "nebulalog-postgresql",
+            "psql", "-X", "--username=postgres", "--dbname=nebulalog", "--single-transaction",
+            "--quiet", "--tuples-only", "--no-align", "--set=ON_ERROR_STOP=1"], input=query.encode(), timeout=150)
+
+    def _schema_intent(self, stage, context):
+        path = stage / "adapter-application-schema-intent.json"
+        intent = strict_json(trusted_file(path).read_bytes())
+        if (not isinstance(intent, dict) or set(intent) != {"context", "executor"}
+                or intent["context"] != context):
+            raise Refused("Schema intent is not bound to this operation and backup")
+        execution = intent["executor"]
+        if (not isinstance(execution, dict) or set(execution) != {"container_id", "image", "unit", "application_name"}
+                or not re.fullmatch(r"[0-9a-f]{64}", execution.get("container_id", ""))
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", execution.get("image", ""))
+                or execution.get("unit") != "nebulalog-schema-" + context["operation"][:32] + ".service"
+                or execution.get("application_name") != "captainslog-schema-" + context["operation"][:32]):
+            raise Refused("Invalid retained schema executor identity")
+        self._schema_record(path, intent)
+        return intent
+
+    def application_schema_fence(self, stage):
+        """Remove the exact client, then fence orphan PostgreSQL server execution.
+
+        Must precede restore. Stopping a podman CLI alone does not stop its
+        container child, and absence from pg_stat_activity alone is not a fence.
+        """
+        context = self._schema_context(stage)
+        self._schema_hold(stage, context)
+        intent = self._schema_intent(stage, context)
+        executor = intent["executor"]
+        unit = executor["unit"]
+        load = self.cmd(["systemctl", "show", "--property=LoadState", "--value", unit])
+        if load != "not-found":
+            self.cmd(["systemctl", "stop", unit], timeout=60)
+            if self.cmd(["systemctl", "show", "--property=ActiveState", "--value", unit]) not in ("inactive", "failed"):
+                raise Refused("Migration supervisor remains active")
+        identity = executor["container_id"]
+        listed = self.cmd(["podman", "ps", "--all", "--no-trunc", "--filter", "id=" + identity, "--format", "{{.ID}}"])
+        if listed:
+            if listed != identity:
+                raise Refused("Migration client identity changed")
+            self.cmd(["podman", "rm", "--force", "--time", "10", identity], timeout=60)
+        if self.cmd(["podman", "ps", "--all", "--no-trunc", "--filter", "id=" + identity, "--format", "{{.ID}}"]):
+            raise Refused("Migration client can still execute")
+        app = executor["application_name"]
+        query = f"""SET LOCAL search_path=pg_catalog; SET LOCAL statement_timeout='30s';
+DO $fence$ DECLARE item record; BEGIN
+ FOR item IN SELECT pid FROM pg_stat_activity WHERE datid=(SELECT oid FROM pg_database WHERE datname=current_database())
+  AND application_name='{app}' AND pid<>pg_backend_pid() LOOP
+  IF NOT pg_terminate_backend(item.pid,10000) THEN RAISE EXCEPTION 'Migration executor did not terminate'; END IF;
+ END LOOP;
+ PERFORM pg_advisory_xact_lock({STORAGE_LOCK});
+ PERFORM pg_stat_clear_snapshot();
+ IF EXISTS(SELECT FROM pg_stat_activity WHERE datid=(SELECT oid FROM pg_database WHERE datname=current_database())
+  AND application_name='{app}' AND pid<>pg_backend_pid()) THEN RAISE EXCEPTION 'Migration backend remains'; END IF;
+END $fence$; SELECT 'fenced';"""
+        if self._schema_psql(query) != "fenced":
+            raise Refused("Migration backend fence was not observed")
+        return self.receipt(stage, "application-schema-fence", operation=context["operation"],
+                            intent_sha256=digest_file(stage / "adapter-application-schema-intent.json"), executor=executor)
+
+    def _schema_result(self, stage, context, raw, *, recovered):
+        observed = strict_json(raw.encode())
+        if (not isinstance(observed, dict) or set(observed) != {"revision", "catalog", "marker", "profile"}
+                or observed["revision"] not in ("1", "2") or observed["profile"] not in ("base", "host-stepup")):
+            raise Refused("Unrecognized schema readback")
+        if observed["revision"] != "2" or observed["marker"] != context:
+            return self.receipt(stage, "application-schema-recovery", ok=False, state="aborted",
+                                operation=context["operation"], schema_revision="1", replay_permitted=False)
+        intent = self._schema_intent(stage, context)
+        result = {**context, "ok": True, "action": "application-schema", "state": "complete",
+                  "intent_sha256": digest_file(stage / "adapter-application-schema-intent.json"),
+                  "marker": context, "profile": observed["profile"], "executor": intent["executor"],
+                  "catalog_sha256": hashlib.sha256(json.dumps(observed["catalog"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()}
+        # Completion is immutable. Recovery does not rewrite a receipt which the
+        # manager's actual-schema pointer may already bind by hash.
+        self._schema_record(stage / "adapter-application-schema.json", result)
+        return result
+
+    def application_schema_recover(self, stage):
+        context = self._schema_context(stage)
+        self.application_schema_fence(stage)
+        self._schema_hold(stage, context)
+        return self._schema_result(stage, context, self._schema_psql(self._schema_query(context)), recovered=True)
+
+    def application_schema_receipt(self, stage):
+        """Static immutable provenance; does not claim a current database check."""
+        context = self._schema_context(stage, current=False)
+        intent = self._schema_intent(stage, context)
+        path = stage / "adapter-application-schema.json"
+        retained = strict_json(trusted_file(path).read_bytes())
+        extra = {"ok", "action", "state", "intent_sha256", "marker", "profile", "executor", "catalog_sha256"}
+        if (not isinstance(retained, dict) or set(retained) != set(context) | extra
+                or any(retained.get(k) != v for k, v in context.items())
+                or retained.get("ok") is not True or retained.get("action") != "application-schema"
+                or retained.get("state") != "complete" or retained.get("marker") != context
+                or retained.get("profile") not in ("base", "host-stepup")
+                or retained.get("executor") != intent["executor"]
+                or retained.get("intent_sha256") != digest_file(stage / "adapter-application-schema-intent.json")
+                or not isinstance(retained.get("catalog_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", retained["catalog_sha256"])):
+            raise Refused("Retained schema completion provenance changed")
+        self._schema_record(path, retained)
+        return retained
+
+    def application_schema_verify(self, stage, *, maintenance_stage=None):
+        """Recheck original completion under a current operation's delivery hold."""
+        retained = self.application_schema_receipt(stage)
+        context = self._schema_context(stage, current=False)
+        owner_stage = maintenance_stage or stage
+        if (not owner_stage.is_absolute() or owner_stage.is_symlink() or owner_stage.resolve() != owner_stage
+                or owner_stage.parent not in ((self.state / "releases").resolve(),
+                                               (self.data / "manager/os-updates").resolve())):
+            raise Refused("Schema verification needs an owned maintenance stage")
+        gate_operation = hashlib.sha256(str(owner_stage).encode()).hexdigest()
+        self._schema_hold(owner_stage, {"operation": gate_operation})
+        actual = self._schema_result(stage, context,
+            self._schema_psql(self._schema_query(context, gate_operation=gate_operation)), recovered=True)
+        if actual != retained:
+            raise Refused("Retained application schema receipt no longer verifies")
+        return actual
+
+    def application_schema_catalog(self, stage, revision):
+        """Observe a fixed factory/restored profile; never adopt it as provenance.
+
+        The coordinator must separately bind the requested revision to factory
+        source or a checked backup. This method cannot authorize SQL migration.
+        """
+        self.guard()
+        if (revision not in ("1", "2") or not stage.is_absolute() or stage.is_symlink() or stage.resolve() != stage
+                or stage.parent not in ((self.state / "releases").resolve(),
+                                        (self.data / "manager/os-updates").resolve())):
+            raise Refused("Invalid schema catalog observation scope")
+        owner = "nebulalog"
+        if (stage / "adapter-backup.json").exists():
+            owner = self.checked_backup(stage).get("owners", {}).get("nebulalog", "")
+        if not isinstance(owner, str) or not IDENTIFIER.fullmatch(owner):
+            raise Refused("Unknown application database owner")
+        context = {"operation": hashlib.sha256(str(stage).encode()).hexdigest(), "owner": owner}
+        self._schema_hold(stage, context)
+        observed = strict_json(self._schema_psql(self._schema_query(context, catalog_only=revision)).encode())
+        if (not isinstance(observed, dict) or set(observed) != {"revision","catalog","marker","profile","markers"}
+                or observed["revision"] != revision or observed["profile"] not in ("base", "host-stepup")
+                or not isinstance(observed["markers"], list) or len(observed["markers"]) > 128):
+            raise Refused("Unrecognized schema catalog observation")
+        markers = []
+        for item in observed["markers"]:
+            if (not isinstance(item, dict) or set(item) != {"key", "value"}
+                    or not isinstance(item["key"], str) or not re.fullmatch(r"application_schema_migration:[0-9a-f]{64}", item["key"])):
+                raise Refused("Malformed retained migration marker")
+            markers.append({"key": item["key"], "sha256": hashlib.sha256(json.dumps(item["value"], sort_keys=True,
+                            separators=(",", ":")).encode()).hexdigest()})
+        if revision == "1" and markers:
+            raise Refused("Restored legacy schema contains migration completion evidence")
+        return {"ok": True, "schema_revision": revision, "schema_sha256": ApplicationSchema.schema_digest(revision),
+                "sql_sha256": ApplicationSchema.SCHEMAS[revision]["migrations/postgres.sql"],
+                "stage": str(stage), "operation": context["operation"], "owner": owner,
+                "profile": observed["profile"], "markers": markers,
+                "catalog_sha256": hashlib.sha256(json.dumps(observed["catalog"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()}
+
+    def _schema_client_ready(self):
+        raw = self._schema_psql("SELECT jsonb_build_object('listen',current_setting('listen_addresses'),'rules',"
+            "(SELECT jsonb_agg(jsonb_build_object('type',type,'database',database,'user_name',user_name,"
+            "'address',address,'netmask',netmask,'auth_method',auth_method,'options',options,'error',error) ORDER BY rule_number) "
+            "FROM pg_hba_file_rules));")
+        value = strict_json(raw.encode())
+        if (not isinstance(value, dict) or set(value) != {'listen', 'rules'}
+                or value['listen'] not in ('*', 'localhost', '127.0.0.1', '127.0.0.1,::1')
+                or not isinstance(value['rules'], list) or not 1 <= len(value['rules']) <= 64):
+            raise Refused("PostgreSQL loopback client authentication is not qualified")
+        loopback = False
+        for rule in value['rules']:
+            if (not isinstance(rule, dict) or set(rule) != {'type','database','user_name','address','netmask','auth_method','options','error'}
+                    or rule['error'] is not None or rule['options'] not in (None, [])):
+                raise Refused("PostgreSQL authentication configuration is ambiguous")
+            if rule['type'] == 'local' or rule['database'] == ['replication']:
+                continue
+            if (rule['type'] not in ('host','hostssl','hostnossl') or rule['auth_method'] != 'scram-sha-256'
+                    or rule['database'] != ['all'] or rule['user_name'] != ['all']):
+                raise Refused("PostgreSQL TCP rules differ from the qualified SCRAM profile")
+            if rule['type'] in ('host','hostnossl') and (rule['address'] == 'all'
+                    or rule['address'] == '127.0.0.1' and rule['netmask'] == '255.255.255.255'):
+                loopback = True
+        if not loopback:
+            raise Refused("No qualified loopback SCRAM connection is available")
+
+    def application_schema_migrate(self, stage):
+        context = self._schema_context(stage)
+        self._schema_hold(stage, context)
+        if (stage / "adapter-application-schema-intent.json").exists():
+            return self.application_schema_recover(stage)
+        release, _ = self.release(stage)
+        if ApplicationSchema.transition(release["components"]["nebulalog"], self.config["schema_revision"]) != ApplicationSchema.ADDITIVE_UPGRADE:
+            raise Refused("No reviewed additive schema migration was authorized")
+        # Preflight exact old catalog before creating even a stopped executor.
+        before = strict_json(self._schema_psql(self._schema_query(context)).encode())
+        if before["revision"] != "1":
+            raise Refused("An unowned target schema is not a migration opportunity")
+        self._schema_client_ready()
+        image = self.cmd(["podman", "inspect", "--format", "{{.Image}}", "nebulalog-postgresql"])
+        if re.fullmatch(r"[0-9a-f]{64}", image): image = "sha256:" + image
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
+            raise Refused("PostgreSQL client image has no immutable identity")
+        pinned = image_from_quadlet(trusted_file(self.quadlets / "nebulalog-postgresql.container").read_text())
+        accepted_image = self.cmd(["podman", "image", "inspect", "--format", "{{.Id}}", pinned])
+        if re.fullmatch(r"[0-9a-f]{64}", accepted_image): accepted_image = "sha256:" + accepted_image
+        if accepted_image != image:
+            raise Refused("Running PostgreSQL client image differs from the protected Quadlet pin")
+        name = "nebulalog-schema-" + context["operation"][:32]
+        # Use the existing root-controlled Podman secret. Secret bytes never
+        # enter a host command argument, receipt, or diagnostic output.
+        script = 'set -eu; export PGPASSWORD="$(cat /run/secrets/nebulalog-pg-password)"; exec psql -X --host=127.0.0.1 --username=postgres --dbname=nebulalog --single-transaction --quiet --tuples-only --no-align --set=ON_ERROR_STOP=1'
+        identity = self.cmd(["podman", "create", "--name", name, "--label", "captainslog.schema.operation=" + context["operation"],
+            "--network=container:nebulalog-postgresql", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+            "--user=999:999", "--interactive", "--secret=nebulalog-pg-password,uid=999,gid=999,mode=0400",
+            "--env", "PGSSLMODE=disable",
+            "--env", "PGAPPNAME=captainslog-schema-" + context["operation"][:32],
+            "--entrypoint=/bin/sh", image, "-c", script], timeout=60)
+        executor = {"container_id": identity, "image": image, "unit": name + ".service",
+                    "application_name": "captainslog-schema-" + context["operation"][:32]}
+        if not re.fullmatch(r"[0-9a-f]{64}", identity):
+            raise Refused("Migration client has no exact container identity")
+        self._schema_record(stage / "adapter-application-schema-intent.json", {"context": context, "executor": executor})
+        self._schema_hold(stage, context)
+        raw = self.cmd(["systemd-run", "--unit=" + executor["unit"], "--wait", "--pipe", "--collect",
+            "--property=KillMode=control-group", "--property=RuntimeMaxSec=180", "--",
+            "podman", "start", "--attach", "--interactive", identity], input=self._schema_query(context, migrate=True).encode(), timeout=210)
+        # A valid stdout does not prove COMMIT (psql emits SELECT before commit).
+        # The independent transaction below is authoritative, even on success.
+        self.application_schema_fence(stage)
+        return self._schema_result(stage, context, self._schema_psql(self._schema_query(context)), recovered=False)
+
     def pg(self, args, *, input=None, timeout=120):
         return self.cmd(["podman", "exec", "--user", "999:999", "nebulalog-postgresql", *args], input=input, timeout=timeout)
 
@@ -253,13 +1037,19 @@ class Lifecycle:
                 raise Refused("Preflight requires the expected appliance services to be running")
         local_auth(self.config)
         previous = transaction["previous"]["components"]
+        schema = self.application_schema_current()
+        application = release["components"].get("nebulalog")
+        migration = self.application_schema_transition(application, schema["revision"]) if application else "none"
+        target_schema = application["schema_revision"] if application else schema["revision"]
         for component, change in release["components"].items():
             if component == "host":
                 continue
             if change.get("rollback_safe") is not True or not IMAGE.fullmatch(change.get("image", "")):
                 raise Refused("Every component needs a reversible release and an immutable OCI image")
-            if change.get("database_migration") != "none" or change.get("schema_revision") != self.config["schema_revision"]:
-                raise Refused("Automatic component updates require the current schema; controlled migrations are a separate qualification")
+            if component != "nebulalog":
+                if change.get("database_migration") != "none" or change.get("schema_revision") != target_schema:
+                    raise Refused("Supporting components must preserve the target application schema")
+                ApplicationSchema.transition(change, target_schema)
             if component not in previous:
                 raise Refused("Component is not part of the installed release")
             old = previous[component]["version"]
@@ -279,8 +1069,13 @@ class Lifecycle:
         if shutil.disk_usage(self.data).free < sum(item["bytes"] for item in release["artifacts"]) * 3 + 1024**3:
             raise Refused("Insufficient staged-image and metadata backup reserve")
         host = {"host": HostRuntime(self, stage).preflight()} if "host" in release["components"] else {}
+        # Written before returning to the manager, before backup or preparation
+        # can stop writers or authorize candidate effects. An interrupted fixed
+        # preflight may be rechecked only while no such effects have started.
+        self._schema_record(stage / "adapter-backup-intent.json", self.preactivation_context(stage))
         return self.receipt(stage, "preflight", components=list(release["components"]),
-                            schema_revision=self.config["schema_revision"], logs_backup=False, **host)
+                            schema_revision=schema["revision"], target_schema_revision=target_schema,
+                            database_migration=migration, logs_backup=False, **host)
 
     @staticmethod
     def identity_qualification(stage, release, change):
@@ -301,6 +1096,67 @@ class Lifecycle:
                 raise Refused("Required prerelease identity browser evidence is missing: " + gate)
         return {"artifact": name, "checks": sorted(IDENTITY_GATES), "kind": "signed prerelease browser qualification"}
 
+    def preactivation_context(self, stage):
+        """Bind the unchanged runtime before backup can stop a writer."""
+        _, transaction = self.release(stage)
+        def snapshot(directory):
+            files = inventory(directory)
+            for entry in files:
+                entry["mode"] = (directory / entry["path"]).stat().st_mode & 0o7777
+            directories = []
+            for path in [directory, *sorted(directory.rglob("*"))]:
+                if path.is_dir():
+                    info = path.stat()
+                    directories.append({"path": path.relative_to(directory).as_posix(),
+                        "uid": info.st_uid, "gid": info.st_gid, "mode": info.st_mode & 0o7777})
+            return {"files": files, "directories": directories}
+        return {"schema": 1, "stage": str(stage), "manifest_sha256": transaction["manifest_sha256"],
+                "previous_sha256": hashlib.sha256(json.dumps(transaction["previous"], sort_keys=True,
+                    separators=(",", ":"), allow_nan=False).encode()).hexdigest(),
+                "application_schema": self.application_schema_current(),
+                "configuration": snapshot(self.configuration), "quadlets": snapshot(self.quadlets)}
+
+    def preactivation_recover(self, stage):
+        """Resume only proven unchanged code; never restore an incomplete dump."""
+        release, transaction = self.release(stage)
+        if (transaction.get("activation_started") is not False
+                or transaction.get("state") not in {"rolling_back", "recovery_required"}):
+            raise Refused("Unchanged-runtime recovery requires a durable preactivation transaction")
+        for name in ("activate", "application-schema-intent", "application-schema",
+                     "database-restore-intent", "database-restore-complete"):
+            if os.path.lexists(stage / ("adapter-" + name + ".json")):
+                raise Refused("Candidate effects cannot use unchanged-runtime recovery")
+        snapshot = strict_json(trusted_file(stage / "adapter-backup-intent.json").read_bytes())
+        if snapshot != self.preactivation_context(stage):
+            raise Refused("Runtime changed since the preactivation backup intent")
+        marker = self.data / "manager/maintenance.json"
+        if os.path.lexists(marker):
+            owner = strict_json(trusted_file(marker).read_bytes())
+            if owner.get("active") is not True or owner.get("release") != str(stage):
+                raise Refused("Another operation owns public maintenance")
+        self.storage_maintenance(stage, held=True, delivery_held=True, host_only=True)
+        self.maintenance(True, stage)
+        self.service("stop", tuple(name for name in reversed(self.services) if name != "postgresql"))
+        self.service("start", ("postgresql",))
+        self.pg_ready()
+        # Unknown INSERT/removal outcomes still refuse this barrier. A failed
+        # backup is not authority to clear an unsettled storage operation.
+        self.storage_maintenance(stage, held=True, delivery_held=True)
+        self.application_schema_check(stage, snapshot["application_schema"])
+        if snapshot != self.preactivation_context(stage):
+            raise Refused("Runtime changed while recovering the preactivation hold")
+        host = HostRuntime(self, stage) if "host" in release["components"] else None
+        if host:
+            # Reconstruct only a missing host-file recovery copy after proving
+            # each live file still equals the original protected plan. Database
+            # dump files and incomplete backup evidence remain untouched.
+            host.backup(preactivation_recovery=True)
+        self.service("start", tuple(name for name in self.services if name != "postgresql"))
+        self.storage_maintenance(stage, held=True, delivery_held=False)
+        return self.receipt(stage, "rollback", unchanged_runtime_recovered=True,
+                            current_databases_preserved=True, current_configuration_preserved=True,
+                            **({"host": host.runtime_evidence("update-rollback")} if host else {}))
+
     def backup(self, stage, *, os_backup=False, retain_maintenance=False, maintenance_owner=None):
         release = {}
         if not os_backup:
@@ -314,11 +1170,20 @@ class Lifecycle:
         elif maintenance_owner is not None:
             raise Refused("Backup maintenance owner requires retained maintenance")
         self.encrypted()
+        schema_snapshot = self.application_schema_current()
+        if not os_backup:
+            self._schema_record(stage / "adapter-backup-intent.json", self.preactivation_context(stage))
+        receiving = self.storage_gate_aware_ingest()
+        writers = ("api", "keycloak") + (() if receiving else ("ingest",))
+        restart_writers = ("keycloak", "api") + (() if receiving else ("ingest",))
         destination = stage / "recovery"
         destination.mkdir(mode=0o700, exist_ok=False)
         self.maintenance(True, owner)
+        storage_held = False
         try:
-            self.service("stop", ("api", "keycloak"))
+            self.storage_maintenance(owner, held=True, delivery_held=True)
+            storage_held = True
+            self.service("stop", writers)
             owners = json.loads(self.sql("SELECT json_object_agg(datname,pg_get_userbyid(datdba)) FROM pg_database WHERE datname IN ('nebulalog','keycloak')"))
             if set(owners) != {"nebulalog", "keycloak"} or any(not IDENTIFIER.fullmatch(owner) for owner in owners.values()):
                 raise Refused("Recovery requires the two known databases and safe observed owner identities")
@@ -350,14 +1215,17 @@ class Lifecycle:
                 image_from_quadlet(path.read_text())
                 shutil.copy2(path, quadlets / path.name)
             evidence = {"schema": 1, "owners": owners, "role_hashes": roles, "configuration_directories": directories,
+                        "application_schema": schema_snapshot,
                         "files": inventory(destination), "includes_clickhouse_logs": False}
             atomic_json(stage / "adapter-backup-inventory.json", evidence)
             host = {"host": HostRuntime(self, stage).backup()} if "host" in release.get("components", {}) else {}
             result = self.receipt(stage, "backup", postgresql=True, configuration=True,
                                   inventory_sha256=digest_file(stage / "adapter-backup-inventory.json"),
-                                  ingestion="continues receiving; durable data and WAL are not restored from a metadata backup", **host)
+                                  ingestion="receiving into durable WAL" if receiving else "legacy receiver stopped for a consistent backup",
+                                  schema_revision=schema_snapshot["revision"], storage_maintenance=True, **host)
             if os_backup:
-                self.service("start", ("keycloak", "api"))
+                self.service("start", restart_writers)
+                self.storage_maintenance(owner, held=True, delivery_held=False)
                 self.api_ready()
                 if not retain_maintenance:
                     self.maintenance(False, owner)
@@ -366,11 +1234,15 @@ class Lifecycle:
             # The manager does not invoke rollback for preflight/backup failures.
             # Preserve active=true if service recovery itself fails.
             try:
-                self.service("start", ("keycloak", "api"))
+                if not storage_held:
+                    raise Refused("Storage barrier was not established; its uncertain hold requires recovery")
+                self.service("start", restart_writers)
                 self.api_ready()
+                self.storage_maintenance(owner, held=os_backup or retain_maintenance, delivery_held=False)
                 if not retain_maintenance:
                     self.maintenance(False, owner)
-                self.receipt(stage, "backup-recovery", recovered=True, services=["keycloak", "api"], maintenance_retained=retain_maintenance)
+                self.receipt(stage, "backup-recovery", recovered=True, services=list(restart_writers),
+                             maintenance_retained=retain_maintenance, storage_maintenance_held=os_backup or retain_maintenance)
             except BaseException as recovery_error:
                 self.receipt(stage, "backup-recovery", ok=False, recovered=False,
                              error=type(recovery_error).__name__, original_error=type(failure).__name__)
@@ -410,11 +1282,16 @@ class Lifecycle:
         return self.receipt(stage, "prepare", images=images, files=inventory(prepared), **host)
 
     def activate(self, stage):
-        release, _ = self.release(stage)
-        self.checked_backup(stage)
+        release, transaction = self.release(stage)
+        if transaction.get("activation_started") is False:
+            raise Refused("Candidate activation was not durably authorized by the manager")
+        backup = self.checked_backup(stage)
         preparation = json.loads(trusted_file(stage / "adapter-prepare.json").read_text())
         verify_inventory(stage / "prepared-quadlets", preparation["files"])
-        self.service("stop", tuple(reversed(self.services)))
+        self.storage_maintenance(stage, held=True, delivery_held=True)
+        self.service("stop", tuple(name for name in reversed(self.services) if name != "postgresql"))
+        self.application_schema_check(stage, backup["application_schema"])
+        self.service("stop", ("postgresql",))
         self.cmd(["sync", "-f", str(self.data)], timeout=120)
         # Fixed file set; no Exec/volume/env changes are accepted from downloaded artifacts.
         for item in preparation["files"]:
@@ -426,18 +1303,53 @@ class Lifecycle:
         if host:
             host.apply()
         self.cmd(["systemctl", "daemon-reload"])
-        self.service("start", self.services)
+        self.service("start", ("postgresql",))
+        self.pg_ready()
+        application = release["components"].get("nebulalog")
+        migration = self.application_schema_transition(application, backup["application_schema"]["revision"]) if application else "none"
+        if migration == ApplicationSchema.ADDITIVE_UPGRADE:
+            result = self.application_schema_migrate(stage)
+            if result.get("ok") is not True or result.get("state") != "complete":
+                raise Refused("Application schema migration did not commit; activation remains held")
+            self.application_schema_accept(stage)
+        else:
+            self.application_schema_check(stage)
+        self.service("start", tuple(name for name in self.services if name != "postgresql"))
+        # Health can now exercise real INSERT and WAL delivery. Destructive
+        # retention remains held until durable commit and final acceptance.
+        self.storage_maintenance(stage, held=True, delivery_held=False)
         return self.receipt(stage, "activate", services=list(self.services), maintenance=True,
-                            durable_data_preserved=True, migration="none",
+                            durable_data_preserved=True, migration=migration,
+                            schema_revision=self.application_schema_current()["revision"],
                             **({"host": host.runtime_evidence("update-activate")} if host else {}))
 
     def rollback(self, stage):
-        release, _ = self.release(stage)
+        release, transaction = self.release(stage)
+        if transaction.get("activation_started") is False:
+            return self.preactivation_recover(stage)
         evidence = self.checked_backup(stage)
         finalized = stage / "adapter-finalize.json"
         historical = finalized.exists() and json.loads(trusted_file(finalized).read_text()).get("transaction_state") == "committed"
+        restore_context, restoring, restored = (None, False, False) if historical else self.database_restore_status(stage, evidence)
         self.maintenance(True, stage)
-        self.service("stop", tuple(reversed(self.services)))
+        self.storage_maintenance(stage, held=True, delivery_held=True, host_only=True)
+        self.service("stop", tuple(name for name in reversed(self.services) if name != "postgresql"))
+        self.service("start", ("postgresql",))
+        self.pg_ready()
+        migration_intent = stage / "adapter-application-schema-intent.json"
+        if os.path.lexists(migration_intent) and not (restoring and not restored):
+            # Remove the exact retained execution client before waiting on a
+            # database lock. An orphan client may still be about to connect.
+            self.application_schema_fence(stage)
+        if not (restoring and not restored):
+            self.storage_maintenance(stage, held=True, delivery_held=True)
+            if os.path.lexists(migration_intent) and not historical and not restored:
+                outcome = self.application_schema_recover(stage)
+                if outcome.get("state") not in ("complete", "aborted"):
+                    raise Refused("Unproven migration outcome cannot authorize database restore")
+            else:
+                self.application_schema_check(stage, evidence["application_schema"] if restored else None)
+        self.service("stop", ("postgresql",))
         host = HostRuntime(self, stage) if "host" in release["components"] else None
         if host:
             host.apply(rollback=True)
@@ -455,9 +1367,14 @@ class Lifecycle:
             atomic_file(self.quadlets / source.name, body, source.stat().st_mode & 0o777)
         if historical:
             self.cmd(["systemctl", "daemon-reload"])
-            self.service("start", self.services)
+            self.service("start", ("postgresql",))
+            self.pg_ready()
+            self.application_schema_check(stage)
+            self.service("start", tuple(name for name in self.services if name != "postgresql"))
+            self.storage_maintenance(stage, held=True, delivery_held=False)
             return self.receipt(stage, "rollback", restored_image_pins=True, current_databases_preserved=True,
-                                current_configuration_preserved=True, kind="same-schema operator rollback",
+                                current_configuration_preserved=True, kind="operator image rollback with current schema retained",
+                                schema_revision=self.application_schema_current()["revision"],
                                 **({"host": host.runtime_evidence("update-rollback")} if host else {}))
         expected_files = {f["path"] for f in inventory(stage / "recovery/configuration")}
         for existing in self.configuration.rglob("*"):
@@ -482,13 +1399,21 @@ class Lifecycle:
         query = "SELECT json_object_agg(rolname,rolpassword) FROM pg_authid WHERE rolname IN (" + ",".join("'" + owner + "'" for owner in sorted(set(owners.values()))) + ")"
         if json.loads(self.sql(query)) != evidence["role_hashes"]:
             raise Refused("Database role credentials changed; automatic restore cannot safely reconcile them")
-        for database in ("nebulalog", "keycloak"):
-            self.pg(["dropdb", "--username=postgres", "--force", "--if-exists", database])
-            self.pg(["createdb", "--username=postgres", "--owner=" + owners[database], database])
-            self.cmd.feed(["podman", "exec", "-i", "--user", "999:999", "nebulalog-postgresql", "pg_restore",
-                           "--username=postgres", "--exit-on-error", "--single-transaction", "--dbname=" + database],
-                          stage / "recovery" / (database + ".dump"), timeout=600)
+        if not restored:
+            # The durable intent follows the verified empty-action/INSERT
+            # barrier and executor fence. On restart either DB may be absent;
+            # only this exact intent plus a continuous host hold permits retry.
+            self._schema_record(stage / "adapter-database-restore-intent.json", restore_context)
+            for database in ("nebulalog", "keycloak"):
+                self.pg(["dropdb", "--username=postgres", "--force", "--if-exists", database])
+                self.pg(["createdb", "--username=postgres", "--owner=" + owners[database], database])
+                self.cmd.feed(["podman", "exec", "-i", "--user", "999:999", "nebulalog-postgresql", "pg_restore",
+                               "--username=postgres", "--exit-on-error", "--single-transaction", "--dbname=" + database],
+                              stage / "recovery" / (database + ".dump"), timeout=600)
+        self.application_schema_restore(stage, evidence["application_schema"])
+        self._schema_record(stage / "adapter-database-restore-complete.json", restore_context)
         self.service("start", tuple(name for name in self.services if name != "postgresql"))
+        self.storage_maintenance(stage, held=True, delivery_held=False)
         return self.receipt(stage, "rollback", restored_databases=["nebulalog", "keycloak"],
                             restored_image_pins=True, clickhouse_logs_preserved=True, wal_preserved=True,
                             **({"host": host.runtime_evidence("update-rollback")} if host else {}))
@@ -653,6 +1578,8 @@ class Lifecycle:
                 raise Refused("OS health stage is not an operation-owned recovery directory")
         else:
             release, _ = self.release(stage)
+        if not boot_health and not livepatch_health:
+            self.storage_maintenance(stage, held=True, delivery_held=False)
         checks = {name: False for name in REQUIRED_CHECKS}
         evidence = {}
         def assess(name, operation):
@@ -722,6 +1649,7 @@ class Lifecycle:
             if health.get("checks", {}).get("host") is not True:
                 raise Refused("Maintenance cannot end without measured host acceptance")
             host["host"] = HostRuntime(self, stage).runtime_evidence("update-finalize", accept_integrity=True)
+        self.storage_maintenance(stage, held=False)
         self.maintenance(False, stage)
         if host:
             host["host"]["checks"]["maintenance_released"] = True
@@ -771,11 +1699,59 @@ class Lifecycle:
         parent.mkdir(mode=0o700, exist_ok=True)
         stage = parent / uuid.uuid4().hex
         stage.mkdir(mode=0o700)
-        result = self.backup(stage, os_backup=True)
         boot_id = self.boot_id()
+        journal = self.data / "manager/os-transaction.json"
+        transaction = json.loads(trusted_file(journal).read_text())
+        if transaction.get("state") != "preflight" or transaction.get("stage") is not None:
+            raise Refused("OS backup requires a new scheduler-owned preflight")
+        # Publish ownership before backup acquires either persistent hold. A
+        # crash in backup is retained recovery work, never an anonymous gate.
+        atomic_json(journal, {**transaction, "stage": str(stage), "boot_id": boot_id,
+                             "storage_maintenance": "held", "finalization": "pending"})
+        atomic_json(self.data / "manager/os-latest.json", {"stage": str(stage), "state": "backup_preparing",
+                    "boot_id": boot_id, "observed_at": datetime.now(timezone.utc).isoformat()})
+        result = self.backup(stage, os_backup=True)
         atomic_json(self.data / "manager/os-latest.json", {"stage": str(stage), "state": "prepared",
                     "boot_id": boot_id, "observed_at": datetime.now(timezone.utc).isoformat()})
         return {**result, "repositories": repositories, "stage": str(stage), "boot_id": boot_id}
+
+    def _os_finalize(self, stage, transaction, checks, current_boot):
+        """Release destructive storage authority only after durable OS acceptance.
+
+        Deferred reboot and fallback success expose the healthy runtime while
+        retaining the same operation's destructive hold. The caller supplies
+        freshly verified health; a retained healthy journal alone cannot clear it.
+        """
+        journal = self.data / "manager/os-transaction.json"
+        retained = json.loads(trusted_file(journal).read_text())
+        latest = json.loads(trusted_file(self.data / "manager/os-latest.json").read_text())
+        if (retained != transaction or transaction.get("stage") != str(stage)
+                or transaction.get("state") not in {"complete", "reboot_aborted"}
+                or transaction.get("finalization") not in {"pending", "failed"}
+                or latest.get("stage") != str(stage) or latest.get("boot_id") != transaction.get("boot_id")
+                or latest.get("state") not in {"postcheck_passed", "reboot_completed", "reboot_aborted"}
+                or transaction.get("health_boot_id") != current_boot or self.boot_id() != current_boot
+                or transaction.get("health") != checks
+                or any(checks.get(name) is not True for name in REQUIRED_CHECKS)
+                or type(transaction.get("reboot_pending")) is not bool):
+            raise Refused("OS finalization requires exact durable current-boot acceptance")
+        owner, observed = self._reboot_binding(latest, transaction, new_boot=current_boot != transaction["boot_id"])
+        if owner != stage or observed != current_boot:
+            raise Refused("OS finalization recovery owner changed")
+        pending = transaction["reboot_pending"] or any(
+            transaction.get(field, "complete") not in (None, "complete")
+            for field in ("kernel_finalization", "kernel_retention", "kernel_rollback"))
+        transaction = {**transaction, "storage_maintenance": "held" if pending else "release_pending"}
+        atomic_json(journal, transaction)
+        try:
+            self.storage_maintenance(stage, held=pending, delivery_held=False)
+            self.maintenance(False, stage)
+        except Exception as exc:
+            atomic_json(journal, {**transaction, "finalization": "failed", "finalization_error": type(exc).__name__})
+            raise Refused("OS acceptance passed; operation-owned storage finalization requires retry") from exc
+        transaction = {**transaction, "finalization": "complete", "storage_maintenance": "held" if pending else "released"}
+        atomic_json(journal, transaction)
+        return transaction
 
     def os_postcheck(self):
         """Accept the current runtime only against this OS operation's recovery state."""
@@ -785,16 +1761,24 @@ class Lifecycle:
         latest = json.loads(trusted_file(path).read_text())
         transaction = json.loads(trusted_file(self.data / "manager/os-transaction.json").read_text())
         stage = Path(latest["stage"])
+        finalizing = transaction.get("state") == "complete" and transaction.get("finalization") in {"pending", "failed"}
+        current_boot = self.boot_id()
         if (stage.is_symlink() or stage.resolve().parent != (self.data / "manager/os-updates").resolve()
-                or transaction.get("stage") != str(stage) or transaction.get("state") != "postcheck"
-                or not latest.get("boot_id") or latest["boot_id"] != transaction.get("boot_id") or latest["boot_id"] != self.boot_id()
-                or latest.get("state") not in ("prepared", "postcheck_passed")):
+                or transaction.get("stage") != str(stage) or not (transaction.get("state") == "postcheck" or finalizing)
+                or not latest.get("boot_id") or latest["boot_id"] != transaction.get("boot_id") or latest["boot_id"] != current_boot
+                or latest.get("state") not in ("prepared", "postcheck_passed", "reboot_aborted")):
             raise Refused("OS health check is not bound to the active update and recovery directory")
         try:
-            self.checked_backup(stage)
+            self._reboot_binding(latest, transaction)
+            if transaction.get("resuming_deferred") is True:
+                latest, transaction, backup_stage = self._os_recovery_backup(stage, latest, transaction)
+            else:
+                backup_stage = stage
+            self.checked_backup(backup_stage)
             os_payload.accept_integrity(stage, runner=self.cmd)
             result = self.health(stage, os_health=True)
-            if result.get("ok") is not True or any(result.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS):
+            if (result.get("ok") is not True or any(result.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS)
+                    or self.boot_id() != current_boot):
                 raise Refused("OS runtime, security or compliance acceptance failed")
         except Exception as exc:
             atomic_json(path, {**latest, "state": "postcheck_failed", "error": type(exc).__name__})
@@ -802,7 +1786,23 @@ class Lifecycle:
             audit(self.data / "manager/audit.jsonl", "os.postcheck_failed", error=type(exc).__name__)
             raise Refused("OS runtime acceptance failed; recovery evidence retained and maintenance remains active") from exc
         atomic_json(path, {**latest, "state": "postcheck_passed"})
-        return {**self.receipt(stage, "os-postcheck", checks=result["checks"]), "stage": str(stage)}
+        if finalizing:
+            # Recheck the negative hint before releasing a destructive hold;
+            # the scheduler's earlier observation is not acceptance authority.
+            reboot = self._kernel_candidate(stage) is not None
+            try:
+                self.cmd(["dnf", "needs-restarting", "--reboothint"], timeout=120)
+            except CommandFailed as exc:
+                if exc.returncode != 1:
+                    raise Refused("Cannot determine whether a reboot is required") from exc
+                reboot = True
+            transaction = {**transaction, "health": result["checks"], "health_boot_id": current_boot,
+                           "reboot_pending": reboot or transaction.get("reboot_pending") is True}
+            atomic_json(self.data / "manager/os-transaction.json", transaction)
+            transaction = self._os_finalize(stage, transaction, result["checks"], current_boot)
+        return {**self.receipt(stage, "os-postcheck", checks=result["checks"], boot_id=current_boot,
+                    finalized=finalizing, storage_released=finalizing and transaction.get("storage_maintenance") == "released"),
+                "stage": str(stage)}
 
     def os_recover(self):
         """Recover retained OS work, including a verified old-kernel recovery boot."""
@@ -816,13 +1816,20 @@ class Lifecycle:
             stage = Path(latest["stage"])
             current_boot = self.boot_id()
             preparing = transaction.get("state") == "reboot_preparing" or transaction.get("recovery_phase") == "reboot_preparing"
+            aborted = latest.get("state") == "reboot_aborted" and (
+                transaction.get("state") == "reboot_aborted" and transaction.get("finalization") in {"pending", "failed"}
+                or transaction.get("state") == "recovery_required" and transaction.get("recovery_phase") == "reboot_abort")
             retry = transaction.get("state") in ("recovery_required", "reboot_preparing") or (
-                transaction.get("state") == "complete" and transaction.get("finalization") in ("pending", "failed"))
-            if (not retry or not preparing and transaction.get("recovery_phase") not in ("updating", "postcheck")
+                transaction.get("state") == "complete" and transaction.get("finalization") in ("pending", "failed")) or aborted
+            if (not retry or not preparing and not aborted and transaction.get("recovery_phase") not in ("updating", "postcheck")
                     or stage.is_symlink() or stage.resolve().parent != (self.data / "manager/os-updates").resolve()
                     or transaction.get("stage") != str(stage)
-                    or latest.get("state") not in (("postcheck_passed", "reboot_prepared", "postcheck_failed") if preparing else
-                                                  ("prepared", "postcheck_failed", "postcheck_passed"))
+                    or latest.get("state") not in (("reboot_aborted",) if aborted else
+                        ("postcheck_passed", "reboot_prepared", "postcheck_failed") if preparing else
+                        ("prepared", "postcheck_failed", "postcheck_passed"))
+                    or aborted and (transaction.get("reboot_pending") is not True
+                        or transaction.get("health_boot_id") != current_boot
+                        or any(transaction.get("health", {}).get(name) is not True for name in REQUIRED_CHECKS))
                     or preparing and (transaction.get("reboot_pending") is not True or
                                       any(transaction.get("health", {}).get(name) is not True for name in REQUIRED_CHECKS))
                     or not latest.get("boot_id") or latest["boot_id"] != transaction.get("boot_id")
@@ -876,20 +1883,20 @@ class Lifecycle:
                     reboot = True
             except Exception as exc:
                 atomic_json(path, {**latest, "state": "postcheck_failed", "error": type(exc).__name__})
-                atomic_json(journal, {**transaction, "state": "recovery_required", "error": type(exc).__name__})
+                atomic_json(journal, {**transaction, "state": "recovery_required", "error": type(exc).__name__,
+                                     "recovery_phase": "postcheck" if aborted else transaction.get("recovery_phase")})
                 audit(self.data / "manager/audit.jsonl", "os.recovery_health_failed", error=type(exc).__name__)
                 raise Refused("OS recovery acceptance failed; maintenance and recovery evidence remain intact") from exc
             atomic_json(path, {**latest, "state": "postcheck_passed"})
             completed = {**transaction, "state": "complete", "status": "no_updates" if transaction.get("no_updates") is True else "updated", "finalization": "pending",
-                         "reboot_pending": reboot, "health": result["checks"], "recovery_phase": "postcheck",
+                         "reboot_pending": reboot, "health": result["checks"], "health_boot_id": current_boot, "recovery_phase": "postcheck",
                          "completed_at": datetime.now(timezone.utc).isoformat()}
             atomic_json(journal, completed)
             try:
-                self.maintenance(False, stage)
+                self._os_finalize(stage, completed, result["checks"], current_boot)
             except Exception as exc:
                 atomic_json(journal, {**completed, "finalization": "failed", "finalization_error": type(exc).__name__})
                 raise Refused("OS health passed; retry os-recover to release maintenance") from exc
-            atomic_json(journal, {**completed, "finalization": "complete"})
             audit(self.data / "manager/audit.jsonl", "os.recovery_verified", reboot_pending=reboot)
             return self.receipt(stage, "os-recover", checks=result["checks"], status=completed["status"], reboot_pending=reboot)
 
@@ -1082,6 +2089,7 @@ class Lifecycle:
                 transaction = {**transaction, "state": "reboot_preparing", "kernel_retry": "armed",
                                "retry_boot_id": current_boot, "reboot_pending": True}
                 atomic_json(journal, transaction)
+                self.storage_maintenance(stage, held=True, delivery_held=True)
                 self.service("stop", tuple(reversed(self.services)))
                 self.cmd(["sync", "-f", str(self.data)], timeout=120)
                 if self.boot_id() != current_boot:
@@ -1106,11 +2114,11 @@ class Lifecycle:
                     failed = {**transaction, "state": "complete", "finalization": "pending",
                               "kernel_retry": "held", "kernel_finalization": "recovery_required",
                               "kernel_outcome": "recovery", "reboot_pending": True,
-                              "kernel_recovery_reason": "retry_request_failed", "error": type(exc).__name__}
+                              "kernel_recovery_reason": "retry_request_failed", "error": type(exc).__name__,
+                              "health": checks, "health_boot_id": current_boot}
                     atomic_json(latest_path, {**latest, "state": "reboot_completed", "observed_boot_id": current_boot})
                     atomic_json(journal, failed)
-                    self.maintenance(False, stage)
-                    atomic_json(journal, {**failed, "finalization": "complete", "health": checks})
+                    self._os_finalize(stage, failed, checks, current_boot)
                 except Exception as recovery_error:
                     self.maintenance(True, stage)
                     atomic_json(journal, {**transaction, "state": "recovery_required", "finalization": "failed",
@@ -1172,11 +2180,10 @@ class Lifecycle:
             transaction = {**transaction, "state": "complete", "finalization": "pending",
                            "kernel_finalization": "complete", "kernel_rollback": "complete",
                            "kernel_outcome": "rolled_back", "kernel_retry": "held", "reboot_pending": False,
-                           "observed_boot_id": current_boot, "health": checks}
+                           "observed_boot_id": current_boot, "health": checks, "health_boot_id": current_boot}
             atomic_json(latest_path, latest)
             atomic_json(journal, transaction)
-            self.maintenance(False, stage)
-            atomic_json(journal, {**transaction, "finalization": "complete"})
+            self._os_finalize(stage, transaction, checks, current_boot)
         except Exception as exc:
             self.maintenance(True, stage)
             atomic_json(journal, {**transaction, "state": "recovery_required", "finalization": "failed",
@@ -1202,6 +2209,7 @@ class Lifecycle:
 
     def _kernel_retain(self, stage, latest, transaction):
         journal = self.data / "manager/os-transaction.json"
+        current_boot = self.boot_id()
         transaction = {**transaction, "kernel_retention": "pending", "finalization": "pending"}
         atomic_json(journal, transaction)
         self.maintenance(True, stage)
@@ -1215,12 +2223,14 @@ class Lifecycle:
             health = self.health(stage, os_health=True)
             if health.get("ok") is not True or any(health.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS):
                 raise Refused("Kernel retention runtime postcheck failed")
-            self.maintenance(False, stage)
+            transaction = {**transaction, "state": "complete", "kernel_retention": "complete",
+                           "reboot_pending": False, "health": health["checks"], "health_boot_id": current_boot}
+            atomic_json(journal, transaction)
+            self._os_finalize(stage, transaction, health["checks"], transaction["health_boot_id"])
         except Exception as exc:
             self.maintenance(True, stage)
             atomic_json(journal, {**transaction, "kernel_retention": "failed", "finalization": "failed", "retention_error": type(exc).__name__})
             raise Refused("Kernel retention requires recovery; maintenance and retained kernels are preserved") from exc
-        atomic_json(journal, {**transaction, "kernel_retention": "complete", "finalization": "complete"})
         return result
 
     def _kernel_retention_unattempted(self, stage, latest, transaction, current_boot):
@@ -1311,15 +2321,15 @@ class Lifecycle:
             latest = {**latest, "state": "reboot_completed", "observed_boot_id": current_boot}
             atomic_json(latest_path, latest)
             transaction = {**transaction, "state": "complete", "kernel_finalization": "complete",
-                           "observed_boot_id": current_boot, "reboot_pending": False}
+                           "observed_boot_id": current_boot, "reboot_pending": False,
+                           "kernel_retention": "complete", "health": postcheck["checks"], "health_boot_id": current_boot}
             atomic_json(journal, transaction)
-            self.maintenance(False, stage)
+            self._os_finalize(stage, transaction, postcheck["checks"], current_boot)
         except Exception as exc:
             self.maintenance(True, stage)
             atomic_json(journal, {**transaction, "kernel_retention": "failed", "finalization": "failed",
                                  "retention_error": type(exc).__name__})
             raise Refused("Later-boot kernel retention requires recovery; maintenance remains active") from exc
-        atomic_json(journal, {**transaction, "kernel_retention": "complete", "finalization": "complete"})
         return self.receipt(stage, "reboot-complete", boot_id=current_boot, checks=postcheck["checks"],
                             status="complete", reboot_pending=False, retention=result)
 
@@ -1375,21 +2385,41 @@ class Lifecycle:
                 or transaction.get("reboot_pending") is not True
                 or any(transaction.get("health", {}).get(name) is not True for name in REQUIRED_CHECKS)):
             raise Refused("OS reboot preparation requires the accepted pending reboot transaction")
+        backup_stage = Path(latest.get("recovery_backup_stage", str(stage)))
+        if (backup_stage.parent != stage.parent or backup_stage.is_symlink()
+                or latest.get("recovery_backup_stage") != transaction.get("recovery_backup_stage")):
+            raise Refused("Reboot recovery backup belongs to another operation")
+        # Refreshed backups retain the original OS stage and hold owner.
+        observed_at = (json.loads(trusted_file(backup_stage / "adapter-backup.json").read_text())["observed_at"]
+                       if backup_stage != stage else latest.get("observed_at"))
         try:
-            age = (datetime.now(timezone.utc) - datetime.fromisoformat(latest["observed_at"])).total_seconds()
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(observed_at)).total_seconds()
         except (KeyError, TypeError, ValueError):
             raise Refused("OS recovery backup timestamp is invalid") from None
         if not 0 <= age <= 7200:
             raise Refused("OS recovery backup is stale or dated in the future")
-        self.checked_backup(stage)
+        self.checked_backup(backup_stage)
         candidate = self._kernel_candidate(stage)
         unlock = self.unlock_readiness("/boot/vmlinuz-" + candidate[1]["kernel"]) if candidate is not None else self.unlock_readiness()
         local_auth(self.config)
         self.maintenance(True, stage)
         try:
+            rearmed = False
+            if candidate is not None:
+                progress = kernel_boot.candidate_status(stage, runner=self.cmd)
+                if progress.get("phase") in {"abort", "rearm"}:
+                    # Rearm authorization needs the complete healthy runtime;
+                    # it must precede the delivery fence and service stops.
+                    result = kernel_boot.rearm_candidate(stage,
+                        authorize=lambda directory: self._kernel_recovery_authorization(directory, backup_stage),
+                        **self._kernel_callbacks())
+                    if result.get("ok") is not True or result.get("status") != "rearmed" or result.get("boot_id") != boot_id:
+                        raise Refused("Kernel rearm did not verify its operation-bound receipt")
+                    rearmed = True
+            self.storage_maintenance(stage, held=True, delivery_held=True)
             self.service("stop", tuple(reversed(self.services)))
             self.cmd(["sync", "-f", str(self.data)], timeout=120)
-            if candidate is not None:
+            if candidate is not None and not rearmed:
                 kernel_boot.arm_candidate(stage, **self._kernel_callbacks())
         except BaseException:
             # A successful restart alone is not runtime/security acceptance.
@@ -1408,7 +2438,7 @@ class Lifecycle:
         self.encrypted()
         latest = json.loads(trusted_file(self.data / "manager/os-latest.json").read_text())
         transaction = json.loads(trusted_file(self.data / "manager/os-transaction.json").read_text())
-        stage, _ = self._reboot_binding(latest, transaction)
+        stage, current_boot = self._reboot_binding(latest, transaction)
         if latest.get("state") != "reboot_prepared" or transaction.get("state") != "reboot_requested":
             raise Refused("No operation-owned prepared reboot can be aborted")
         self.checked_backup(stage)
@@ -1418,10 +2448,13 @@ class Lifecycle:
         result = self.health(stage, os_health=True)
         if result.get("ok") is not True or any(result.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS):
             raise Refused("Reboot abort runtime acceptance failed; maintenance remains active")
-        self.maintenance(False, stage)
         atomic_json(self.data / "manager/os-latest.json", {**latest, "state": "reboot_aborted"})
+        transaction = {**transaction, "state": "reboot_aborted", "finalization": "pending", "reboot_pending": True,
+                       "health": result["checks"], "health_boot_id": current_boot, "recovery_phase": "postcheck"}
+        atomic_json(self.data / "manager/os-transaction.json", transaction)
+        self._os_finalize(stage, transaction, result["checks"], current_boot)
         return self.receipt(stage, "reboot-abort", services_restarted=list(self.services), recovered=True,
-                            health=result["checks"])
+                            health=result["checks"], boot_id=current_boot, finalized=True, storage_released=False)
 
     @staticmethod
     def boot_id():
@@ -1505,8 +2538,11 @@ class Lifecycle:
                     continue
                 record = json.loads(trusted_file(path).read_text())
                 pending = (record.get("state") not in terminal or record.get("finalization", "complete") != "complete"
-                           or record.get("kernel_finalization") in ("pending", "failed")
-                           or record.get("kernel_retention") in ("pending", "failed"))
+                           or record.get("kernel_finalization") in ("pending", "failed", "recovery_required")
+                           or record.get("kernel_retention") in ("pending", "failed")
+                           or record.get("storage_maintenance") == "release_pending"
+                           or record.get("storage_maintenance") == "held"
+                           and self.boot_id() != record.get("health_boot_id", record.get("boot_id")))
                 if pending:
                     self.maintenance(True, Path(record.get(owner_key, str(self.data / "manager"))))
                     return {"ok": True, "maintenance": True, "source": "interrupted transaction"}
@@ -1529,6 +2565,8 @@ class Lifecycle:
             latest = json.loads(trusted_file(path).read_text())
             transaction = json.loads(trusted_file(journal).read_text())
             if (transaction.get("state") == "complete" and transaction.get("finalization", "complete") == "complete"
+                    and transaction.get("reboot_pending") is not True
+                    and transaction.get("storage_maintenance", "released") == "released"
                     and transaction.get("kernel_finalization", "complete") in (None, "complete")
                     and transaction.get("kernel_retention", "complete") in (None, "complete")
                     and transaction.get("kernel_rollback", "complete") in (None, "complete")):
@@ -1553,8 +2591,9 @@ class Lifecycle:
                     return self.receipt(stage, "reboot-complete", boot_id=current_boot, checks=acceptance["checks"],
                                         status="complete", reboot_pending=False, retention=retained)
             transition = os.path.lexists(stage / "kernel-boot-current.json")
-            latest_allowed = ("reboot_prepared", "recovery_required", "reboot_completed") + (("postcheck_passed", "postcheck_failed") if transition else ())
-            transaction_allowed = ("reboot_requested", "recovery_required", "complete") + (("reboot_preparing",) if transition else ())
+            deferred = transaction.get("storage_maintenance") == "held" and transaction.get("reboot_pending") is True
+            latest_allowed = ("reboot_prepared", "recovery_required", "reboot_completed") + (("postcheck_passed", "postcheck_failed") if transition or deferred else ()) + (("reboot_aborted",) if deferred else ())
+            transaction_allowed = ("reboot_requested", "recovery_required", "complete") + (("reboot_preparing",) if transition else ()) + (("reboot_aborted",) if deferred else ())
             if latest.get("state") not in latest_allowed or transaction.get("state") not in transaction_allowed:
                 raise Refused("Interrupted OS work has not reached the verified reboot phase")
             self.maintenance(True, stage)
@@ -1583,20 +2622,14 @@ class Lifecycle:
             atomic_json(path, {**latest, "state": "reboot_completed", "observed_boot_id": current_boot})
             recovered = boot_result is not None and boot_result["outcome"] == "recovery"
             completed = {**transaction, "state": "complete", "finalization": "pending", "reboot_pending": recovered,
-                         "observed_boot_id": current_boot, "completed_at": datetime.now(timezone.utc).isoformat()}
+                         "observed_boot_id": current_boot, "completed_at": datetime.now(timezone.utc).isoformat(),
+                         "health": result["checks"], "health_boot_id": current_boot}
             if candidate is not None:
                 completed.update(kernel_finalization="recovery_required" if recovered else "pending", kernel_outcome=boot_result["outcome"])
                 if recovered:
                     completed.update(kernel_retry="held", kernel_recovery_reason="candidate_not_running_after_reboot")
                 else:
                     completed["kernel_retention"] = "pending"
-            atomic_json(journal, completed)
-            try:
-                self.maintenance(False, stage)
-            except Exception as exc:
-                atomic_json(journal, {**completed, "finalization": "failed", "finalization_error": type(exc).__name__})
-                raise Refused("New OS boot passed; retry reboot-complete to release maintenance") from exc
-            completed = {**completed, "finalization": "complete"}
             atomic_json(journal, completed)
             if candidate is not None and not recovered:
                 try:
@@ -1608,6 +2641,11 @@ class Lifecycle:
                 completed = {**completed, "kernel_finalization": "complete"}
                 atomic_json(journal, completed)
                 self._kernel_retain(stage, {**latest, "state": "reboot_completed", "observed_boot_id": current_boot}, completed)
+            else:
+                try:
+                    self._os_finalize(stage, completed, result["checks"], current_boot)
+                except Exception as exc:
+                    raise Refused("New OS boot passed; retry reboot-complete to release maintenance") from exc
             audit(self.data / "manager/audit.jsonl", "os.reboot_verified", boot_id=current_boot)
             return self.receipt(stage, "reboot-complete", boot_id=current_boot, checks=result["checks"],
                                 status="kernel_recovery_required" if recovered else "complete", reboot_pending=recovered)

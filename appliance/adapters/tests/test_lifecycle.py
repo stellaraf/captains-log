@@ -88,6 +88,10 @@ class LifecycleTests(unittest.TestCase):
                                  data=self.root, configuration=self.config_dir, quadlets=self.quadlets, guard=lambda: None)
         self.manager.encrypted = Mock()
         self.manager.maintenance = Mock()
+        # Native holds/catalog execution have separate real PostgreSQL suites;
+        # these coordinator tests inject those boundaries and test phase order.
+        self.manager.storage_maintenance = Mock()
+        self.manager.application_schema_catalog = Mock(return_value={"schema_revision": "1"})
         self.manager.api_ready = Mock()
         self.trusted = patch("nebulalog_adapters.lifecycle.trusted_file", side_effect=lambda path: path)
         self.trusted.start()
@@ -105,7 +109,7 @@ class LifecycleTests(unittest.TestCase):
         recovered = self.stage / "recovery/configuration/api.env"
         self.assertEqual(recovered.stat().st_mode & 0o777, 0o640)
         self.assertEqual(recovered.stat().st_uid, self.secret.stat().st_uid)
-        self.assertNotIn(["systemctl", "stop", "nebulalog-ingest.service"], self.commands.calls)
+        self.assertIn(["systemctl", "stop", "nebulalog-ingest.service"], self.commands.calls)
 
     def test_backup_failure_restores_writers_before_propagating_error(self):
         self.commands.fail_dump = True
@@ -156,7 +160,8 @@ class LifecycleTests(unittest.TestCase):
         pg_start = max(index for index, call in enumerate(self.commands.calls) if call == ["systemctl", "start", "nebulalog-postgresql.service"])
         drop = next(index for index, call in enumerate(self.commands.calls) if "dropdb" in call)
         readiness = [call for call in self.commands.calls[pg_start:drop] if "--command" in call and call[-1] == "SELECT 1"]
-        self.assertEqual(len(readiness), 2)
+        self.assertGreaterEqual(len(readiness), 1)
+        self.assertEqual(self.commands.pg_unready, 0)
         self.assertIn(["restorecon", "-RF", str(self.config_dir)], self.commands.calls)
 
     def test_historical_operator_rollback_preserves_later_users_metadata_and_config(self):

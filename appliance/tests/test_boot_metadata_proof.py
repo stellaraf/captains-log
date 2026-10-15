@@ -53,7 +53,7 @@ class ProofTests(TestCase):
         if drift:
             for path in database.TMPFILES:
                 value['rows'][path].update(ctime_s=1760000100, ctime_ns=1760000100_500000000)
-            for path in database.EFI: value['rows'][path]['inode'] += 1
+            for path in database.EFI_TARGETS: value['rows'][path]['inode'] += 1
         return value
 
     def plan(self, *, anchor=None, kind='ordinary-boot-v1', boot_id=None, **extra):
@@ -139,7 +139,7 @@ class ProofTests(TestCase):
                                'mtime': 'mtime_s', 'inode': 'inode', 'lcount': 'nlink',
                                'attr': 'attributes'}.items():
                 row[field] = str(value[key])
-            row['perm'] = format((0o120000 if value['kind'] == 'symlink' else 0o100000) | value['mode'], 'o')
+            row['perm'] = format({'symlink': 0o120000, 'directory': 0o40000, 'file': 0o100000}[value['kind']] | value['mode'], 'o')
             row['lname'] = value['target'] or '0'
             row['sha512'] = '0' if value['sha512'] is None else base64.b64encode(bytes.fromhex(value['sha512'])).decode()
             row['selinux'] = value['selinux']
@@ -238,9 +238,9 @@ class ProofTests(TestCase):
         self.initial['boot_metadata_authority']['mount']['uuid'] = 'AAAA-BBBB'
         self.assertNotEqual(self.anchor['authority'], self.initial['boot_metadata_authority'])
 
-    def test_eighteen_qualified_changes_revalidate_real_gzip_and_exact_proof(self):
+    def test_twenty_qualified_changes_revalidate_real_gzip_and_exact_proof(self):
         value = self.make()
-        self.assertEqual(len(value['transition']['changes']), 18)
+        self.assertEqual(len(value['transition']['changes']), 20)
         self.assertEqual(self.validate(value), value)
         self.assertEqual({item['path'] for item in value['transition']['changes']}, database.TARGETS)
         self.assertEqual(value['transition']['database_rows_sha256'], digest(self.authenticated()['rows']))
@@ -249,7 +249,7 @@ class ProofTests(TestCase):
         plan, lineage = self.kernel_observation()
         value = proof.make(plan, self.sha(kernel.encode(plan)), anchor=self.anchor,
                            authenticated_database=self.authenticated(), after=self.observation(drift=True), lineage=lineage)
-        self.assertEqual(len(value['transition']['changes']), 18)
+        self.assertEqual(len(value['transition']['changes']), 20)
         self.validate(value, plan=plan)
         result = proof.validate_chain(self.initial, self.base, [self.entry(plan, value)])
         self.assertEqual(result['boot_id'], native_fixture.NEW_BOOT)
@@ -448,7 +448,9 @@ class ProofTests(TestCase):
     def test_self_consistent_output_hash_cannot_authorize_unobserved_metadata_or_content(self):
         for path, field, change in (('/etc/issue', 'ctime_s', 1760000101),
                                     ('/etc/issue', 'sha512', 'f' * 128),
-                                    (database.EFI[0], 'inode', 999)):
+                                    (database.EFI[0], 'inode', 999),
+                                    (database.EFI_DIRECTORIES[0], 'inode', 999),
+                                    (database.EFI_DIRECTORIES[1], 'inode', 999)):
             value = self.make(); row = self.entry(self.plan(), value)
             changed = copy.deepcopy(value['after']['rows']); changed[path][field] = change
             row['output_database'] = self.rows_database(changed)

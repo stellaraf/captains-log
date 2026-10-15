@@ -20,6 +20,7 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from nebulalog_manager import host_payload as payload, image_bundle, publisher_inputs
+from nebulalog_manager.image_bundle import ApplicationSchema as application_schema
 from nebulalog_manager.common import Refused, run
 from nebulalog_manager.updates import verify_release, _utc, CLICKHOUSE_VERSION, validate_clickhouse_change
 from build_host_bundle import build as build_host
@@ -82,12 +83,15 @@ def write_json(path, value):
 
 def validate_recipe(value, now=None):
     fields = {"schema", "repository", "sequence", "version", "issued_at", "expires_at", "schema_revision", "source_commit", "components", "evidence_artifacts"}
-    if (not isinstance(value, dict) or set(value) != fields or type(value["schema"]) is not int or value["schema"] != 1
+    if (not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"database_migration"} or type(value["schema"]) is not int or value["schema"] != 1
             or value["repository"] != REPOSITORY or type(value["sequence"]) is not int or not 0 < value["sequence"] < 2**63
             or not isinstance(value["version"], str) or not payload.VERSION.fullmatch(value["version"])
             or not isinstance(value["schema_revision"], str) or not re.fullmatch(r"[1-9][0-9]{0,8}", value["schema_revision"])
             or not isinstance(value["source_commit"], str) or not re.fullmatch(r"[a-f0-9]{40}", value["source_commit"])):
         raise Refused("Release recipe identity, sequence or schema is invalid")
+    migration = value.get("database_migration", "none")
+    if migration not in ("none", application_schema.ADDITIVE_UPGRADE) or migration == application_schema.ADDITIVE_UPGRADE and value["schema_revision"] != "2":
+        raise Refused("Release recipe has no reviewed application migration")
     now = now or datetime.now(timezone.utc)
     if not _utc(value["issued_at"]) <= now < _utc(value["expires_at"]):
         raise Refused("Release recipe must be currently valid with explicit expiration")
@@ -155,6 +159,7 @@ def assemble(source, source_manifest, image_directory, recipe_path, output, *, s
     source_raw = payload.read_regular(source_manifest, payload.MAX_SOURCE_MANIFEST)
     snapshot = payload.source_manifest(source_raw)
     verify_source(source, snapshot)
+    application_schema.bind_source(snapshot["files"], recipe["schema_revision"])
     if not any(name.startswith("cmd/") for name in snapshot["files"]) or "go.mod" not in snapshot["files"]:
         raise Refused("Frozen source must include the application as well as host modules")
     public_raw = payload.read_regular(source / publisher_inputs.PUBLIC_SOURCE, 16384)
@@ -198,7 +203,9 @@ def assemble(source, source_manifest, image_directory, recipe_path, output, *, s
                 artifacts[filename] = file_info(image_directory / filename, destination=stage / filename)
                 if artifacts[filename] != {"bytes": item["archive_bytes"], "sha256": item["archive_sha256"]}:
                     raise Refused("OCI asset changed after verification")
-                component.update(artifact=filename, image=item["reference"], database_migration="none", schema_revision=recipe["schema_revision"])
+                migration = recipe.get("database_migration", "none") if name == "nebulalog" else "none"
+                component.update(artifact=filename, image=item["reference"],
+                                 **application_schema.declaration(snapshot["files"], recipe["schema_revision"], migration))
             manifest["components"][name] = component
         reserved = {"manifest.json", "manifest.sig", "source-manifest.json", "publisher-public.spki", "publisher-trust.json", "release-provenance.json"}
         for name in recipe["evidence_artifacts"]:
@@ -281,10 +288,14 @@ def verify_package(package, *, expected_manifest, expected_commit, source_tree=N
         **{key: manifest[key] for key in ("version", "sequence", "issued_at", "expires_at")},
         "schema_revision": manifest["components"]["nebulalog"]["schema_revision"],
         "components": {}, "evidence_artifacts": [item["name"] for item in manifest["artifacts"] if item["name"] not in referenced]}
+    recipe["database_migration"] = manifest["components"]["nebulalog"]["database_migration"]
+    application_schema.bind_source(source["files"], recipe["schema_revision"])
     for name, change in manifest["components"].items():
         keys = {"version", "from_versions"} | ({"family", "tested_minimum", "tested_maximum"} if name == "clickhouse" else {"qualification_artifact"} if name == "keycloak" else set())
-        fixed = {"artifact", "rollback_safe"} | ({"abi", "host_source_sha256"} if name == "host" else {"image", "database_migration", "schema_revision"})
-        if set(change) != keys | fixed or change["rollback_safe"] is not True or name != "host" and (change["database_migration"] != "none" or change["schema_revision"] != recipe["schema_revision"]):
+        fixed = {"artifact", "rollback_safe"} | ({"abi", "host_source_sha256"} if name == "host" else {"image", "database_migration", "schema_revision", "schema_sha256"})
+        declared = application_schema.declaration(source["files"], recipe["schema_revision"],
+            recipe["database_migration"] if name == "nebulalog" else "none") if name != "host" else {}
+        if set(change) != keys | fixed or change["rollback_safe"] is not True or any(change.get(key) != value for key, value in declared.items()):
             raise Refused("Release component differs from the fixed compatible publisher contract")
         recipe["components"][name] = {key: change[key] for key in keys}
     validate_recipe(recipe, now)

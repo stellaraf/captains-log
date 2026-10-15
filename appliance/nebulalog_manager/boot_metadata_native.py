@@ -3,8 +3,9 @@
 This module observes; it never enrolls, changes a database, or accepts drift.
 The caller must independently authenticate ``database`` through the retained
 AIDE chain and bind the returned proof to a full strict AIDE scan. Old scalar
-values come ONLY from those database rows. Stable authority deliberately has
-no historical target rows: accepted package updates can change those rows.
+values come ONLY from those database rows. The two fixed EFI directories also
+retain full scalars and child contents because AIDE omits some directory
+attributes. That authority cannot change without an explicit migration.
 """
 from __future__ import annotations
 
@@ -92,6 +93,10 @@ MAX_FILE = 64 * 1024 * 1024
 MAX_CONFIG = 1024 * 1024
 ROW_FIELDS = {'kind', 'mode', 'uid', 'gid', 'bytes', 'inode', 'nlink', 'ctime_s', 'mtime_s',
               'attributes', 'target', 'sha512', 'acl', 'selinux', 'xattrs'}
+DIRECTORY_FIELDS = {'kind', 'mode', 'uid', 'gid', 'bytes', 'nlink', 'ctime_ns', 'mtime_ns',
+                    'acl', 'selinux', 'xattrs', 'children'}
+DIRECTORY_CHILDREN = {path: tuple(Path(child).name for child in db.EFI if str(Path(child).parent) == path)
+                      for path in db.EFI_DIRECTORIES}
 SERVICE_FIELDS = {'invocation_id', 'start_us', 'end_us', 'start_monotonic_us', 'end_monotonic_us',
                   'active_monotonic_us', 'result', 'exit_code', 'exit_status', 'credentials'}
 SNAPSHOT_FIELDS = {'schema', 'boot_id', 'authority', 'service', 'rows', 'observed_at_ns', 'uptime_us'}
@@ -133,15 +138,17 @@ def _base64(value):
 
 def _row(value, path, *, live):
     exact(value, ROW_FIELDS | ({'ctime_ns', 'mtime_ns'} if live else set()))
-    link, efi = path == '/etc/os-release', path in db.EFI
-    mask = db.SYMLINK_MASK if link else db.EFI_MASK if efi else db.REGULAR_MASK
+    link, efi, directory = path == '/etc/os-release', path in db.EFI_TARGETS, path in db.EFI_DIRECTORIES
+    mask = db.EFI_DIRECTORY_MASK if directory else db.SYMLINK_MASK if link else db.EFI_MASK if efi else db.REGULAR_MASK
     for key in ('mode', 'uid', 'gid', 'bytes', 'inode', 'nlink', 'ctime_s', 'mtime_s', 'attributes'):
         _integer(value[key])
-    if (value['kind'] != ('symlink' if link else 'file') or value['attributes'] != mask
-            or value['uid'] != 0 or value['gid'] != 0 or value['nlink'] != 1 or not value['inode']
+    if (value['kind'] != ('directory' if directory else 'symlink' if link else 'file') or value['attributes'] != mask
+            or value['uid'] != 0 or value['gid'] != 0 or value['nlink'] != (0 if directory else 1) or not value['inode']
             or value['bytes'] > MAX_FILE or value['mode'] > 0o7777
+            or directory and (value['mode'] != 0o700 or value['target'] is not None or value['sha512'] is not None
+                              or any(value[key] != 0 for key in ('bytes', 'nlink', 'ctime_s', 'mtime_s')))
             or link and (value['mode'] != 0o777 or value['target'] != '../usr/lib/os-release' or value['sha512'] is not None)
-            or not link and (value['mode'] & 0o7022 or value['target'] is not None
+            or not link and not directory and (value['mode'] & 0o7022 or value['target'] is not None
                              or not isinstance(value['sha512'], str) or not re.fullmatch('[a-f0-9]{128}', value['sha512']))):
         refuse('unqualified_row')
     if link or efi:
@@ -168,6 +175,33 @@ def _row(value, path, *, live):
     return value
 
 
+def _directory_projection(value, inode):
+    """Exact AIDE row projection; omitted directory scalars are not invented.
+
+    The full observed scalars/listing are independently frozen in authority.
+    AIDE's fixed directory mask stores zeros for these unmeasured columns.
+    """
+    return {'kind': 'directory', 'mode': value['mode'], 'uid': value['uid'], 'gid': value['gid'],
+            'bytes': 0, 'inode': inode, 'nlink': 0, 'ctime_s': 0, 'mtime_s': 0,
+            'ctime_ns': 0, 'mtime_ns': 0, 'attributes': db.EFI_DIRECTORY_MASK,
+            'target': None, 'sha512': None, 'acl': value['acl'],
+            'selinux': value['selinux'], 'xattrs': copy.deepcopy(value['xattrs'])}
+
+
+def _directory_invariant(value, path):
+    exact(value, DIRECTORY_FIELDS)
+    for key in ('bytes', 'nlink', 'ctime_ns', 'mtime_ns'):
+        _integer(value[key], MAX_FILE if key == 'bytes' else (1 << 63) - 1, minimum=1)
+    if value['kind'] != 'directory' or value['nlink'] != 2:
+        refuse('unqualified_directory')
+    _row(_directory_projection(value, 1), path, live=True)
+    exact(value['children'], DIRECTORY_CHILDREN[path])
+    for name, child in value['children'].items():
+        exact(child, (ROW_FIELDS | {'ctime_ns', 'mtime_ns'}) - {'inode'})
+        _row({**child, 'inode': 1}, path + '/' + name, live=True)
+    return value
+
+
 def _description(value, *, sha256=None, mode=None, link=None):
     exact(value, {'kind', 'uid', 'gid', 'mode', 'xattrs_sha256'} | ({'target'} if link else {'sha256', 'bytes'}))
     if (value['kind'] != ('symlink' if link else 'file') or type(value['uid']) is not int
@@ -186,7 +220,7 @@ def _description(value, *, sha256=None, mode=None, link=None):
 
 def validate_authority(value):
     """Check retained stable authority; no host read or adoption occurs."""
-    exact(value, {'schema', 'writers', 'configuration', 'mount', 'targets', 'execution'})
+    exact(value, {'schema', 'writers', 'configuration', 'mount', 'targets', 'execution', 'directories'})
     if type(value['schema']) is not int or value['schema'] != 1 or value['targets'] != sorted(db.TARGETS):
         refuse('invalid_authority')
     if value['execution'] != EXECUTION:
@@ -221,6 +255,9 @@ def validate_authority(value):
             or not re.fullmatch('[A-F0-9]{4}-[A-F0-9]{4}', mount['uuid'])):
         refuse('unqualified_efi_mount')
     _uuid(mount['partuuid'])
+    exact(value['directories'], db.EFI_DIRECTORIES)
+    for path, directory in value['directories'].items():
+        _directory_invariant(directory, path)
     return value
 
 
@@ -264,6 +301,17 @@ def validate_snapshot(value):
         _row(row, path, live=True)
         if row['ctime_ns'] > value['observed_at_ns']:
             refuse('future_target_timestamp')
+        if path in db.EFI_DIRECTORIES:
+            directory = value['authority']['directories'][path]
+            if row != _directory_projection(directory, row['inode']):
+                refuse('directory_projection_changed')
+            for item in [directory, *directory['children'].values()]:
+                if item['ctime_ns'] > value['observed_at_ns'] or item['mtime_ns'] > value['observed_at_ns']:
+                    refuse('future_directory_timestamp')
+            for name, child in directory['children'].items():
+                actual = value['rows'][path + '/' + name]
+                if child != {key: data for key, data in actual.items() if key != 'inode'}:
+                    refuse('directory_child_observation_changed')
     return value
 
 
@@ -293,7 +341,7 @@ def transition(stable, after, *, database, source_boot_id):
         fields = {key for key in ROW_FIELDS if old[key] != new[key]}
         if not fields:
             continue
-        attribute = 'inode' if path in db.EFI else 'ctime_s'
+        attribute = 'inode' if path in db.EFI_TARGETS else 'ctime_s'
         if fields != {attribute} or source_boot_id == after['boot_id']:
             refuse('unqualified_target_change')
         if attribute == 'ctime_s':
@@ -302,7 +350,7 @@ def transition(stable, after, *, database, source_boot_id):
                     not service['start_us'] * 1000 <= current['ctime_ns'] <= service['end_us'] * 1000 + 999):
                 refuse('ctime_outside_successful_boot_service')
         label = 'inode' if attribute == 'inode' else 'ctime'
-        summary = 'f = ... ..i.. ..  ' if label == 'inode' else 'l.= ... .c..  ..  ' if path == '/etc/os-release' else 'f = ... .c......  '
+        summary = ('d   ...   i   ..  ' if path in db.EFI_DIRECTORIES else 'f = ... ..i.. ..  ') if label == 'inode' else 'l.= ... .c..  ..  ' if path == '/etc/os-release' else 'f = ... .c......  '
         db.validate_change_summary(path, summary, row=old, attribute=label)
         changes.append({'path': path, 'attribute': label, 'before': old[attribute], 'after': new[attribute], 'summary': summary})
     return {'schema': 1, 'kind': KIND, 'authority_sha256': digest(stable),
@@ -419,6 +467,9 @@ class _Acl:
 
 
 def _target(path, acl):
+    if path in db.EFI_DIRECTORIES:
+        directory = _directory(path, acl)
+        return _row(_directory_projection(directory, directory['inode']), path, live=True)
     parents, before = _parents(path), Path(path).lstat()
     link, efi = path == '/etc/os-release', path in db.EFI
     if (not (stat.S_ISLNK(before.st_mode) if link else stat.S_ISREG(before.st_mode))
@@ -461,6 +512,45 @@ def _target(path, acl):
     if _identity(Path(path).lstat()) != _identity(before) or _parents(path) != parents:
         refuse('target_changed_during_read')
     return _row(row, path, live=True)
+
+
+def _directory(path, acl):
+    """Measure both fixed directories, their complete children and security.
+
+    A stable open descriptor binds enumeration to the observed directory.
+    Nothing is created, relabelled, repaired or accepted by this read path.
+    """
+    if path not in db.EFI_DIRECTORIES:
+        refuse('unqualified_directory_path')
+    parents, before = _parents(path), Path(path).lstat()
+    if (not stat.S_ISDIR(before.st_mode) or stat.S_IMODE(before.st_mode) != 0o700
+            or before.st_uid != 0 or before.st_gid != 0 or before.st_nlink != 2):
+        refuse('unsafe_directory')
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if _identity(os.fstat(fd)) != _identity(before):
+            refuse('directory_changed_before_open')
+        names = sorted(os.listdir(fd))
+        if names != sorted(DIRECTORY_CHILDREN[path]):
+            refuse('directory_listing_changed')
+        children = {name: {key: value for key, value in _target(path + '/' + name, acl).items() if key != 'inode'}
+                    for name in names}
+        attributes = _xattrs(path)
+        label = attributes.get('security.selinux', b'')
+        if not label.endswith(b'\0') or b'\0' in label[:-1]:
+            refuse('missing_native_security_label')
+        value = {'kind': 'directory', 'mode': stat.S_IMODE(before.st_mode), 'uid': before.st_uid,
+                 'gid': before.st_gid, 'bytes': before.st_size, 'nlink': before.st_nlink,
+                 'ctime_ns': before.st_ctime_ns, 'mtime_ns': before.st_mtime_ns,
+                 'acl': acl.access(fd, unsupported=True), 'selinux': base64.b64encode(label[:-1]).decode(),
+                 'xattrs': {name: base64.b64encode(raw).decode() for name, raw in attributes.items()},
+                 'children': children}
+        if (sorted(os.listdir(fd)) != names or _identity(os.fstat(fd)) != _identity(before)
+                or _identity(Path(path).lstat()) != _identity(before) or _parents(path) != parents):
+            refuse('directory_changed_during_read')
+    finally:
+        os.close(fd)
+    return {**_directory_invariant(value, path), 'inode': before.st_ino}
 
 
 def _configuration():
@@ -506,7 +596,7 @@ def _mount(runner):
         return value
     expected = get('/boot/efi')
     device = Path('/boot/efi').stat().st_dev
-    for path in db.EFI:
+    for path in db.EFI_TARGETS:
         if get(path) != expected or Path(path).lstat().st_dev != device:
             refuse('efi_target_mount_changed')
     return {key: value for key, value in expected.items() if key != 'source'}
@@ -522,8 +612,12 @@ def _authority(runner):
         owner = runner(['/usr/bin/rpm', '--query', '--file', path, '--queryformat',
                         '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n']).strip()
         writers[path] = {'owner': owner, 'description': _file(path)}
+    acl = _Acl()
+    directories = {path: {key: value for key, value in _directory(path, acl).items() if key != 'inode'}
+                   for path in db.EFI_DIRECTORIES}
     return validate_authority({'schema': 1, 'writers': writers, 'configuration': _configuration(),
                                'execution': copy.deepcopy(EXECUTION),
+                               'directories': directories,
                                'mount': _mount(runner), 'targets': sorted(db.TARGETS)})
 
 

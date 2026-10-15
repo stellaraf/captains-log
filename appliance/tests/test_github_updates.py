@@ -451,6 +451,10 @@ class PollTests(unittest.TestCase):
     def test_pending_recovery_or_os_reboot_does_not_download(self):
         for target, value in ((self.manager.state / "transaction.json", {"state": "committed", "finalization": "failed"}),
                               (self.manager.state.parent / "os-transaction.json", {"state": "reboot_requested"}),
+                              (self.manager.state.parent / "os-transaction.json",
+                               {"state": "complete", "finalization": "complete", "storage_maintenance": "held"}),
+                              (self.manager.state.parent / "os-transaction.json",
+                               {"state": "complete", "finalization": "complete", "storage_maintenance": "release_pending"}),
                               *((self.manager.state.parent / "os-transaction.json",
                                  {"state": "complete", "finalization": "complete", field: "recovery_required"})
                                 for field in ("kernel_finalization", "kernel_retention", "kernel_rollback"))):
