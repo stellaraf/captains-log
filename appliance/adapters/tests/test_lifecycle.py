@@ -360,6 +360,111 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.commands.calls[before:], [["dnf", "needs-restarting", "--reboothint"]])
         self.assertTrue((stage / "recovery/keycloak.dump").exists())
 
+    def interrupted_reboot_fixture(self, latest_state="postcheck_passed"):
+        stage, journal = self.os_recovery_fixture()
+        transaction = json.loads(journal.read_text())
+        atomic_json(journal, {**transaction, "state": "reboot_preparing", "recovery_phase": None,
+                             "reboot_pending": True, "health": {name: True for name in REQUIRED_CHECKS}})
+        latest_path = self.root / "manager/os-latest.json"
+        latest = json.loads(latest_path.read_text())
+        atomic_json(latest_path, {**latest, "state": latest_state})
+        self.manager.service = Mock()
+        return stage, journal
+
+    def test_interrupted_reboot_preparation_restores_services_after_integrity_before_health(self):
+        stage, journal = self.interrupted_reboot_fixture()
+        observed = []
+        self.os_integrity.side_effect = lambda *args, **kwargs: observed.append("integrity")
+        self.manager.service.side_effect = lambda *args: observed.append("services")
+        checks = {name: True for name in REQUIRED_CHECKS}
+        self.manager.health.side_effect = lambda *args, **kwargs: observed.append("health") or {"ok": True, "checks": checks}
+        result = self.manager.os_recover()
+        self.assertEqual(result["status"], "updated")
+        self.assertEqual(observed, ["integrity", "services", "health"])
+        self.manager.service.assert_called_once_with("start", self.manager.services)
+        self.manager.maintenance.assert_called_with(False, stage)
+        self.assertEqual(json.loads(journal.read_text())["finalization"], "complete")
+        self.assertFalse(any(call[:2] in (["systemctl", "reboot"], ["/usr/bin/dnf", "upgrade"]) for call in self.commands.calls))
+
+    def test_prepared_reboot_interruption_preserves_retry_after_service_restart_failure(self):
+        stage, journal = self.interrupted_reboot_fixture("reboot_prepared")
+        self.manager.service.side_effect = Refused("service restart failed")
+        with self.assertRaisesRegex(Refused, "recovery evidence remain intact"):
+            self.manager.os_recover()
+        failed = json.loads(journal.read_text())
+        self.assertEqual(failed["state"], "recovery_required")
+        self.assertEqual(failed["recovery_phase"], "reboot_preparing")
+        self.assertTrue(failed["reboot_pending"])
+        self.manager.health.assert_not_called()
+        self.manager.maintenance.assert_called_once_with(True, stage)
+        self.manager.service.side_effect = None
+        result = self.manager.os_recover()
+        self.assertEqual(result["status"], "updated")
+        self.manager.maintenance.assert_called_with(False, stage)
+        self.assertTrue((stage / "recovery/keycloak.dump").exists())
+
+    def test_interrupted_reboot_refuses_invalid_identity_and_already_requested_reboot(self):
+        _, journal = self.interrupted_reboot_fixture()
+        original = json.loads(journal.read_text())
+        for changed in ({"state": "reboot_requested"}, {"health": {}}, {"reboot_pending": False},
+                        {"boot_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}):
+            with self.subTest(changed=changed):
+                atomic_json(journal, {**original, **changed})
+                with self.assertRaisesRegex(Refused, "exact retained same-boot"):
+                    self.manager.os_recover()
+        self.manager.service.assert_not_called()
+        self.manager.health.assert_not_called()
+        self.manager.maintenance.assert_not_called()
+
+    def test_interrupted_reboot_verifies_backup_and_integrity_before_starting_services(self):
+        stage, journal = self.interrupted_reboot_fixture()
+        self.os_integrity.side_effect = Refused("unplanned file drift")
+        with self.assertRaisesRegex(Refused, "recovery evidence remain intact"):
+            self.manager.os_recover()
+        self.manager.service.assert_not_called()
+        self.manager.health.assert_not_called()
+        self.manager.maintenance.assert_called_once_with(True, stage)
+        self.assertTrue(json.loads(journal.read_text())["reboot_pending"])
+        self.assertTrue((stage / "adapter-backup-inventory.json").exists())
+
+    def test_interrupted_reboot_finalization_retries_after_reboot_requirement_clears(self):
+        stage, journal = self.interrupted_reboot_fixture()
+        def fail_release(active, directory):
+            if not active:
+                raise Refused("edge maintenance marker temporarily unavailable")
+        self.manager.maintenance.side_effect = fail_release
+        with self.assertRaisesRegex(Refused, "retry os-recover"):
+            self.manager.os_recover()
+        accepted = json.loads(journal.read_text())
+        self.assertEqual(accepted["state"], "complete")
+        self.assertEqual(accepted["finalization"], "failed")
+        self.assertFalse(accepted["reboot_pending"])
+        self.assertEqual(accepted["recovery_phase"], "postcheck")
+        self.manager.maintenance.side_effect = None
+        self.manager.service.reset_mock()
+        self.manager.health.reset_mock()
+        self.assertFalse(self.manager.os_recover()["reboot_pending"])
+        self.manager.health.assert_called_once_with(stage, os_health=True)
+        self.manager.service.assert_not_called()
+        self.manager.maintenance.assert_called_with(False, stage)
+        self.assertEqual(json.loads(journal.read_text())["finalization"], "complete")
+
+    def test_no_package_recovery_keeps_no_updates_status_and_pending_reboot(self):
+        _, journal = self.os_recovery_fixture()
+        transaction = json.loads(journal.read_text())
+        atomic_json(journal, {**transaction, "no_updates": True, "plan_sha256": None})
+        original = self.manager.cmd
+        def runner(argv, **kwargs):
+            if argv == ["dnf", "needs-restarting", "--reboothint"]:
+                raise CommandFailed("dnf", 1)
+            return original(argv, **kwargs)
+        self.manager.cmd = runner
+        result = self.manager.os_recover()
+        self.assertEqual(result["status"], "no_updates")
+        self.assertTrue(result["reboot_pending"])
+        self.assertEqual(json.loads(journal.read_text())["status"], "no_updates")
+        self.assertFalse(any(call[0] == "/usr/bin/rpm" for call in self.commands.calls))
+
     def test_os_recovery_reports_needed_reboot_without_requesting_one(self):
         _, journal = self.os_recovery_fixture()
         self.manager.cmd = Mock(side_effect=CommandFailed("dnf", 1))

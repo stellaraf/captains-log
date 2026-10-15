@@ -119,6 +119,13 @@ class HostSignatureTests(HostUpdateFixture):
         return updates.verify_release(self.bundle / "manifest.json", self.bundle / "manifest.sig", self.public, self.bundle,
             current_sequence=9, current_versions={"host": "0.1.0", "nebulalog": "0.1.0"}, now=datetime(2026, 9, 9, tzinfo=timezone.utc), **kwargs)
 
+    def test_livepatch_recovery_prevents_component_activation(self):
+        with patch.object(updates.livepatch, 'require_settled', side_effect=Refused('Livepatch recovery')) as gate:
+            with self.assertRaisesRegex(Refused, 'Livepatch recovery'):
+                self.install()
+        gate.assert_called_once_with(self.state)
+        self.assertEqual(self.calls, [])
+
     def test_signed_host_bundle_and_metadata_only_contract(self):
         self.assertTrue(self.verify()["artifacts_verified"])
         (self.bundle / "host.tar").unlink()

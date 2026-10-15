@@ -618,9 +618,20 @@ class Lifecycle:
                 atomic_json(stage / "adapter-compliance.json", {**proof, "status": "passed"})
                 return proof
 
-    def health(self, stage, *, os_health=False):
+    def livepatch_health(self, stage):
+        self.guard()
+        self.encrypted()
+        return self.health(stage, livepatch_health=True)
+
+    def health(self, stage, *, os_health=False, livepatch_health=False):
         release = {}
-        if os_health:
+        if os_health and livepatch_health:
+            raise Refused("Health operation must have one owner")
+        if livepatch_health:
+            self.guard()
+            if stage.is_symlink() or stage.resolve().parent != (self.state / "livepatch-health").resolve():
+                raise Refused("Livepatch health stage is outside protected retained storage")
+        elif os_health:
             self.guard()
             if stage.is_symlink() or stage.resolve().parent != (self.data / "manager/os-updates").resolve():
                 raise Refused("OS health stage is not an operation-owned recovery directory")
@@ -778,7 +789,7 @@ class Lifecycle:
         return {**self.receipt(stage, "os-postcheck", checks=result["checks"]), "stage": str(stage)}
 
     def os_recover(self):
-        """Retry same-boot postcheck acceptance, without repeating package changes."""
+        """Recover same-boot acceptance or interrupted pre-reboot service stops."""
         self.guard()
         self.encrypted()
         with locked(self.data / "manager/transaction.lock"), locked(self.data / "manager/updates/transaction.lock"):
@@ -787,21 +798,33 @@ class Lifecycle:
             latest = json.loads(trusted_file(path).read_text())
             transaction = json.loads(trusted_file(journal).read_text())
             stage = Path(latest["stage"])
-            retry = transaction.get("state") == "recovery_required" or (
+            preparing = transaction.get("state") == "reboot_preparing" or transaction.get("recovery_phase") == "reboot_preparing"
+            retry = transaction.get("state") in ("recovery_required", "reboot_preparing") or (
                 transaction.get("state") == "complete" and transaction.get("finalization") in ("pending", "failed"))
-            if (not retry or transaction.get("recovery_phase") not in ("updating", "postcheck")
+            if (not retry or not preparing and transaction.get("recovery_phase") not in ("updating", "postcheck")
                     or stage.is_symlink() or stage.resolve().parent != (self.data / "manager/os-updates").resolve()
                     or transaction.get("stage") != str(stage)
-                    or latest.get("state") not in ("prepared", "postcheck_failed", "postcheck_passed")
+                    or latest.get("state") not in (("postcheck_passed", "reboot_prepared", "postcheck_failed") if preparing else
+                                                  ("prepared", "postcheck_failed", "postcheck_passed"))
+                    or preparing and (transaction.get("reboot_pending") is not True or
+                                      any(transaction.get("health", {}).get(name) is not True for name in REQUIRED_CHECKS))
                     or not latest.get("boot_id") or latest["boot_id"] != transaction.get("boot_id") or latest["boot_id"] != self.boot_id()):
                 raise Refused("OS recovery requires the exact retained same-boot postcheck transaction")
             marker = self.data / "manager/maintenance.json"
             if marker.exists() and json.loads(trusted_file(marker).read_text()).get("release") != str(stage):
                 raise Refused("Another transaction owns appliance maintenance")
+            if preparing:
+                # The scheduler records reboot_requested BEFORE calling systemd.
+                # A retained reboot_preparing operation has not requested a reboot;
+                # it may have stopped any subset of services before interruption.
+                transaction = {**transaction, "state": "recovery_required", "recovery_phase": "reboot_preparing"}
+                atomic_json(journal, transaction)
             self.maintenance(True, stage)
             try:
                 self.checked_backup(stage)
                 os_payload.accept_integrity(stage, runner=self.cmd)
+                if preparing:
+                    self.service("start", self.services)
                 result = self.health(stage, os_health=True)
                 if result.get("ok") is not True or any(result.get("checks", {}).get(name) is not True for name in REQUIRED_CHECKS):
                     raise Refused("OS runtime, security or compliance acceptance failed")
@@ -818,8 +841,8 @@ class Lifecycle:
                 audit(self.data / "manager/audit.jsonl", "os.recovery_health_failed", error=type(exc).__name__)
                 raise Refused("OS recovery acceptance failed; maintenance and recovery evidence remain intact") from exc
             atomic_json(path, {**latest, "state": "postcheck_passed"})
-            completed = {**transaction, "state": "complete", "status": "updated", "finalization": "pending",
-                         "reboot_pending": reboot, "health": result["checks"],
+            completed = {**transaction, "state": "complete", "status": "no_updates" if transaction.get("no_updates") is True else "updated", "finalization": "pending",
+                         "reboot_pending": reboot, "health": result["checks"], "recovery_phase": "postcheck",
                          "completed_at": datetime.now(timezone.utc).isoformat()}
             atomic_json(journal, completed)
             try:
@@ -829,7 +852,7 @@ class Lifecycle:
                 raise Refused("OS health passed; retry os-recover to release maintenance") from exc
             atomic_json(journal, {**completed, "finalization": "complete"})
             audit(self.data / "manager/audit.jsonl", "os.recovery_verified", reboot_pending=reboot)
-            return self.receipt(stage, "os-recover", checks=result["checks"], status="updated", reboot_pending=reboot)
+            return self.receipt(stage, "os-recover", checks=result["checks"], status=completed["status"], reboot_pending=reboot)
 
     def unlock_readiness(self):
         if self.config.get("unattended_reboot") is not True:

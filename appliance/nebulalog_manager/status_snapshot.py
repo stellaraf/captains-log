@@ -130,6 +130,7 @@ class Collector:
             return probe.get("value") if probe.get("ok") is True and probe.get("value") in allowed else "unavailable"
         return {"status": "observed", "fips_kernel": value.get("fips_kernel") is True,
                 "fips_tool_passed": value.get("fips_tool", {}).get("ok") is True,
+                "module_signatures_enforced": value.get("module_signatures_enforced") is True,
                 "crypto_policy": observed("crypto_policy", {"FIPS", "DEFAULT", "LEGACY", "FUTURE"}),
                 "selinux": observed("selinux", {"Enforcing", "Permissive", "Disabled"}),
                 "firewall": observed("firewalld", {"active", "inactive", "failed"}),

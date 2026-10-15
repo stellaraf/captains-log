@@ -49,6 +49,10 @@ def status(runner=run) -> dict:
         result["fips_kernel"] = Path("/proc/sys/crypto/fips_enabled").read_text().strip() == "1"
     except OSError:
         result["fips_kernel"] = False
+    try:
+        result["module_signatures_enforced"] = Path("/sys/module/module/parameters/sig_enforce").read_text().strip() == "Y"
+    except OSError:
+        result["module_signatures_enforced"] = False
     result["fips_tool"] = probe(["fips-mode-setup", "--check"])
     result["crypto_policy"] = probe(["update-crypto-policies", "--show"])
     result["selinux"] = probe(["getenforce"])
@@ -60,7 +64,7 @@ def status(runner=run) -> dict:
     journal = probe(["journalctl", "-k", "--boot=0", "--no-pager", "--output=cat", "--lines=10000"])
     result["kernel_crypto_diagnostics"] = kernel_crypto_diagnostics(SimpleNamespace(
         code=0 if journal["ok"] else 1, stdout=journal["value"] if journal["ok"] else "", stderr=""))
-    result["host_controls_ok"] = (result["fips_kernel"] and result["fips_tool"]["ok"] and
+    result["host_controls_ok"] = (result["fips_kernel"] and result["module_signatures_enforced"] and result["fips_tool"]["ok"] and
                                   result["kernel_crypto_diagnostics"]["status"] == "no_failure_observed" and
                                   result["crypto_policy"]["value"] == "FIPS" and
                                   result["selinux"]["value"] == "Enforcing" and
@@ -111,13 +115,15 @@ def scan(policy_path: Path, output: Path, runner=run) -> dict:
         if not profile_id.startswith("xccdf_"):
             raise Refused("Expected an explicit XCCDF profile ID")
         info = runner(["oscap", "info", str(source)])
-        if profile_id not in info:
+        if profile.get("base_profile_id", profile_id) not in info:
             raise Refused("Requested SCAP profile is not present")
         xml = output / (profile["kind"] + ".xml")
         html = output / (profile["kind"] + ".html")
         argv = ["oscap", "xccdf", "eval", "--profile", profile_id,
                 "--results", str(xml), "--report", str(html)]
         if profile.get("tailoring"):
+            from .baseline import validate_tailoring
+            validate_tailoring(profile, runner=runner)
             tailoring = trusted_file(Path(profile["tailoring"]))
             if hashlib.sha256(tailoring.read_bytes()).hexdigest() != profile.get("tailoring_sha256"):
                 raise Refused("SCAP tailoring hash mismatch")

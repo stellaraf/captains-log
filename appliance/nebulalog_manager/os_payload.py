@@ -403,9 +403,16 @@ def prepare(stage, policy, *, runner=run):
     immutable(stage / 'operation.json', (json.dumps(operation, sort_keys=True) + '\n').encode())
     download = stage / 'download'
     download.mkdir(mode=0o700)
+    _, _, before = inventory(runner)
     runner(['/usr/bin/dnf', '--releasever=9', '--refresh', '--assumeyes', '--downloadonly', '--downloaddir=' + str(download), 'upgrade', *requested], timeout=3600)
     packages = sorted(download.glob('*.rpm'))
     if not packages:
+        if inventory(runner)[2] != before:
+            refuse('package_inventory_changed_during_download')
+        observation = {'schema': 1, 'kind': 'rocky-no-updates-v1',
+                       'operation_sha256': sha(read(stage / 'operation.json', 8192)),
+                       'inventory_sha256': digest(before)}
+        immutable(stage / 'os-no-updates.json', (json.dumps(observation, sort_keys=True) + '\n').encode())
         return {'ok': True, 'status': 'no_updates', 'plan_sha256': None}
     result = plan_cached(stage, packages, runner=runner)
     plan, plan_sha = load_plan(stage)
@@ -487,12 +494,57 @@ def allowed_integrity_report(report, plan, phase):
         refuse('unrelated_integrity_change')
 
 
+def _verify_no_updates(stage, identity, runner):
+    """Bind an empty download to this same-boot operation, never an RPM bypass."""
+    parent = identity.root / 'manager/os-updates'
+    if stage.is_symlink() or stage.resolve().parent != parent.resolve():
+        refuse('no_updates_stage_changed')
+    raw = read(stage / 'operation.json', 8192)
+    operation = strict_json(raw)
+    exact(operation, {'schema', 'id', 'stage', 'boot_id'})
+    try:
+        uuid.UUID(operation['id'])
+        uuid.UUID(operation['boot_id'])
+    except (ValueError, TypeError, AttributeError):
+        refuse('invalid_operation_identity')
+    observation = strict_json(read(stage / 'os-no-updates.json', 8192))
+    exact(observation, {'schema', 'kind', 'operation_sha256', 'inventory_sha256'})
+    journal = strict_json(read(parent.parent / 'os-transaction.json', 65536))
+    latest = strict_json(read(parent.parent / 'os-latest.json', 65536))
+    if (operation['schema'] != 1 or operation['stage'] != str(stage)
+            or observation['schema'] != 1 or observation['kind'] != 'rocky-no-updates-v1'
+            or observation['operation_sha256'] != sha(raw)
+            or journal.get('state') not in {'postcheck', 'recovery_required', 'complete'}
+            or journal.get('no_updates') is not True or journal.get('plan_sha256') is not None
+            or journal.get('stage') != str(stage) or latest.get('stage') != str(stage)
+            or operation['boot_id'] != journal.get('boot_id') or operation['boot_id'] != latest.get('boot_id')
+            or operation['boot_id'] != Path('/proc/sys/kernel/random/boot_id').read_text().strip()):
+        refuse('no_updates_operation_binding_changed')
+    if any(os.path.lexists(stage / name) for name in ('os-payload-plan.json', 'os-integrity-plan.json', 'rpm-apply-intent.json')):
+        refuse('no_updates_conflicts_with_package_transaction')
+    if digest(inventory(runner)[2]) != observation['inventory_sha256']:
+        refuse('no_updates_package_inventory_changed')
+    return observation
+
+
 def accept_integrity(stage, *, runner=run):
     # Recovery verifies the installed exact package/file result and never reruns
     # RPM or treats dnf history undo as a scriptlet/data rollback guarantee.
     stage = Path(stage)
+    from . import aide, aide_updates
+    if os.path.lexists(stage / 'os-no-updates.json'):
+        # The lifecycle caller owns manager/update locks. The existing update
+        # coordination takes the remaining locks for a fresh ordinary AIDE check.
+        # No --update, acceptance or baseline replacement is permitted here.
+        manager = aide.Aide()
+        with aide_updates._locked(manager) as (state, identity):
+            observation = _verify_no_updates(stage, identity, runner)
+            integrity = manager._check_locked(state, identity)
+            if integrity.get('state') != 'clean' or integrity.get('exit_code') != 0:
+                refuse('no_updates_integrity_not_clean')
+            _verify_no_updates(stage, identity, runner)
+        return {'ok': True, 'package': {'status': 'no_updates', **observation}, 'integrity': integrity}
     package = postcheck_cached(stage, runner=runner)
-    from . import aide
     integrity = aide.Aide().authorized_update_accept(stage, stage / 'os-integrity-plan.json')
     if integrity.get('ok') is not True:
         refuse('integrity_acceptance_failed')

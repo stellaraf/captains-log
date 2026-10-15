@@ -117,6 +117,7 @@ def write_new(path, raw, mode):
 
 def variables(output, build_disk_id):
     return {"appliance_source_directory": str(output / "appliance"),
+            "provenance_directory": str(output),
             "keycloak_realm_template": str(output / REALM),
             "kickstart_directory": str(output / "appliance/packer/http"),
             "build_disk_id": build_disk_id}

@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 from .common import CommandFailed, Refused, atomic_json, audit, locked, require_linux_root, run, trusted_file
 from .security import status
-from . import os_payload
+from . import os_payload, livepatch
 from .updates import REQUIRED_CHECKS, in_maintenance_window
 
 
@@ -24,6 +24,16 @@ def _runtime_postcheck(runner, stage):
     return result
 
 
+def _reboot_required(runner):
+    try:
+        runner(["dnf", "needs-restarting", "--reboothint"], timeout=120)
+    except CommandFailed as exc:
+        if exc.returncode != 1:
+            raise Refused("Cannot determine whether a reboot is required") from exc
+        return True
+    return False
+
+
 def maintain(config: Path, state: Path=Path("/var/lib/nebulalog/manager"), runner=run, now=None):
     require_linux_root()
     policy=json.loads(trusted_file(config).read_text())
@@ -33,6 +43,7 @@ def maintain(config: Path, state: Path=Path("/var/lib/nebulalog/manager"), runne
     if not in_maintenance_window(now,weekday=policy.get("weekday",6),start=policy.get("start","03:00"),end=policy.get("end","05:00"),zone=policy["timezone"]):
         return {"status":"outside_maintenance_window"}
     with locked(state/"transaction.lock"), locked(state/"updates/transaction.lock"):
+        livepatch.require_settled(state / "updates")
         journal = state / "os-transaction.json"
         previous = json.loads(journal.read_text()) if journal.exists() else None
         if previous and (previous.get("state") not in ("complete", "failed", "reboot_aborted") or previous.get("finalization", "complete") != "complete"):
@@ -43,6 +54,9 @@ def maintain(config: Path, state: Path=Path("/var/lib/nebulalog/manager"), runne
             if component.get("state") not in ("preflight_failed", "committed", "rolled_back") or (component.get("state") in ("committed", "rolled_back") and component.get("finalization") != "complete"):
                 raise Refused("Component maintenance must finish before OS maintenance")
         transaction = {"state": "preflight", "started_at": datetime.now(timezone.utc).isoformat()}
+        if previous and previous.get("reboot_pending") is True:
+            # Planning/network failures must not erase an earlier deferred reboot.
+            transaction.update(reboot_pending=True, prior_reboot_stage=previous.get("stage"))
         def record(value, **details):
             transaction.update(state=value, **details)
             atomic_json(journal, transaction)
@@ -66,23 +80,27 @@ def maintain(config: Path, state: Path=Path("/var/lib/nebulalog/manager"), runne
                 raise Refused("OS maintenance requires the backup boot identity")
             record("planning", stage=stage, boot_id=boot_id)
             plan = os_payload.prepare(Path(stage), policy, runner=runner)
-            if plan.get("status") == "no_updates":
-                record("complete", status="no_updates", reboot_pending=False)
-                return {"status": "no_updates", "reboot_pending": False}
-            record("updating", plan_sha256=plan["plan_sha256"])
-            os_payload.apply(Path(stage), runner=runner)
-            record("postcheck")
+            no_updates = plan.get("status") == "no_updates"
+            if no_updates:
+                record("planning", no_updates=True, plan_sha256=None)
+                reboot = _reboot_required(runner)
+                if not reboot and transaction.get("reboot_pending") is not True:
+                    record("complete", status="no_updates", reboot_pending=False)
+                    return {"status": "no_updates", "reboot_pending": False}
+                # A prior update can still require a reboot after DNF has no new
+                # packages. Use this run's fresh backup and full acceptance; do
+                # not replay the earlier RPM installation or its stale backup.
+                record("postcheck", reboot_pending=reboot or transaction.get("reboot_pending") is True)
+            else:
+                record("updating", plan_sha256=plan["plan_sha256"])
+                os_payload.apply(Path(stage), runner=runner)
+                record("postcheck")
             if not status(runner)["host_controls_ok"]:
                 raise Refused("OS update security postcondition failed; reboot blocked")
             accepted = _runtime_postcheck(runner, stage)
             record("postcheck", health=accepted["checks"])
-            reboot = False
-            try:
-                runner(["dnf", "needs-restarting", "--reboothint"], timeout=120)
-            except CommandFailed as exc:
-                if exc.returncode != 1:
-                    raise Refused("Cannot determine whether a reboot is required") from exc
-                reboot = True
+            reboot = _reboot_required(runner)
+            record("postcheck", reboot_pending=reboot)
         except Exception as exc:
             record("recovery_required" if transaction["state"] in ("updating", "postcheck") or (state / "maintenance.json").exists() else "failed",
                    recovery_phase=transaction["state"], error=type(exc).__name__)
@@ -105,9 +123,9 @@ def maintain(config: Path, state: Path=Path("/var/lib/nebulalog/manager"), runne
                     except Exception as postcheck_error:
                         record("recovery_required", recovery_phase="postcheck", error=type(postcheck_error).__name__)
                         raise Refused("Reboot preparation failed and current runtime acceptance requires recovery") from postcheck_error
-                    record("complete", status="updated", reboot_pending=True, reboot_blocked=type(exc).__name__)
-                    raise Refused("OS packages updated; reboot remains pending because unlock or preparation requirements were not met") from exc
-                record("recovery_required", error=type(exc).__name__)
+                    record("complete", status="no_updates" if no_updates else "updated", reboot_pending=True, reboot_blocked=type(exc).__name__)
+                    raise Refused("OS maintenance passed; reboot remains pending because unlock or preparation requirements were not met") from exc
+                record("recovery_required", recovery_phase="reboot_preparing", error=type(exc).__name__)
                 raise Refused("Reboot preparation failed; review appliance service and unlock state") from exc
             record("reboot_requested", boot_id=prepared["boot_id"])
             try:
@@ -123,7 +141,7 @@ def maintain(config: Path, state: Path=Path("/var/lib/nebulalog/manager"), runne
                     raise Refused("Reboot request failed and service recovery failed; maintenance remains active") from recovery_error
                 raise Refused("Reboot request failed; appliance services and local authentication were restored and verified") from exc
             return {"status":"reboot_requested"}
-        result={"status":"updated","reboot_pending":reboot}
+        result={"status":"no_updates" if no_updates else "updated","reboot_pending":reboot}
         record("complete", **result)
         return result
 

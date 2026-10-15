@@ -274,6 +274,21 @@ class LifecycleComplianceTests(unittest.TestCase):
         return self.start_patch("nebulalog_adapters.lifecycle.security_status", return_value={
             "host_controls_ok": True, "selinux": {"value": "Enforcing"}, "firewalld": {"value": "active"}})
 
+    def test_livepatch_health_retains_reviewed_findings_and_checks_current_services(self):
+        self.health_fixture()
+        self.stage = self.manager.state / 'livepatch-health' / self.boot
+        self.stage.mkdir(parents=True, mode=0o700)
+        self.assertFalse(self.manager.livepatch_health(self.stage)['ok'])
+        self.approve()
+        self.assertTrue(self.manager.livepatch_health(self.stage)['ok'])
+        self.manager.release.assert_not_called()
+        self.manager.sql = lambda _: 'unavailable'
+        self.assertFalse(self.manager.livepatch_health(self.stage)['ok'])
+
+    def test_livepatch_health_refuses_unowned_stage(self):
+        with self.assertRaisesRegex(Refused, 'outside protected'):
+            self.manager.livepatch_health(self.stage)
+
     def test_component_health_uses_review_and_still_refuses_failed_fips_selinux(self):
         host = self.health_fixture()
         self.assertFalse(self.manager.health(self.stage)["checks"]["compliance"])

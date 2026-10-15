@@ -9,7 +9,13 @@ from nebulalog_manager.firstboot import FirstBoot
 
 
 class RuntimeSecurityTests(unittest.TestCase):
-    def observe(self, journal, *, unavailable=False):
+    def observe(self, journal, *, unavailable=False, signature_mode="Y"):
+        def read(path):
+            if str(path).endswith("/sig_enforce"):
+                if signature_mode is None:
+                    raise OSError("unavailable")
+                return signature_mode + "\n"
+            return "1\n"
         calls = []
 
         def runner(argv):
@@ -24,10 +30,17 @@ class RuntimeSecurityTests(unittest.TestCase):
                 return "Enforcing"
             return "active"
 
-        with patch.object(Path, "read_text", return_value="1\n"):
+        with patch.object(Path, "read_text", read):
             value = security.status(runner)
         self.assertIn(["journalctl", "-k", "--boot=0", "--no-pager", "--output=cat", "--lines=10000"], calls)
         return value
+
+    def test_unsigned_or_unobservable_module_policy_is_not_healthy(self):
+        for mode in ("N", "1", "", None):
+            with self.subTest(mode=mode):
+                result = self.observe("Linux version fixture\n", signature_mode=mode)
+                self.assertFalse(result["module_signatures_enforced"])
+                self.assertFalse(result["host_controls_ok"])
 
     def test_native_hkdf_failure_overrides_enabled_fips_mode(self):
         value = self.observe("Linux version fixture\nbasic hdkf test(hmac(sha256-ni)): hkdf_extract failed with -22\n")

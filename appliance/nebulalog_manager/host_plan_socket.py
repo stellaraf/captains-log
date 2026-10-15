@@ -123,7 +123,22 @@ def handle_connection(connection, service, *, credentials=peer_credentials, mono
     except (OSError, ValueError, TypeError):
         pass
     finally:
-        connection.close()
+        # Linux resets AF_UNIX streams closed with unread request bytes. Drain
+        # only already queued bytes, without parsing/dispatching them or waiting
+        # for a hostile peer. This lets bounded malformed/unauthorized callers
+        # receive the framed refusal while retaining the original time limit.
+        try:
+            connection.setblocking(False)
+            remaining_bytes = MAX_REQUEST + 4
+            while remaining_bytes and monotonic() < deadline:
+                discarded = connection.recv(min(4096, remaining_bytes))
+                if not discarded:
+                    break
+                remaining_bytes -= len(discarded)
+        except OSError:
+            pass
+        finally:
+            connection.close()
 
 
 def verify_directory(path):

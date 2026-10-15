@@ -646,31 +646,63 @@ class Aide:
 
     def check(self):
         with self._locked() as (state, identity):
-            marker = state.parent / "aide-enrollment.json"
-            if not present(marker):
-                raise Refused("aide_baseline_not_enrolled")
-            attempt = {"schema": 1, "id": str(uuid.uuid4()), "observed_at": self.clock(), "state": "running", "report_id": None}
+            return self._check_locked(state, identity)
+
+    def check_for_transaction(self, manager_lock_fd):
+        """Check without reacquiring the caller's live manager-lock descriptor.
+
+        The caller retains and closes the descriptor. No database acceptance or
+        baseline change is performed; ordinary check/report semantics apply.
+        """
+        from .aide_updates import _locked as coordination
+        identity = self.guard()
+        manager = identity.root / "manager"
+        self.records.directory(manager, identity)
+        try:
+            if type(manager_lock_fd) is not int:
+                raise Refused("aide_transaction_lock_descriptor_required")
+            info = os.fstat(manager_lock_fd)
+            self.records._file(info, identity, allow_empty=True)
+            expected = (manager / "transaction.lock").lstat()
+            self.records._file(expected, identity, allow_empty=True)
+            if (info.st_dev, info.st_ino) != (expected.st_dev, expected.st_ino):
+                raise Refused("aide_transaction_lock_identity_changed")
+            # Same open description as the outer transaction: reacquiring is
+            # harmless. An unrelated competing lock refuses nonblockingly.
+            fcntl.flock(manager_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with coordination(self) as (state, current):
+                if current != identity:
+                    raise Refused("aide_transaction_storage_changed")
+                return self._check_locked(state, identity)
+        except OSError:
+            raise Refused("aide_transaction_lock_unavailable") from None
+
+    def _check_locked(self, state, identity):
+        marker = state.parent / "aide-enrollment.json"
+        if not present(marker):
+            raise Refused("aide_baseline_not_enrolled")
+        attempt = {"schema": 1, "id": str(uuid.uuid4()), "observed_at": self.clock(), "state": "running", "report_id": None}
+        self.records.write(state / "last-attempt.json", attempt, identity)
+        try:
+            enrolled = self._enrolled(state, identity)
+            policy = self._monitor(identity, state, enrolled)
+            facts = enrolled["facts"]
+            if enrolled.get("installation_id") != identity.installation_id:
+                raise Refused("aide_monitor_context_changed")
+            _, database_sha = self._database(state / "aide.db.gz", identity)
+            if database_sha != enrolled.get("database_sha256"):
+                raise Refused("aide_enrolled_database_changed")
+            config = self._config(state, identity, policy, stage="enrolled")
+            result = self._report(state, identity, config, "check", facts, database_sha)
+            if self._database(state / "aide.db.gz", identity)[1] != database_sha or self._monitor(identity, state, enrolled) != policy:
+                raise Refused("aide_context_changed_during_check")
+            attempt.update(state="complete", report_id=result["id"])
             self.records.write(state / "last-attempt.json", attempt, identity)
-            try:
-                enrolled = self._enrolled(state, identity)
-                policy = self._monitor(identity, state, enrolled)
-                facts = enrolled["facts"]
-                if enrolled.get("installation_id") != identity.installation_id:
-                    raise Refused("aide_monitor_context_changed")
-                _, database_sha = self._database(state / "aide.db.gz", identity)
-                if database_sha != enrolled.get("database_sha256"):
-                    raise Refused("aide_enrolled_database_changed")
-                config = self._config(state, identity, policy, stage="enrolled")
-                result = self._report(state, identity, config, "check", facts, database_sha)
-                if self._database(state / "aide.db.gz", identity)[1] != database_sha or self._monitor(identity, state, enrolled) != policy:
-                    raise Refused("aide_context_changed_during_check")
-                attempt.update(state="complete", report_id=result["id"])
-                self.records.write(state / "last-attempt.json", attempt, identity)
-                return result
-            except Exception:
-                attempt["state"] = "error"
-                self.records.write(state / "last-attempt.json", attempt, identity)
-                raise
+            return result
+        except Exception:
+            attempt["state"] = "error"
+            self.records.write(state / "last-attempt.json", attempt, identity)
+            raise
 
     def status(self):
         with self._locked() as (state, identity):

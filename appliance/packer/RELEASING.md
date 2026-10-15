@@ -86,3 +86,20 @@ Stage these exact paths for a version:
 Supply the independently reviewed manifest SHA256 when dispatching. The workflow checks that every frozen source file matches the checked-out commit, verifies the evidence gate, uploads only the explicit package assets and OVA to a new draft prerelease, and compares GitHub's uploaded asset lengths/SHA256 digests and actual tag commit. It rechecks local evidence before publishing with `prerelease: true` and `latest: false`. Missing GitHub digest evidence, an existing release, upload failure or any mismatch leaves publication unfinished; no overwrite, deletion or automatic partial-draft reuse is attempted.
 
 The appliance's 15-minute stable GitHub poller excludes prereleases. Stable publication and promotion require a separately reviewed process and are deliberately absent here. The workflow source has local fixture validation only until it is installed and run against the configured repository/runner/environment.
+
+## Preserve builder disks independently
+
+The October 12 private build completed provisioning but its manifest
+post-processor failed because the relative output directory was absent. Packer
+then removed the input artifact despite `-on-error=abort`. That flag is not an
+artifact-retention guarantee. The template now returns builder outputs directly,
+without a post-processor. Write receipt files outside Packer after it exits.
+
+A local build supervisor can use `preserve_build.RecoveryLinks` to retain the
+three known disk/firmware files in a separate recovery directory on the same
+filesystem. Call `capture()` throughout the build and after the writer exits;
+replacement inodes receive separate links. These links share live writes and
+must never be treated as crash-consistent snapshots or opened by a second VM
+while the original writer runs. After exit, verify image consistency before use.
+They are recovery evidence and must be preserved independently of Packer output
+cleanup. This does not protect against physical filesystem/drive failure.

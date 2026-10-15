@@ -1,0 +1,21 @@
+<?xml version='1.0' encoding='utf-8'?>
+<xccdf:Tailoring xmlns:xccdf="http://checklists.nist.gov/xccdf/1.2" id="xccdf_com.captainslog_tailoring_stig">
+  <xccdf:benchmark href="ssg-rl9-ds.xml" />
+  <xccdf:version time="2026-10-12T00:00:00Z">1</xccdf:version>
+  <xccdf:Profile id="xccdf_com.captainslog_profile_stig_appliance" extends="xccdf_org.ssgproject.content_profile_stig">
+    <xccdf:title>Captain’s Log stig appliance adaptation</xccdf:title>
+    <xccdf:select idref="xccdf_org.ssgproject.content_rule_aide_build_database" selected="false" />
+    <xccdf:select idref="xccdf_org.ssgproject.content_rule_aide_check_audit_tools" selected="false" />
+    <xccdf:select idref="xccdf_org.ssgproject.content_rule_aide_scan_notification" selected="false" />
+    <xccdf:select idref="xccdf_org.ssgproject.content_rule_aide_use_fips_hashes" selected="false" />
+    <xccdf:select idref="xccdf_org.ssgproject.content_rule_aide_verify_acls" selected="false" />
+    <xccdf:select idref="xccdf_org.ssgproject.content_rule_aide_verify_ext_attributes" selected="false" />
+    <xccdf:select idref="xccdf_org.ssgproject.content_rule_configure_crypto_policy" selected="false" />
+    <xccdf:select idref="xccdf_org.ssgproject.content_rule_fips_crypto_subpolicy" selected="false" />
+    <xccdf:select idref="xccdf_org.ssgproject.content_rule_fips_custom_stig_sub_policy" selected="false" />
+    <xccdf:select idref="xccdf_org.ssgproject.content_rule_firewalld_sshd_port_enabled" selected="false" />
+    <xccdf:select idref="xccdf_org.ssgproject.content_rule_service_sshd_enabled" selected="false" />
+    <xccdf:select idref="xccdf_org.ssgproject.content_rule_crypto_policy_not_overridden" selected="false" />
+    <xccdf:select idref="xccdf_org.ssgproject.content_rule_sysctl_net_ipv4_conf_all_forwarding" selected="false" />
+  </xccdf:Profile>
+</xccdf:Tailoring>

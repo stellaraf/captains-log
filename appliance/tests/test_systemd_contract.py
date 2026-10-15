@@ -94,6 +94,16 @@ class StartupContracts(unittest.TestCase):
         self.assertIn("database_in=file:@@{DBDIR}/aide.db.gz\n", config)
         self.assertNotIn("aide --init", installer)
 
+    def test_vendor_only_factory_keeps_os_and_app_updates_without_livepatch_timer(self):
+        installer = (APPLIANCE / 'install-host.sh').read_text()
+        enabled = set()
+        for line in installer.splitlines():
+            if line.startswith('systemctl enable '):
+                enabled.update(line.split()[2:])
+        self.assertIn('nebulalog-os-update.timer', enabled)
+        self.assertIn('nebulalog-app-update.timer', enabled)
+        self.assertNotIn('nebulalog-livepatch.timer', enabled)
+
 
 if __name__ == "__main__":
     unittest.main()

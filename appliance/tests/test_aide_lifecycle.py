@@ -16,7 +16,7 @@ import unittest
 from unittest.mock import patch
 
 from nebulalog_manager import aide, host_job_storage
-from nebulalog_manager.common import Refused, atomic_json
+from nebulalog_manager.common import Refused, atomic_json, locked
 from nebulalog_manager.host_job_storage import StorageIdentity
 
 
@@ -164,6 +164,24 @@ class AideLifecycleTests(unittest.TestCase):
         for path in self.state.rglob("*"):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700 if path.is_dir() else 0o600)
         self.assertEqual(stat.S_IMODE(self.marker.stat().st_mode), 0o600)
+
+    def test_transaction_check_uses_existing_lock_without_reenrolling(self):
+        self.enrolled()
+        original = (self.state / 'aide.db.gz').read_bytes()
+        with locked(self.root / 'manager/transaction.lock') as descriptor:
+            with self.assertRaises(Refused):
+                self.manager.check()
+            result = self.manager.check_for_transaction(descriptor)
+            self.assertEqual(result['state'], 'clean')
+        self.assertEqual((self.state / 'aide.db.gz').read_bytes(), original)
+
+    def test_transaction_check_refuses_unrelated_descriptor(self):
+        self.enrolled()
+        with locked(self.root / 'unrelated.lock') as descriptor:
+            with self.assertRaisesRegex(Refused, 'lock_identity_changed'):
+                self.manager.check_for_transaction(descriptor)
+        with self.assertRaisesRegex(Refused, 'lock_unavailable'):
+            self.manager.check_for_transaction(descriptor)
 
     def test_all_eight_check_results_preserve_the_enrolled_database(self):
         _, receipt = self.enrolled()

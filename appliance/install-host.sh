@@ -6,6 +6,7 @@ set -euo pipefail
 [ "$ID" = rocky ] && [ "${VERSION_ID%%.*}" = 9 ]
 [ "$(cat /proc/sys/crypto/fips_enabled)" = 1 ]
 fips-mode-setup --check
+[ "$(cat /sys/module/module/parameters/sig_enforce)" = Y ]
 [ "$(getenforce)" = Enforcing ]
 APPLIANCE_SOURCE=$(cd "$(dirname "$0")" && pwd)
 # Serialize the complete provisioner and sealer without creating a lock file.
@@ -54,6 +55,10 @@ fi
 install -m 0644 "$APPLIANCE_SOURCE/security/storage.conf" /etc/containers/storage.conf
 install -d -m 0755 /etc/dracut.conf.d
 install -m 0644 "$APPLIANCE_SOURCE/security/dracut-nebulalog.conf" /etc/dracut.conf.d/90-nebulalog.conf
+install -d -m 0755 /usr/share/nebulalog/baselines
+for baseline_file in baseline-catalog.json baseline-cis.xml baseline-stig.xml; do
+  install -m 0644 "$APPLIANCE_SOURCE/security/$baseline_file" "/usr/share/nebulalog/baselines/$baseline_file"
+done
 install -d -m 0755 /usr/share/nebulalog/aide
 install -m 0644 "$APPLIANCE_SOURCE/security/aide-policy.conf" /usr/share/nebulalog/aide/policy.conf
 install -o root -g root -m 0600 "$APPLIANCE_SOURCE/security/aide.conf" /etc/aide.conf

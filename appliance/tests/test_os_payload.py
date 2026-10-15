@@ -1,5 +1,7 @@
 """OS package policy and integrity-chain tests; native RPM proof is separate."""
 import copy
+from contextlib import contextmanager
+from types import SimpleNamespace
 import hashlib
 import json
 from pathlib import Path
@@ -91,6 +93,133 @@ class RpmPolicyTests(unittest.TestCase):
             with self.subTest(report=report,phase=phase),self.assertRaises(Refused):rpm.allowed_integrity_report(report,plan,phase)
 
 
+class NoUpdatesObservationTests(unittest.TestCase):
+    def setUp(self):
+        temporary=tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root=Path(temporary.name)
+        self.stage=self.root / "manager/os-updates/one"
+        self.stage.mkdir(parents=True)
+        self.boot="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        self.journal=self.root / "manager/os-transaction.json"
+        self.latest=self.root / "manager/os-latest.json"
+        self.journal.write_text(json.dumps({"state": "planning", "stage": str(self.stage), "boot_id": self.boot}))
+        self.inventory=["linux-firmware-whence-0:20260804-161.2.el9_8.noarch"]
+        self.runner=Mock(return_value="")
+        self.manager=Mock()
+        self.manager._check_locked.return_value={"state": "clean", "exit_code": 0}
+        original_read=Path.read_text
+        boot=self.boot
+        def read_text(path, *args, **kwargs):
+            if str(path) == "/proc/sys/kernel/random/boot_id":
+                return boot
+            return original_read(path, *args, **kwargs)
+        @contextmanager
+        def coordination(manager):
+            self.assertIs(manager, self.manager)
+            yield self.root / "manager/aide", SimpleNamespace(root=self.root)
+        patches=[patch.object(rpm, 'read', side_effect=lambda path, maximum=rpm.MAX_RPM: Path(path).read_bytes()),
+                 patch.object(rpm, 'inventory', return_value=('fixture XML', [], self.inventory)),
+                 patch.object(Path, 'read_text', read_text),
+                 patch('nebulalog_manager.aide.Aide', return_value=self.manager),
+                 patch.object(aide_updates, '_locked', coordination)]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def prepare(self):
+        result=rpm.prepare(self.stage, {}, runner=self.runner)
+        self.assertEqual(result['status'], 'no_updates')
+        self.journal.write_text(json.dumps({"state": "postcheck", "stage": str(self.stage), "boot_id": self.boot,
+                                           "no_updates": True, "plan_sha256": None}))
+        self.latest.write_text(json.dumps({"state": "prepared", "stage": str(self.stage), "boot_id": self.boot}))
+        return result
+
+    def test_empty_download_can_check_existing_integrity_without_accepting_new_baseline(self):
+        self.prepare()
+        result=rpm.accept_integrity(self.stage, runner=self.runner)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['package']['status'], 'no_updates')
+        self.manager._check_locked.assert_called_once()
+        self.manager.authorized_update_accept.assert_not_called()
+        self.manager.authorized_update_prepare.assert_not_called()
+        self.assertEqual(len(self.runner.call_args_list), 1)
+        command=self.runner.call_args.args[0]
+        self.assertEqual(command[0], '/usr/bin/dnf')
+        self.assertIn('--downloadonly', command)
+        self.assertFalse((self.stage / 'rpm-apply-intent.json').exists())
+
+    def test_changed_inventory_during_download_creates_no_empty_transaction_proof(self):
+        with patch.object(rpm, 'inventory', side_effect=[('before', [], self.inventory), ('after', [], ['other'])]):
+            with self.assertRaisesRegex(Refused, 'inventory_changed_during_download'):
+                rpm.prepare(self.stage, {}, runner=self.runner)
+        self.assertFalse((self.stage / 'os-no-updates.json').exists())
+
+    def test_no_updates_refuses_changed_operation_boot_or_transaction(self):
+        self.prepare()
+        original=self.journal.read_bytes()
+        record=json.loads(original)
+        for changes in ({'stage': '/other'}, {'boot_id': 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'},
+                        {'state': 'planning'}, {'no_updates': False}, {'plan_sha256': 'a'*64}):
+            with self.subTest(changes=changes):
+                self.journal.write_text(json.dumps({**record, **changes}))
+                with self.assertRaisesRegex(Refused, 'operation_binding_changed'):
+                    rpm.accept_integrity(self.stage, runner=self.runner)
+                self.journal.write_bytes(original)
+        operation=self.stage / 'operation.json'
+        value=json.loads(operation.read_text())
+        operation.write_text(json.dumps({**value, 'id': 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'}))
+        with self.assertRaisesRegex(Refused, 'operation_binding_changed'):
+            rpm.accept_integrity(self.stage, runner=self.runner)
+        self.manager._check_locked.assert_not_called()
+
+    def test_changed_current_boot_or_latest_stage_cannot_reuse_observation(self):
+        self.prepare()
+        self.latest.write_text(json.dumps({'stage': '/other', 'boot_id': self.boot}))
+        with self.assertRaisesRegex(Refused, 'operation_binding_changed'):
+            rpm.accept_integrity(self.stage, runner=self.runner)
+        self.latest.write_text(json.dumps({'stage': str(self.stage), 'boot_id': self.boot}))
+        original_read=Path.read_text
+        def different_boot(path, *args, **kwargs):
+            if str(path) == '/proc/sys/kernel/random/boot_id':
+                return 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+            return original_read(path, *args, **kwargs)
+        with patch.object(Path, 'read_text', different_boot), self.assertRaisesRegex(Refused, 'operation_binding_changed'):
+            rpm.accept_integrity(self.stage, runner=self.runner)
+        self.manager._check_locked.assert_not_called()
+
+    def test_empty_transaction_cannot_mask_planned_or_attempted_rpm_mutation(self):
+        self.prepare()
+        for name in ('os-payload-plan.json', 'os-integrity-plan.json', 'rpm-apply-intent.json'):
+            with self.subTest(name=name):
+                path=self.stage / name
+                path.write_text('{}')
+                with self.assertRaisesRegex(Refused, 'conflicts_with_package_transaction'):
+                    rpm.accept_integrity(self.stage, runner=self.runner)
+                path.unlink()
+        self.manager._check_locked.assert_not_called()
+
+    def test_inventory_drift_before_or_during_aide_refuses_without_baseline_replacement(self):
+        self.prepare()
+        with patch.object(rpm, 'inventory', return_value=('changed', [], ['other'])):
+            with self.assertRaisesRegex(Refused, 'package_inventory_changed'):
+                rpm.accept_integrity(self.stage, runner=self.runner)
+        self.manager._check_locked.assert_not_called()
+        with patch.object(rpm, 'inventory', side_effect=[('before', [], self.inventory), ('changed', [], ['other'])]):
+            with self.assertRaisesRegex(Refused, 'package_inventory_changed'):
+                rpm.accept_integrity(self.stage, runner=self.runner)
+        self.manager.authorized_update_accept.assert_not_called()
+
+    def test_integrity_drift_or_unusable_check_cannot_authorize_reboot(self):
+        self.prepare()
+        for result in ({'state': 'differences', 'exit_code': 4}, {'state': 'clean', 'exit_code': 1}, {'state': 'clean'}):
+            with self.subTest(result=result):
+                self.manager._check_locked.return_value=result
+                with self.assertRaisesRegex(Refused, 'integrity_not_clean'):
+                    rpm.accept_integrity(self.stage, runner=self.runner)
+        self.manager.authorized_update_accept.assert_not_called()
+
+
 class OSIntegrityTransitionTests(unittest.TestCase):
     for _name,_value in aide_fixture.AuthorizedAideTests.__dict__.items():
         if not _name.startswith('__') and not _name.startswith('test_'):
@@ -107,6 +236,23 @@ class OSIntegrityTransitionTests(unittest.TestCase):
         self.write_private(self.plan_path,json.dumps(self.plan).encode())
 
     def activate(self):self.runtime.write_bytes(b'new managed\n')
+
+    def test_no_package_reboot_check_preserves_enrolled_baseline_and_rejects_real_fixture_drift(self):
+        self.os_fixture()
+        self.write_private(self.stage / 'os-no-updates.json', b'{}')
+        with patch('nebulalog_manager.aide.Aide', return_value=self.manager), \
+             patch.object(rpm, '_verify_no_updates', return_value={'kind': 'rocky-no-updates-v1'}):
+            self.assertTrue(rpm.accept_integrity(self.stage)['ok'])
+            self.assertEqual((self.state / 'aide.db.gz').read_bytes(), self.initial_db)
+            self.assertEqual(self.scan_calls.count('update'), 0)
+            checks=self.scan_calls.count('check')
+            self.unrelated.write_bytes(b'unrelated drift')
+            with self.assertRaisesRegex(Refused, 'no_updates_integrity_not_clean'):
+                rpm.accept_integrity(self.stage)
+            self.assertEqual(self.scan_calls.count('check'), checks + 1)
+            self.assertEqual((self.state / 'aide.db.gz').read_bytes(), self.initial_db)
+            self.assertEqual(self.scan_calls.count('update'), 0)
+            self.assert_original()
 
     def test_os_payload_uses_retained_aide_update_chain_and_fresh_acceptance(self):
         self.os_fixture();self.prepare_update();self.activate()

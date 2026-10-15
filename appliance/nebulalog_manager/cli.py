@@ -37,6 +37,8 @@ def main(argv=None) -> int:
     up = commands.add_parser("update").add_subparsers(dest="action", required=True)
     up.add_parser("status")
     up.add_parser("history")
+    up.add_parser("livepatch-status", help="Observe the committed kernel patch on this boot without loading it")
+    up.add_parser("livepatch-poll", help="Run the configured automatic kernel livepatch check")
     p = up.add_parser("enroll-trust", help="Enroll an explicitly authenticated publisher public key; never generates a signer")
     p.add_argument("--public-key", type=Path, required=True, help="Root-owned public SPKI PEM input")
     p.add_argument("--expected-spki-sha256", required=True, help="SHA256 obtained through an independently authenticated publisher channel")
@@ -91,6 +93,12 @@ def main(argv=None) -> int:
             manager = updates.UpdateManager()
             if args.action == "status":
                 result = manager.status()
+            elif args.action == "livepatch-status":
+                from . import livepatch
+                result = livepatch.status(manager.state, Path('/etc/nebulalog/release-public.pem'))
+            elif args.action == "livepatch-poll":
+                from . import livepatch
+                result = livepatch.poll_configured(manager.state)
             elif args.action == "history":
                 path = manager.state / "history.jsonl"
                 result = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []

@@ -195,6 +195,7 @@ class StagedSourceTests(unittest.TestCase):
         self.assertIn("$${path}", content)
         self.assertIn("%%{if true}", content)
         self.assertTrue(Path(result["variables"]["appliance_source_directory"]).is_absolute())
+        self.assertEqual(result["variables"]["provenance_directory"], str(self.output.resolve()))
 
     def test_omitted_runtime_file_refuses_incomplete_capture(self):
         (self.root / "appliance/bin/nebulalog-aide").unlink()

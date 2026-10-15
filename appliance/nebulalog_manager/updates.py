@@ -19,7 +19,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 from .common import Refused, atomic_json, audit, locked, require_linux_root, run, trusted_file
 from .update_enrollment import enrolled_key, enrollment_status
-from . import host_activation, host_dispatch, host_payload
+from . import host_activation, host_dispatch, host_payload, livepatch
 
 COMPONENTS = frozenset(("nebulalog", "keycloak", "postgresql", "clickhouse", "scap", "baseline", "host"))
 REQUIRED_CHECKS = frozenset(("api", "web", "clickhouse", "postgresql", "keycloak", "local_auth", "ingestion", "fips", "selinux", "luks", "firewall", "compliance"))
@@ -320,6 +320,7 @@ class UpdateManager:
         require_linux_root()
         trusted_file(public_key)
         with locked(self.state.parent / "transaction.lock"), locked(self.state / "transaction.lock"):
+            livepatch.require_settled(self.state)
             enrolled_key(self.state, public_key)
             transaction = self.status()["transaction"]
             if not transaction or transaction.get("state") not in ("committed", "rolled_back"):
@@ -345,6 +346,7 @@ class UpdateManager:
         require_linux_root()
         trusted_file(public_key)
         with locked(self.state.parent / "transaction.lock"), locked(self.state / "transaction.lock"):
+            livepatch.require_settled(self.state)
             enrolled_key(self.state, public_key)
             status = self.status()
             if status["maintenance_release_pending"]:
@@ -460,6 +462,7 @@ class UpdateManager:
         require_linux_root()
         trusted_file(public_key)
         with locked(self.state.parent / "transaction.lock"), locked(self.state / "transaction.lock"):
+            livepatch.require_settled(self.state)
             enrolled_key(self.state, public_key)
             status = self.status()
             if status["maintenance_release_pending"]:
@@ -503,6 +506,7 @@ class UpdateManager:
         require_linux_root()
         trusted_file(public_key)
         with locked(self.state.parent / "transaction.lock"), locked(self.state / "transaction.lock"):
+            livepatch.require_settled(self.state)
             enrolled_key(self.state, public_key)
             status = self.status()
             transaction = status["transaction"]

@@ -38,9 +38,9 @@ PLATFORM = {"os": "linux", "distribution": "rocky", "major": 9, "architecture": 
 # files require a reviewed catalog change. Customer/trust inputs never belong here.
 MANAGER_MODULES = (
     "__init__.py", "aide.py", "aide_report.py", "aide_updates.py", "backup.py", "baseline.py", "bootstrap.py", "cli.py",
-    "common.py", "console.py", "enrollment.py", "firstboot.py", "github_updates.py", "guest_validation.py",
+    "bootloader.py", "common.py", "console.py", "enrollment.py", "firstboot.py", "github_updates.py", "guest_validation.py",
     "host_activation.py", "host_dispatch.py", "host_identity.py", "host_job_storage.py", "host_jobs.py", "host_operations.py", "host_payload.py",
-    "host_plan_socket.py", "host_plans.py", "image_bundle.py", "image_seal_network.py", "os_payload.py", "os_updates.py",
+    "host_plan_socket.py", "host_plans.py", "image_bundle.py", "image_seal_network.py", "livepatch.py", "os_payload.py", "os_updates.py",
     "publisher_inputs.py", "security.py", "setup_integrity.py", "sizing.py", "status_snapshot.py", "storage.py", "update_enrollment.py", "updates.py",
 )
 ADAPTER_MODULES = ("__init__.py", "auth.py", "cli.py", "commands.py", "host_runtime.py", "lifecycle.py")
@@ -52,13 +52,14 @@ ADAPTER_COMMANDS = ("update-activate", "update-backup", "update-boot-gate", "upd
                     "update-prepare", "update-reboot-abort", "update-reboot-complete", "update-reboot-prepare", "update-rollback")
 UNITS = ("nebulalog-aide.service", "nebulalog-aide.timer", "nebulalog-app-update.service", "nebulalog-app-update.timer",
          "nebulalog-console.service", "nebulalog-edge.service", "nebulalog-firstboot.service",
+         "nebulalog-livepatch.service", "nebulalog-livepatch.timer",
          "nebulalog-maintenance-gate.service", "nebulalog-os-update.service", "nebulalog-os-update.timer",
          "nebulalog-reboot-verify.service", "nebulalog-status.service", "nebulalog-status.timer",
          "nebulalog-storage.service", "nebulalog-storage.timer", "getty@tty1.service.d/50-nebulalog-firstboot.conf")
 QUADLETS = ("nebulalog-api.container.in", "nebulalog-clickhouse.container.in", "nebulalog-ingest.container.in",
             "nebulalog-keycloak.container.in", "nebulalog-postgresql.container.in", "nebulalog.network")
 DEFAULTS = ("90-nebulalog.conf", "90-nebulalog.rules", "aide-policy.conf", "aide.conf", "dracut-nebulalog.conf",
-            "github-updates.json", "storage.conf")
+            "github-updates.json", "storage.conf", "baseline-catalog.json", "baseline-cis.xml", "baseline-stig.xml")
 
 
 def _catalog():

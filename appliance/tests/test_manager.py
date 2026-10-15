@@ -273,6 +273,13 @@ class TransactionTests(unittest.TestCase):
     setUp = SignatureTests.setUp
     sign = SignatureTests.sign
     def setup_manager(self,fail=None):
+        # Exercise the signed fixture within its declared validity interval.
+        # Production expiry checks stay enabled; wall-clock drift must not make
+        # transaction/rollback tests stop before reaching their intended gates.
+        clock = patch("nebulalog_manager.updates.datetime", wraps=datetime)
+        frozen = clock.start()
+        frozen.now.return_value = datetime(2026, 9, 7, tzinfo=timezone.utc)
+        self.addCleanup(clock.stop)
         state=self.path/"state";hooks=self.path/"hooks";hooks.mkdir()
         current={"sequence":1,"version":"0.1.0","components":{name:{"version":version} for name,version in
                  (("nebulalog","0.1.0"),("postgresql","17.11"),("clickhouse","25.3.9.100"),("keycloak","26.7.3"))}}

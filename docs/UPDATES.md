@@ -54,8 +54,43 @@ The local OS adapters enforce enrolled Rocky repository keys, healthy databases,
 
 OS package changes now require all 12 runtime/security checks even when no reboot is needed, or when a reboot must wait. A failed check retains its operation-owned backup and blocks further automatic changes. `nebulalog update os-recover` retries the exact same-boot postcheck operation after the underlying issue or compliance review is resolved; it verifies the retained backup and fresh health, and completes the journal before releasing maintenance. It does not repeat RPM/DNF installation or restore databases/logs. An interrupted apply can recover only if the retained exact package/file result and its AIDE acceptance pass; a partial or unplanned package transaction remains blocked for investigation.
 
+A deferred reboot is checked again at the next maintenance window even if there are no newer RPMs to download. That attempt takes a fresh backup, binds the unchanged package inventory to the current boot, runs an ordinary AIDE check without replacing its baseline, and rechecks runtime health and the maintenance window. A failed package query, unknown reboot hint, or failed health check cannot silently clear the pending reboot.
+
+If the process is interrupted while preparing to reboot, `nebulalog update os-recover` can restore the operation's services on the same boot. It verifies the retained backup and package/AIDE state before starting services, then requires all runtime checks before releasing maintenance. It neither installs packages again nor requests a reboot. A transaction that already requested a reboot follows the separate new-boot completion path; the recovery command cannot reinterpret it as an interrupted preparation.
+
 For an interrupted component transaction, `nebulalog update recover` verifies the retained release signature and transaction, restores through the previous host coordinator, and requires fresh health checks before releasing maintenance. This command can restore configuration and release pins from the interrupted operation; completed transactions use `finalize` instead. Pending OS recovery must finish first. The appliance status publishes the applicable fixed recovery command.
 
 Native x86_64 UEFI/Secure Boot build work is present; tested vTPM enrollment and unattended encrypted-storage reboot on both selected hypervisors remain required. The GitHub transaction also carries compatible management-software generations with exact AIDE renewal; baseline/SCAP policy migrations, checker changes and broad OS package recipes remain separate unfinished work. These are explicit candidate limitations, not accepted all-software update coverage.
 
 The first-boot maintenance configuration, scheduled GitHub delivery, UI status bridge, controlled database migration/rollback and OS kernel reboot still require installed-guest acceptance. The source tests do not change host packages or services. A separate disposable native guest has executed a real signed inert-RPM upgrade and refusal tests; that result does not establish full appliance acceptance.
+
+### Vendor kernel updates and retained live-patch tooling
+
+The October 13, 2026 product decision retains vendor-supplied Rocky kernels.
+Automatic package maintenance and controlled reboots are the release path.
+New factory installations set `automatic_livepatch: false` in
+`/etc/nebulalog/github-updates.json` and do not enable
+`nebulalog-livepatch.timer`. This leaves application `automatic_updates: true`
+and its 15-minute schedule unchanged. Existing installations are not silently
+rewritten; an already enabled live-patch policy requires explicit operator review.
+
+Self-built live-patch tooling is retained for isolated qualification. Its
+disabled-by-default timer, when explicitly enabled with an opted-in policy,
+runs two minutes after boot and at minutes 07, 22, 37 and 52.
+`nebulalog update livepatch-poll` enforces the same policy before network access
+or module loading; `nebulalog update livepatch-status` observes retained state
+and the current kernel without loading a module.
+
+A committed patch is reauthenticated and reapplied to the identical kernel on a
+new boot before contacting GitHub. The feed uses the exact tag
+`livepatch-<kernel-release>` and requires signed metadata and matching artifacts.
+Publish these releases with `make_latest=false` so they do not replace the
+application release channel. A missing publication means no published patch,
+not security coverage. A saved sequence alone never proves an active patch.
+Interrupted loads require recovery; automation does not force a transition,
+unload a patch, bypass failing FIPS checks, or enroll an untrusted module signer.
+
+The retained timer and transaction integration have source tests, but they are
+not an enabled release feature or a substitute for the vendor kernel update
+tests. A qualification marker patch is not a security fix. Reintroducing live
+patching would require an explicit scope decision and native qualification.

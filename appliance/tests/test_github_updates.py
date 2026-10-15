@@ -210,7 +210,7 @@ class PolicyTests(unittest.TestCase):
 
     def test_unknown_fields_and_wrong_types_or_cadence_refused(self):
         for fields in ({"schema": True}, {"poll_interval_seconds": 900.0}, {"poll_interval_seconds": 86400},
-                       {"automatic_updates": 1}, {"download_url": "https://evil.invalid"},
+                       {"automatic_updates": 1}, {"automatic_livepatch": 1}, {"download_url": "https://evil.invalid"},
                        {"repository": "stellaraf/captains-log.git"}, {"repository": "stellaraf/../private"},
                        {"repository": "https://github.com/stellaraf/captains-log"}):
             with self.subTest(fields=fields), self.assertRaises(Refused):
@@ -466,9 +466,18 @@ class PollTests(unittest.TestCase):
 
 
 class ScheduleTests(unittest.TestCase):
+    def test_livepatch_schedule_uses_versioned_cli_and_enrollment_gate(self):
+        timer = unit(APPLIANCE / 'systemd/nebulalog-livepatch.timer')
+        self.assertEqual(timer[('Timer', 'OnBootSec')], ['2min'])
+        self.assertEqual(timer[('Timer', 'OnCalendar')], ['*-*-* *:07/15:00'])
+        service = unit(APPLIANCE / 'systemd/nebulalog-livepatch.service')
+        self.assertEqual(service[('Service', 'ExecStart')], ['/usr/bin/python3 -I -B /usr/libexec/nebulalog/host-boot nebulalog update livepatch-poll'])
+        self.assertIn('/etc/nebulalog/configured', words(service, 'Unit', 'ConditionPathExists'))
+        self.assertIn('nebulalog-reboot-verify.service', words(service, 'Unit', 'After'))
+
     def test_installed_policy_and_timer_check_every_quarter_hour(self):
         policy = json.loads((APPLIANCE / "security/github-updates.json").read_text())
-        self.assertEqual(policy, {"schema": 1, "repository": "stellaraf/captains-log", "automatic_updates": True, "poll_interval_seconds": 900})
+        self.assertEqual(policy, {"schema": 1, "repository": "stellaraf/captains-log", "automatic_updates": True, "automatic_livepatch": False, "poll_interval_seconds": 900})
         timer = unit(APPLIANCE / "systemd/nebulalog-app-update.timer")
         self.assertEqual(timer[("Timer", "OnCalendar")], ["*-*-* *:00/15:00"])
         self.assertEqual(timer[("Timer", "Persistent")], ["true"])

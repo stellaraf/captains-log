@@ -1,0 +1,12 @@
+[Unit]
+Description=Verify and apply Captain's Log kernel live patches
+RequiresMountsFor=/var/lib/nebulalog
+After=network-online.target nebulalog-firstboot.service nebulalog-reboot-verify.service
+Wants=network-online.target
+ConditionPathExists=/etc/nebulalog/configured
+ConditionPathExists=/etc/nebulalog/github-updates.json
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /usr/libexec/nebulalog/host-boot nebulalog update livepatch-poll
+TimeoutStartSec=2h
+UMask=0077

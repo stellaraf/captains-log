@@ -142,7 +142,14 @@ class UploadPreparationTests(unittest.TestCase):
         for variable, target in (("appliance_source_directory", NAMES[0]), ("image_bundle_directory", NAMES[1])):
             expected = 'source      = "${var.' + variable + '}/"\n    destination = "/tmp/' + target + '"'
             self.assertIn(expected, RECIPE)
-        self.assertEqual(RECIPE.count('provisioner "file"'), 3)
+        self.assertEqual(RECIPE.count('provisioner "file"'), 5)
+        for name in ('initial-release.json', 'source-manifest.json'):
+            source = 'source      = "${var.provenance_directory}/' + name + '"'
+            self.assertIn(source, RECIPE)
+            self.assertIn('destination = "/tmp/nebulalog-image-bundle/' + name + '"', RECIPE)
+            self.assertLess(RECIPE.index(source), RECIPE.index('sudo /bin/bash /tmp/nebulalog-appliance/install-host.sh'))
+        declaration = RECIPE.split('variable "provenance_directory" {', 1)[1].split('}', 1)[0]
+        self.assertNotIn('default', declaration)
         self.assertIn('sudo /bin/bash /tmp/nebulalog-appliance/install-host.sh', RECIPE)
 
 

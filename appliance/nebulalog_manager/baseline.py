@@ -1,4 +1,4 @@
-"""Installation-bound SCAP evidence and explicit review; never auto-remediate."""
+"""Installation-bound SCAP assessment, initial hardening and explicit review."""
 from __future__ import annotations
 
 import argparse
@@ -15,7 +15,7 @@ import uuid
 import xml.etree.ElementTree as ET
 
 from . import security
-from .common import Refused, atomic_json, audit, locked, require_linux_root, run, trusted_file
+from .common import CommandFailed, Refused, atomic_json, audit, locked, require_linux_root, run, trusted_file
 
 CONFIGURATION = Path("/var/lib/nebulalog/configuration")
 CONTENT = Path("/usr/share/xml/scap/ssg/content")
@@ -118,6 +118,25 @@ def _content(path, runner):
     root = _xml(path)
     profiles = []
     benchmarks = []
+    value_selectors = {}
+    for node in root.iter():
+        if node.tag != "{http://checklists.nist.gov/xccdf/1.2}Value":
+            continue
+        identifier = node.get("id")
+        if not identifier or identifier in value_selectors:
+            raise Refused("SCAP values must have unique identifiers")
+        selectors = [child.get("selector") for child in node
+                     if child.tag == "{http://checklists.nist.gov/xccdf/1.2}value" and child.get("selector") is not None]
+        if len(selectors) != len(set(selectors)):
+            raise Refused("SCAP value selectors must be unambiguous")
+        value_selectors[identifier] = selectors
+    group_rules = {}
+    ns = "{http://checklists.nist.gov/xccdf/1.2}"
+    for group in root.iter(ns + "Group"):
+        identifier = group.get("id")
+        if not identifier or identifier in group_rules:
+            raise Refused("SCAP groups must have unique identifiers")
+        group_rules[identifier] = sorted({node.get("id") for node in group.iter(ns + "Rule") if node.get("id")})
     rule_ids = sorted({node.get("id") for node in root.iter() if _local(node) == "Rule" and node.get("id")})
     cpes = sorted({value for node in root.iter() for value in node.attrib.values() if value.startswith(("cpe:/", "cpe:2.3:"))})
     for node in root.iter():
@@ -138,7 +157,7 @@ def _content(path, runner):
                          "references": [{"href": child.get("href"), "text": " ".join(child.itertext()).strip()} for child in node if _local(child) == "reference"]})
     if not profiles or _sha(path) != digest:
         raise Refused("SCAP content is empty or changed during inventory")
-    return {"path": str(path), "sha256": digest, "profiles": profiles, "benchmarks": benchmarks, "platform_cpes": cpes, "rule_ids": rule_ids,
+    return {"path": str(path), "sha256": digest, "profiles": profiles, "benchmarks": benchmarks, "platform_cpes": cpes, "rule_ids": rule_ids, "group_rules": group_rules, "value_selectors": value_selectors,
             "rocky9_cpe_present": "cpe:/o:rocky:rocky:9" in cpes,
             "oscap_info": info, "qualification": "unreviewed candidate; profile presence does not establish coverage or compliance"}
 
@@ -173,6 +192,174 @@ def _review_attestation(value, now):
         raise Refused("Content review is expired, future-dated, or longer than one year")
 
 
+def validate_tailoring(item, content=None, runner=run):
+    """Bind one effective profile to its reviewed base and explicit rule decisions.
+
+    Rule selections and existing named value selectors require exact decisions.
+    Group enablement requires its complete descendant inventory. Free-form values,
+    group disabling, extra profiles and embedded checks/fixes are refused.
+    """
+    content = content or _content(item["datastream"], runner)
+    path = item.get("tailoring", "")
+    digest = item.get("tailoring_sha256", "")
+    if not SHA256.fullmatch(str(digest)) or _sha(path) != digest:
+        raise Refused("Tailoring hash is missing or changed")
+    root = _xml(path)
+    ns = "{http://checklists.nist.gov/xccdf/1.2}"
+    if root.tag != ns + "Tailoring":
+        raise Refused("Expected an XCCDF 1.2 Tailoring document")
+    allowed = {ns + name for name in ("benchmark", "version", "Profile")}
+    if any(child.tag not in allowed for child in root):
+        raise Refused("Unsupported tailoring document element")
+    benchmarks = root.findall(ns + "benchmark")
+    profiles = root.findall(ns + "Profile")
+    if len(benchmarks) != 1 or benchmarks[0].attrib != {"href": Path(item["datastream"]).name}:
+        raise Refused("Tailoring must bind the local datastream filename")
+    if len(profiles) != 1:
+        raise Refused("Tailoring must contain exactly one effective profile")
+    profile = profiles[0]
+    base = item.get("base_profile_id")
+    if base not in {p["id"] for p in content["profiles"]}:
+        raise Refused("Tailoring base profile is absent from the pinned datastream")
+    effective = item.get("profile_id", "")
+    if (not effective.startswith("xccdf_") or effective in {p["id"] for p in content["profiles"]}
+            or profile.attrib != {"id": effective, "extends": base}):
+        raise Refused("Tailoring effective profile must explicitly extend the selected base")
+    decisions = item.get("tailoring_decisions")
+    values = item.get("tailoring_values", [])
+    groups = item.get("tailoring_groups", [])
+    if not isinstance(decisions, list) or not isinstance(values, list) or not isinstance(groups, list) or not (decisions or values or groups):
+        raise Refused("Tailoring requires explicit reviewed rule or value decisions")
+    expected = {}
+    for decision in decisions:
+        if not isinstance(decision, dict) or decision.get("rule_id") not in content["rule_ids"] or type(decision.get("selected")) is not bool:
+            raise Refused("Tailoring decision references an invalid rule or selection")
+        rule = decision["rule_id"]
+        if rule in expected:
+            raise Refused("Duplicate tailoring decision")
+        _text(decision.get("rationale"), 8)
+        _text(decision.get("effective_control"), 8)
+        expected[rule] = "true" if decision["selected"] else "false"
+    for decision in groups:
+        if not isinstance(decision, dict):
+            raise Refused("Invalid tailoring group decision")
+        identifier = decision.get("group_id")
+        if not isinstance(identifier, str):
+            raise Refused("Invalid tailoring group identifier")
+        descendants = content.get("group_rules", {}).get(identifier)
+        if (not descendants or identifier in content["rule_ids"] or identifier in expected
+                or decision.get("selected") is not True or decision.get("affected_rules") != descendants):
+            raise Refused("Group enablement requires its exact complete rule inventory; disabling groups is refused")
+        _text(decision.get("rationale"), 8)
+        _text(decision.get("effective_control"), 8)
+        expected[identifier] = "true"
+    expected_values = {}
+    for decision in values:
+        if not isinstance(decision, dict):
+            raise Refused("Invalid tailoring value decision")
+        identifier, selector = decision.get("value_id"), decision.get("selector")
+        if (not isinstance(identifier, str) or not isinstance(selector, str)
+                or selector not in content["value_selectors"].get(identifier, [])):
+            raise Refused("Tailoring value must select an existing named source value")
+        if identifier in expected_values:
+            raise Refused("Duplicate tailoring value decision")
+        _text(decision.get("rationale"), 8)
+        expected_values[identifier] = selector
+    actual, actual_values = {}, {}
+    for child in profile:
+        if child.tag in (ns + "title", ns + "description") and not list(child):
+            continue
+        if child.tag == ns + "refine-value":
+            if set(child.attrib) != {"idref", "selector"} or list(child) or child.get("idref") in actual_values:
+                raise Refused("Invalid or duplicate tailoring value selection")
+            actual_values[child.get("idref")] = child.get("selector")
+            continue
+        if child.tag != ns + "select" or set(child.attrib) != {"idref", "selected"} or list(child):
+            raise Refused("Only reviewed rules, group enablement and named values are supported in tailoring")
+        rule = child.get("idref")
+        if rule in actual:
+            raise Refused("Duplicate tailoring selection")
+        actual[rule] = child.get("selected")
+    if actual != expected or actual_values != expected_values or _sha(path) != digest:
+        raise Refused("Tailoring does not match its reviewed rule decisions")
+    return path
+
+
+def _mapping_rules(path, profile_id, overrides=None):
+    """Inventory explicit rule/group selection before appliance exceptions.
+
+    This is not a general XCCDF resolver: inherited items and cluster selectors
+    require resolved content and are refused instead of silently omitting rules.
+    A rule participates only when it and every containing group are selected.
+    """
+    ns = "{http://checklists.nist.gov/xccdf/1.2}"
+    root = _xml(path)
+    benchmarks = [n for n in root.iter(ns + "Benchmark")
+                  if any(c.tag == ns + "Profile" and c.get("id") == profile_id for c in n)]
+    if len(benchmarks) != 1:
+        raise Refused("Unified coverage requires one unambiguous benchmark")
+    benchmark = benchmarks[0]
+    profile = next(c for c in benchmark if c.tag == ns + "Profile" and c.get("id") == profile_id)
+    if profile.get("extends") or profile.get("abstract", "false") not in ("false", "0"):
+        raise Refused("Unified coverage requires a resolved nonabstract profile")
+    selected, rules = {}, {}
+    parents = {child: parent for parent in benchmark.iter() for child in parent}
+    for node in benchmark.iter():
+        if node.tag not in (ns + "Rule", ns + "Group"):
+            continue
+        identifier, enabled = node.get("id"), node.get("selected", "true")
+        if not identifier or identifier in selected or node.get("extends") or enabled not in ("true", "false", "1", "0"):
+            raise Refused("Unified coverage requires unique resolved rules and groups")
+        selected[identifier] = enabled in ("true", "1")
+        if node.tag == ns + "Rule":
+            rules[identifier] = node
+    seen = set()
+    for choice in profile:
+        if choice.tag != ns + "select":
+            continue
+        identifier, enabled = choice.get("idref"), choice.get("selected")
+        if identifier not in selected or identifier in seen or enabled not in ("true", "false", "1", "0"):
+            raise Refused("Unified coverage requires explicit unambiguous rule/group selections")
+        seen.add(identifier)
+        selected[identifier] = enabled in ("true", "1")
+    for identifier, enabled in (overrides or {}).items():
+        if identifier not in selected or type(enabled) is not bool:
+            raise Refused("Unified effective selection references an unknown item")
+        selected[identifier] = enabled
+    result = set()
+    for identifier, node in rules.items():
+        enabled = selected[identifier]
+        parent = parents.get(node)
+        while parent is not None:
+            if parent.tag == ns + "Group":
+                enabled = enabled and selected[parent.get("id")]
+            parent = parents.get(parent)
+        if enabled:
+            result.add(identifier)
+    if not result:
+        raise Refused("Unified coverage cannot use an empty baseline")
+    return result
+
+
+def assessment_binding(item):
+    """Bind source and effective semantics independently of console acceptance.
+
+    A profile ID is reusable when tailoring changes. The coverage reviewer must
+    therefore approve the exact tailoring bytes and all recorded decisions, not
+    just the source datastream and that label. Per-installation reviewer names,
+    timestamps and absolute file paths are intentionally not selection identity.
+    """
+    selections = {key: sorted(item.get(key, []), key=lambda d: d[identifier])
+                  for key, identifier in (("tailoring_decisions", "rule_id"),
+                                          ("tailoring_values", "value_id"),
+                                          ("tailoring_groups", "group_id"))}
+    raw = json.dumps(selections, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    return {"sha256": item["sha256"], "profile_id": item["profile_id"],
+            "base_profile_id": item.get("base_profile_id", item["profile_id"]),
+            "tailoring_sha256": item.get("tailoring_sha256"),
+            "selection_sha256": hashlib.sha256(raw).hexdigest()}
+
+
 def validate_policy(policy, runner=run, now=None):
     now = now or _now()
     if not isinstance(policy, dict) or policy.get("schema") != 1 or policy.get("baseline") not in security.BASELINES:
@@ -189,15 +376,18 @@ def validate_policy(policy, runner=run, now=None):
         _text(item.get("source_url"), 8)
         _text(item.get("content_revision"), 1)
         content = _content(item.get("datastream", ""), runner)
-        rules_by_kind[item["kind"]] = set(content["rule_ids"])
+        rules_by_kind[item["kind"]] = (_mapping_rules(item["datastream"], item.get("base_profile_id", item["profile_id"]))
+                                           if policy["baseline"] == "unified" else set(content["rule_ids"]))
         if content["sha256"] != item.get("sha256") or not content["rocky9_cpe_present"]:
             raise Refused("Reviewed datastream hash or native Rocky9 platform declaration is missing")
-        matches = [p for p in content["profiles"] if p["id"] == item.get("profile_id")]
+        matches = [p for p in content["profiles"] if p["id"] == item.get("base_profile_id", item.get("profile_id"))]
         intent = "cis-level2" if item["kind"] == "cis" else "stig"
         if len(matches) != 1 or intent not in matches[0]["candidate_for"]:
             raise Refused("Choose the actual installed CIS Level 2 Server or STIG profile; profile IDs are not inferred")
         if item.get("tailoring") or item.get("tailoring_sha256"):
-            raise Refused("Tailored profile assessment is unavailable until the scanner supports explicit base/effective profile validation")
+            validate_tailoring(item, content, runner)
+        elif item.get("base_profile_id") or item.get("tailoring_decisions") or item.get("tailoring_values") or item.get("tailoring_groups"):
+            raise Refused("Base profile and decisions require an explicit tailoring document")
     if policy["baseline"] == "unified":
         mapping = policy.get("unified_mapping", {})
         if not isinstance(mapping, dict) or not SHA256.fullmatch(str(mapping.get("sha256", ""))) or _sha(mapping.get("path", "")) != mapping["sha256"]:
@@ -206,10 +396,11 @@ def validate_policy(policy, runner=run, now=None):
         _review_attestation(register.get("review"), now)
         if register.get("schema") != 1 or register.get("baseline") != "unified" or register.get("coverage_reviewed") is not True or not isinstance(register.get("controls"), list) or not 1 <= len(register["controls"]) <= 10000:
             raise Refused("Unified mapping must explicitly review coverage and record control decisions")
-        expected = {p["kind"]: {"sha256": p["sha256"], "profile_id": p["profile_id"]} for p in assessments}
+        expected = {p["kind"]: assessment_binding(p) for p in assessments}
         if register.get("assessments") != expected:
             raise Refused("Unified mapping does not match the selected benchmark content")
         controls, pairs = set(), set()
+        covered = {kind: set() for kind in required}
         for control in register["controls"]:
             if not isinstance(control, dict) or control.get("decision") not in ("same-once", "stricter-compatible", "direct-conflict", "application-exception", "cis-only", "stig-only"):
                 raise Refused("Unified control mapping has an invalid decision")
@@ -222,12 +413,187 @@ def validate_policy(policy, runner=run, now=None):
             pairs.add(pair)
             for kind, identifier in zip(("cis", "stig"), pair):
                 if identifier is not None and identifier not in rules_by_kind[kind]:
-                    raise Refused("Unified mapping references a rule absent from the reviewed benchmark")
+                    raise Refused("Unified mapping references a rule not selected by the original reviewed benchmark")
+                if identifier is not None:
+                    if identifier in covered[kind]:
+                        raise Refused("Unified mapping repeats a benchmark rule across decisions")
+                    covered[kind].add(identifier)
             if (control["decision"] == "cis-only" and (not pair[0] or pair[1] is not None) or
                 control["decision"] == "stig-only" and (not pair[1] or pair[0] is not None) or
                 control["decision"] in ("same-once", "stricter-compatible", "direct-conflict") and not all(pair)):
                 raise Refused("Unified mapping decision does not match its rule references")
+        if covered != rules_by_kind:
+            raise Refused("Unified mapping must cover every selected original benchmark rule, including exceptions")
+        if policy.get("unified_remediation") is not None:
+            item = policy["unified_remediation"]
+            # Reuse full source, review, base/effective and tailoring validation.
+            validate_policy({"schema": 1, "baseline": "stig", "assessments": [item]}, runner, now)
+            stig = next(p for p in assessments if p["kind"] == "stig")
+            if (not item.get("tailoring") or item.get("base_profile_id") != stig.get("base_profile_id", stig["profile_id"])
+                    or any(p["sha256"] != item["sha256"] for p in assessments)):
+                raise Refused("Unified remediation requires one shared datastream and an explicit merged STIG-derived profile")
+            binding = {key: item[key] for key in ("sha256", "profile_id", "tailoring_sha256")}
+            if register.get("remediation") != binding:
+                raise Refused("Unified conflict register does not bind the exact merged remediation")
+            applied = set()
+            for control in register["controls"]:
+                if "applied_rule" not in control:
+                    raise Refused("Unified remediation needs an applied rule or explicit exception for every decision")
+                rule = control["applied_rule"]
+                if rule is None:
+                    if control["decision"] != "application-exception":
+                        raise Refused("Only an explicit application exception may omit remediation")
+                elif not isinstance(rule, str) or rule not in (control.get("cis_rule"), control.get("stig_rule")):
+                    raise Refused("Unified applied rule must belong to its reviewed control pair")
+                else:
+                    applied.add(rule)
+            overrides = {d["rule_id"]: d["selected"] for d in item["tailoring_decisions"]}
+            overrides.update({d["group_id"]: d["selected"] for d in item.get("tailoring_groups", [])})
+            effective = _mapping_rules(item["datastream"], item["base_profile_id"], overrides)
+            if effective != applied:
+                raise Refused("Unified effective profile differs from its complete applied-rule register")
+            _validate_unified_values(assessments, item, register)
+    elif policy.get("unified_remediation") is not None:
+        raise Refused("Merged remediation is only valid for a Unified policy")
     return policy
+
+
+def _profile_values(path, profile_id, overrides=None):
+    """Resolve existing named values without inferring which is more secure."""
+    ns = "{http://checklists.nist.gov/xccdf/1.2}"
+    root = _xml(path)
+    profiles = [p for p in root.iter(ns + "Profile") if p.get("id") == profile_id]
+    if len(profiles) != 1 or profiles[0].get("extends"):
+        raise Refused("Unified values require one resolved source profile")
+    values, choices = {}, {}
+    for node in root.iter(ns + "Value"):
+        identifier = node.get("id")
+        options = [c for c in node if c.tag == ns + "value"]
+        selectors = [c.get("selector") for c in options]
+        if not identifier or identifier in values or len(selectors) != len(set(selectors)) or selectors.count(None) != 1:
+            raise Refused("Unified values require unique source values and one default")
+        values[identifier] = {c.get("selector"): "".join(c.itertext()) for c in options}
+        choices[identifier] = None
+    selected = set()
+    for child in profiles[0]:
+        if child.tag == ns + "set-value":
+            raise Refused("Unified source profiles must use existing named values")
+        if child.tag != ns + "refine-value":
+            continue
+        identifier, selector = child.get("idref"), child.get("selector")
+        if (set(child.attrib) != {"idref", "selector"} or list(child)
+                or identifier in selected or selector not in values.get(identifier, {})):
+            raise Refused("Unified source value selection is unknown or ambiguous")
+        selected.add(identifier)
+        choices[identifier] = selector
+    for identifier, selector in (overrides or {}).items():
+        if identifier not in values or selector not in values[identifier]:
+            raise Refused("Unified value override is not an existing source choice")
+        choices[identifier] = selector
+    return {key: {"selector": choice, "value": values[key][choice]} for key, choice in choices.items()}
+
+
+def unified_value_conflicts(assessments):
+    """Inventory original benchmark differences, before appliance tailoring."""
+    if len(assessments) != 2 or {p.get("kind") for p in assessments} != {"cis", "stig"}:
+        raise Refused("Unified values require one CIS and one STIG assessment")
+    if len({p.get("sha256") for p in assessments}) != 1:
+        raise Refused("Unified values require the same pinned datastream")
+    for item in assessments:
+        if _sha(item["datastream"]) != item["sha256"]:
+            raise Refused("Unified value source changed from its pinned hash")
+    values = {p["kind"]: _profile_values(p["datastream"], p.get("base_profile_id", p["profile_id"])) for p in assessments}
+    for item in assessments:
+        if _sha(item["datastream"]) != item["sha256"]:
+            raise Refused("Unified value source changed during conflict inventory")
+    if set(values["cis"]) != set(values["stig"]):
+        raise Refused("Unified benchmarks have different source value inventories")
+    return {key: {kind: values[kind][key] for kind in ("cis", "stig")}
+            for key in sorted(values["cis"]) if values["cis"][key]["value"] != values["stig"][key]["value"]}
+
+
+def _validate_unified_values(assessments, remediation, register):
+    conflicts = unified_value_conflicts(assessments)
+    decisions = register.get("value_decisions", [])
+    if not isinstance(decisions, list):
+        raise Refused("Unified value conflicts require an explicit decision list")
+    overrides = {d["value_id"]: d["selector"] for d in remediation.get("tailoring_values", [])}
+    effective = _profile_values(remediation["datastream"], remediation["base_profile_id"], overrides)
+    seen = set()
+    for decision in decisions:
+        if not isinstance(decision, dict):
+            raise Refused("Unified value decision is invalid")
+        identifier = decision.get("value_id")
+        if (not isinstance(identifier, str) or identifier not in conflicts or identifier in seen
+                or decision.get("choices") != conflicts[identifier]
+                or decision.get("decision") not in ("stricter-compatible", "direct-conflict", "application-exception")
+                or decision.get("effective") != effective[identifier]):
+            raise Refused("Unified value decision must bind its source choices and exact effective value")
+        _text(decision.get("rationale"), 8)
+        seen.add(identifier)
+    if seen != set(conflicts):
+        raise Refused("Unified mapping must resolve every original benchmark value conflict")
+
+
+def factory_directory():
+    generation_defaults = Path(__file__).resolve().parents[2] / "share/defaults"
+    if generation_defaults.is_dir():
+        return generation_defaults
+    return Path("/usr/share/nebulalog/baselines")
+
+
+def factory_profile(baseline, directory=None):
+    """Read a shipped candidate, without inventing operator or compliance approval."""
+    directory = _directory(directory or factory_directory())
+    catalog = _json(directory / "baseline-catalog.json")
+    if catalog.get("schema") != 1 or baseline not in ("cis-level2", "stig", "unified"):
+        raise Refused("Bundled unified hardening requires a completed conflict mapping")
+    profile = catalog.get("profiles", {}).get(baseline)
+    if baseline == "unified" and not isinstance(profile, dict):
+        raise Refused("Bundled unified hardening requires a completed conflict mapping")
+    if not isinstance(profile, dict):
+        raise Refused("The selected bundled baseline is unavailable")
+    expected = "baseline-" + ("cis" if baseline == "cis-level2" else baseline) + ".xml"
+    if profile.get("tailoring_file") != expected:
+        raise Refused("Bundled tailoring must use its fixed local filename")
+    if baseline == "unified":
+        if (profile.get("kind") != "stig" or profile.get("mapping_file") != "baseline-unified-mapping.json"
+                or not SHA256.fullmatch(str(profile.get("mapping_sha256", "")))
+                or _sha(directory / profile["mapping_file"]) != profile["mapping_sha256"]):
+            raise Refused("Bundled unified hardening requires its exact hashed conflict mapping")
+    return catalog, profile, directory / expected
+
+
+def factory_policy(baseline, reviewer, directory=None, runner=run, now=None, expected_catalog=None):
+    """Create content acceptance after the console operator reviews the candidate.
+
+    This accepts exact content for assessment/remediation, never its findings.
+    Final per-installation compliance review remains a separate required action.
+    """
+    now = now or _now()
+    _text(reviewer, 3, 200)
+    catalog, profile, tailoring = factory_profile(baseline, directory)
+    if expected_catalog is not None and catalog != expected_catalog:
+        raise Refused("Bundled baseline changed after content was displayed; review it again")
+    review = {"approved": True, "reviewer": "Initial-console operator: " + reviewer,
+              "platform_basis": catalog["platform_basis"], "benchmark_basis": profile["benchmark_basis"],
+              "license_basis": catalog["license_basis"], "reviewed_at": now.isoformat(),
+              "expires_at": (now + timedelta(days=90)).isoformat()}
+    item = {key: catalog[key] for key in ("datastream", "sha256", "source_url", "content_revision")}
+    item.update({key: profile[key] for key in ("kind", "base_profile_id", "profile_id", "tailoring_sha256", "tailoring_decisions")})
+    for optional in ("tailoring_values", "tailoring_groups"):
+        if profile.get(optional):
+            item[optional] = profile[optional]
+    item.update(platform="rocky9", reviewed=True, content_review=review, tailoring=str(tailoring))
+    policy = {"schema": 1, "baseline": baseline, "assessments": [item]}
+    if baseline == "unified":
+        # The operator accepts packaged content; this never creates or renews
+        # the separate publisher's semantic coverage/conflict review.
+        policy.update(assessments=[factory_policy(kind, reviewer, directory, runner, now, catalog)["assessments"][0]
+                                   for kind in ("cis-level2", "stig")],
+                      unified_remediation=item,
+                      unified_mapping={"path": str(directory / profile["mapping_file"]), "sha256": profile["mapping_sha256"]})
+    return validate_policy(policy, runner, now)
 
 
 def _host(runner):
@@ -265,6 +631,30 @@ def rule_results(path, profile_id):
             raise Refused("Repeated XCCDF rule instances require an instance-aware review adapter")
         rules.append({"rule_id": identifier, "result": result[0]})
     return rules
+
+
+@contextmanager
+def initial_hardening(configuration, installation_id, baseline):
+    """Serialize with firstboot/AIDE and permit mutation only before enrollment."""
+    from .firstboot import FirstBoot
+    manager = FirstBoot()
+    if Path(configuration) != manager.paths.data / "configuration":
+        raise Refused("Initial hardening requires the installed encrypted configuration")
+    _directory(manager.paths.data / "manager")
+    with locked(manager.paths.data / "manager/transaction.lock"), locked(manager.paths.bootstrap / "firstboot.lock"), locked(configuration / "bootstrap/runtime.lock"):
+        gate = manager.gate()
+        setup = _json(configuration / "bootstrap/setup.json")
+        if setup.get("installation_id") != installation_id or gate.get("installation_id") != installation_id or setup.get("baseline") != baseline:
+            raise Refused("Initial hardening belongs to another installation")
+        if (manager.paths.etc / "configured").exists() or (manager.paths.etc / "configured").is_symlink():
+            raise Refused("Initial hardening cannot run on a completed appliance")
+        # Never silently invalidate an enrolled integrity baseline. Subsequent
+        # policy migrations need the normal authorized lifecycle workflow.
+        for name in ("aide-enrollment.json", "aide"):
+            path = manager.paths.data / "manager" / name
+            if path.exists() or path.is_symlink():
+                raise Refused("Apply initial hardening before starting file-integrity enrollment")
+        yield
 
 
 class Baseline:
@@ -311,6 +701,100 @@ class Baseline:
                   baseline=baseline, policy_sha256=_sha(self.policy_path))
             return {"baseline": baseline, "policy_sha256": _sha(self.policy_path), "assessment_status": "pending", "review_status": "pending"}
 
+    def remediate(self, installation_id, baseline, confirmation):
+        """Apply one reviewed effective profile, retaining an unapproved receipt.
+
+        Remediation output is not a compliance scan: OpenSCAP can emit multiple
+        TestResults and `fixed` statuses. A separate scan/review remains required.
+        """
+        from .bootloader import remediation_checkpoint, accept_remediation
+        require_linux_root()
+        _directory(self.configuration)
+        with initial_hardening(self.configuration, installation_id, baseline), locked(self.configuration / "baseline.lock"):
+            if not SHA256.fullmatch(confirmation) or _sha(self.policy_path) != confirmation:
+                raise Refused("Selected hardening policy changed since confirmation")
+            policy = validate_policy(_json(self.policy_path), self.runner, self.clock())
+            if policy.get("installation_id") != installation_id or policy["baseline"] != baseline:
+                raise Refused("Selected policy belongs to another installation or baseline")
+            if baseline == "unified" and not policy.get("unified_remediation"):
+                raise Refused("Unified remediation requires an executable reviewed conflict mapping; sequential profiles are not equivalent")
+            before = self.host(self.runner)
+            if before.get("host_controls_ok") is not True:
+                raise Refused("Initial hardening requires healthy host security controls")
+            bootloader_state = self.configuration / "bootstrap"
+            bootloader_checkpoint = remediation_checkpoint(bootloader_state, installation_id)
+            profile = policy["unified_remediation"] if baseline == "unified" else policy["assessments"][0]
+            output = _directory(self.configuration / "baseline-remediations" / uuid.uuid4().hex, create=True)
+            content = output / "inputs" / Path(profile["datastream"]).name
+            content.parent.mkdir(mode=0o700)
+            content.write_bytes(trusted_file(Path(profile["datastream"])).read_bytes())
+            content.chmod(0o600)
+            if _sha(content) != profile["sha256"]:
+                raise Refused("Hardening content changed while capturing immutable input")
+            tailoring = None
+            if profile.get("tailoring"):
+                tailoring = content.parent / "tailoring.xml"
+                if tailoring == content:
+                    raise Refused("Tailoring and content filenames collide")
+                tailoring.write_bytes(trusted_file(Path(profile["tailoring"])).read_bytes())
+                tailoring.chmod(0o600)
+                captured = dict(profile, datastream=str(content), tailoring=str(tailoring))
+                validate_tailoring(captured, runner=self.runner)
+            atomic_json(output / "policy.json", policy)
+            if baseline == "unified":
+                mapping = output / "unified-mapping.json"
+                mapping.write_bytes(trusted_file(Path(policy["unified_mapping"]["path"])).read_bytes())
+                mapping.chmod(0o600)
+                if _sha(mapping) != policy["unified_mapping"]["sha256"]:
+                    raise Refused("Unified mapping changed while capturing remediation inputs")
+            record = {"schema": 1, "installation_id": installation_id, "baseline": baseline,
+                      "policy_sha256": confirmation, "content_sha256": profile["sha256"],
+                      "profile_id": profile["profile_id"], "tailoring_sha256": profile.get("tailoring_sha256"), "state": "running",
+                      "unified_mapping_sha256": policy.get("unified_mapping", {}).get("sha256"),
+                      "started_at": self.clock().isoformat(), "provenance": before,
+                      "assessment_required": True, "review_required": True}
+            atomic_json(output / "remediation.json", record)
+            # Invalidate any prior assessment before the first host mutation.
+            atomic_json(self.attempt_path, {"state": "remediation_pending", "installation_id": installation_id,
+                                           "baseline": baseline, "remediation_id": output.name})
+            try:
+                try:
+                    argv = ["oscap", "xccdf", "eval", "--remediate", "--profile", profile["profile_id"],
+                            "--results", str(output / "results.xml"), "--report", str(output / "report.html")]
+                    if tailoring:
+                        argv += ["--tailoring-file", str(tailoring)]
+                    self.runner(argv + [str(content)], timeout=3600)
+                    code = 0
+                except CommandFailed as error:
+                    if error.returncode != 2:
+                        raise
+                    code = 2  # Findings remain; never translate this into success/compliance.
+                if _sha(content) != profile["sha256"] or _sha(self.policy_path) != confirmation:
+                    raise Refused("Hardening inputs changed during execution")
+                if tailoring and _sha(tailoring) != profile["tailoring_sha256"]:
+                    raise Refused("Tailoring changed during remediation")
+                if baseline == "unified" and _sha(mapping) != policy["unified_mapping"]["sha256"]:
+                    raise Refused("Unified mapping changed during remediation")
+                after = self.host(self.runner)
+                if after.get("host_controls_ok") is not True:
+                    raise Refused("Host security checks failed after hardening")
+                artifact_names = ["results.xml", "report.html", "policy.json"]
+                if baseline == "unified":
+                    artifact_names.append("unified-mapping.json")
+                record.update(state="applied_scan_required", scanner_exit_code=code,
+                              completed_at=self.clock().isoformat(), postconditions=after,
+                              artifacts={name: _sha(output / name) for name in artifact_names})
+                record['bootloader_refresh'] = accept_remediation(
+                    bootloader_state, bootloader_checkpoint, output.name, confirmation, runner=self.runner)
+            except Exception as error:
+                record.update(state="failed_review_required", error_type=type(error).__name__)
+                atomic_json(output / "remediation.json", record)
+                raise
+            atomic_json(output / "remediation.json", record)
+            audit(self.configuration / "baseline-audit.jsonl", "baseline.remediate", installation_id=installation_id,
+                  baseline=baseline, policy_sha256=confirmation, remediation_id=output.name)
+            return record
+
     def scan(self, installation_id, baseline):
         require_linux_root()
         _directory(self.configuration)
@@ -348,6 +832,8 @@ class Baseline:
                     destination.write_bytes(trusted_file(Path(profile["tailoring"])).read_bytes())
                     destination.chmod(0o600)
                     artifacts[destination.name] = _sha(destination)
+                    if artifacts[destination.name] != profile["tailoring_sha256"]:
+                        raise Refused("Tailoring changed while retaining its provenance")
             atomic_json(output / "policy.json", policy)
             artifacts["policy.json"] = _sha(output / "policy.json")
             if policy.get("unified_mapping"):
@@ -514,6 +1000,8 @@ def main(argv=None):
     item.add_argument("--policy", type=Path, required=True)
     item.add_argument("--confirm-policy-sha256", required=True)
     commands.add_parser("scan")
+    item = commands.add_parser("remediate")
+    item.add_argument("--confirm-policy-sha256", required=True)
     commands.add_parser("status")
     commands.add_parser("review-template")
     item = commands.add_parser("review")
@@ -532,6 +1020,8 @@ def main(argv=None):
                 result = manager.select(args.policy, args.confirm_policy_sha256, installation_id, baseline)
             elif args.command == "scan":
                 result = manager.scan(installation_id, baseline)
+            elif args.command == "remediate":
+                result = manager.remediate(installation_id, baseline, args.confirm_policy_sha256)
             elif args.command == "review-template":
                 result = manager.review_template(installation_id, baseline)
             elif args.command == "review":

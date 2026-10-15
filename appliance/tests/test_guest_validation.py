@@ -11,6 +11,27 @@ from nebulalog_manager.guest_validation import (Collector, Result, command, list
 
 
 class ParsingTests(unittest.TestCase):
+    def test_algorithm_policy_requires_known_digests_and_real_fetch_refusal(self):
+        success = Result(0, "SHA2-256(/dev/null)= e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n")
+        denied = Result(1, "", "inner_evp_generic_fetch:unsupported")
+        cases = [(success, success, denied, "passed"),
+                 (success, success, Result(0, "MD5(/dev/null)= d41d8cd98f00b204e9800998ecf8427e"), "failed"),
+                 (success, success, Result(127, "", "command not found"), "failed"),
+                 (Result(0, "wrong digest"), success, denied, "failed")]
+        for default, explicit, prohibited, wanted in cases:
+            collector = Collector()
+            with patch.object(collector, "call", side_effect=[default, explicit, prohibited]) as call:
+                result = collector.algorithm_policy()
+            self.assertEqual(result["status"], wanted)
+            self.assertEqual(call.call_count, 3)
+            self.assertNotIn("inner_evp", str(result))
+
+    def test_module_signature_probe_requires_running_kernel_enforcement(self):
+        for mode in ("Y\n", "N\n", "1\n", ""):
+            with patch("nebulalog_manager.guest_validation.small_file", return_value=mode):
+                value = Collector().module_signatures()
+            self.assertEqual(value["status"], "passed" if mode == "Y\n" else "failed")
+
     def test_package_inventory_keeps_exact_versions_and_marks_absent(self):
         value = package_inventory("openssl-libs\t1:3.0.7-30.el9.x86_64\nopenssl-libs\t1:3.0.7-31.el9.x86_64\nPASSWORD\tPRIVATE_SECRET\nopenssl\tinvalid secret value\n")
         self.assertEqual(value["openssl-libs"]["nevra"], ["1:3.0.7-30.el9.x86_64", "1:3.0.7-31.el9.x86_64"])
@@ -24,10 +45,10 @@ class ParsingTests(unittest.TestCase):
         self.assertNotIn("PRIVATE_SECRET", json.dumps(value))
 
     def test_listeners_redact_addresses_and_preserve_public_private_boundary(self):
-        value = listener_summary("tcp LISTEN 0 128 127.0.0.1:8443 0.0.0.0:*\ntcp LISTEN 0 128 [::]:443 [::]:*\nudp UNCONN 0 0 192.0.2.250:514 0.0.0.0:*\n")
+        value = listener_summary("tcp LISTEN 0 128 127.0.0.1:8443 0.0.0.0:*\ntcp LISTEN 0 128 [::]:443 [::]:*\nudp UNCONN 0 0 10.150.1.250:514 0.0.0.0:*\n")
         self.assertIn({"protocol": "tcp", "port": 8443, "scope": "loopback", "family": "ipv4"}, value)
         self.assertIn({"protocol": "tcp", "port": 443, "scope": "wildcard", "family": "ipv6"}, value)
-        self.assertNotIn("192.0.2.250", json.dumps(value))
+        self.assertNotIn("10.150.1.250", json.dumps(value))
         for invalid in ("malformed", "tcp LISTEN 0 128 secret:5432 *:*"):
             with self.assertRaises((Refused, ValueError)):
                 listener_summary(invalid)
