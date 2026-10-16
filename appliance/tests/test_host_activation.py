@@ -43,7 +43,7 @@ class HostFixture(unittest.TestCase):
                 "host_source_sha256": self.new["host_source_sha256"], "rollback_safe": True}},
             "artifacts": [{"name": "host.tar", "sha256": self.new["generation"], "bytes": (self.root / "new/host.tar").stat().st_size}]}
         (self.stage / "host.tar").write_bytes((self.root / "new/host.tar").read_bytes())
-        self.transaction = {"release": str(self.stage), "state": "preparing", "sequence": 10,
+        self.transaction = {"release": str(self.stage), "state": "preparing", "sequence": 10, "hook_protocol": 1,
             "previous": {"sequence": 9, "components": {"host": self.old}}}
         self.bind_manifest()
         atomic_json(self.selection, {"schema": 1, "generation": self.old["generation"], "sequence": 9})

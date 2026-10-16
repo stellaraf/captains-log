@@ -10,7 +10,8 @@ STAGED = {"update-preflight": "preflight", "update-backup": "backup", "update-pr
           "update-activate": "activate", "update-health": "health", "update-rollback": "rollback",
           "update-finalize": "finalize"}
 HOST = {"update-os-preflight": "os_preflight", "update-os-postcheck": "os_postcheck", "update-os-recover": "os_recover", "update-reboot-prepare": "reboot_prepare", "update-reboot-abort": "reboot_abort",
-        "update-boot-gate": "boot_gate", "update-reboot-complete": "reboot_complete"}
+        "update-boot-gate": "boot_gate", "update-reboot-complete": "reboot_complete",
+        "update-kernel-retry": "kernel_retry", "update-kernel-rollback": "kernel_rollback"}
 
 
 def main():
@@ -23,7 +24,7 @@ def main():
         if len(sys.argv) != (2 if name in STAGED else 1):
             raise Refused("Unexpected lifecycle arguments")
         manager = Lifecycle(load_config())
-        result = getattr(manager, STAGED[name])(Path(sys.argv[1])) if name in STAGED else getattr(manager, HOST[name])()
+        result = manager.component_hook(name, Path(sys.argv[1])) if name in STAGED else getattr(manager, HOST[name])()
         print(json.dumps(result, sort_keys=True))
         return 0 if result.get("ok") is True else 1
     except Exception as exc:

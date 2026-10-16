@@ -46,7 +46,7 @@ The initial descriptor has exactly these fields (placeholder hash values are des
   "schema": 1,
   "product": "nebulalog",
   "sequence": 0,
-  "schema_revision": "1",
+  "schema_revision": "2",
   "source_commit": "40-lowercase-hex-base-commit",
   "source_dirty": true,
   "source_snapshot_sha256": "sha256-of-exact-source-manifest.json-bytes",

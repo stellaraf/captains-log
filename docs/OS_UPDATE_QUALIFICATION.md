@@ -12,6 +12,57 @@ Application uses `rpm --upgrade` with the retained package paths, after an exact
 
 The OS integrity plan has its own schema and operation/boot identity. It uses the existing retained AIDE `--update` database chain, including fresh checks, metadata preservation and compare-and-swap recovery. Only the exact planned regular files may change; additions, removals, unrelated paths and ACL/xattr/SELinux changes are refused. The original enrollment and original database remain immutable. A kernel or AIDE checker replacement cannot silently rewrite those original facts.
 
+The OS operation publishes its storage-maintenance owner before backup begins.
+The destructive-storage hold remains active through planning, package changes,
+deferred reboot, failed requests, recovery and pending kernel retention. Delivery
+is held before services stop and reopened for runtime health and the ingest
+canary while destructive cleanup remains suspended. A healthy old runtime can
+therefore serve logs without accepting an unverified candidate or releasing its
+storage hold.
+
+Even a transaction with no available updates performs the full postcheck and
+durable finalization. The existing `update-os-postcheck` hook completes an exact
+stage/boot-bound terminal journal before the scheduler reports finalization.
+Storage release is journaled as pending before the gate changes, and a failed
+release retains retryable finalization evidence. Release requires current-boot
+health and completed acceptance, rollback and retention obligations. A deferred
+retry keeps the original stage owner and refreshes its backup; it does not begin
+a second package transaction or transfer authority to a different operation.
+
+`os-recover` can cancel a failed backup or planning attempt on its original boot
+when the scheduler explicitly recorded that payload application never started.
+An immutable record published before backup binds the exact packages, boot
+selection, configuration, Quadlets, schema provenance and authenticated AIDE
+head/database. Recovery rejects drift, prior reboot obligations, pending or
+adopted candidates, and any package/kernel execution evidence. Inert plans and
+partial backup bytes are retained; cancellation neither restores a dump nor
+accepts an AIDE change. It settles the owned storage barrier, starts the unchanged
+runtime, runs a plain integrity check and full health checks, then records
+cancellation before releasing the hold. A fresh kernel plan's reboot hint alone
+does not prevent cancellation when no candidate was installed or adopted.
+
+Native preflight and cancellation commands retain a per-stage lock and private
+dispatch/completion records containing command digests, never raw arguments,
+input or output. A successful foreground return is required for acknowledgement.
+Missing acknowledgements remain held and are never replayed, even when the
+client has exited or its inherited lock is available. The lock is supplementary;
+it does not prove that systemd or Podman retained an inherited descriptor or
+finished delegated work. Legacy stages without the immutable preflight proof
+also remain held. Source tests include actual Python subprocess/flock survival
+and lost-acknowledgement cases; native delegated-command recovery still needs
+separate qualification.
+
+An abrupt scheduler loss during payload application can leave the journal in
+`updating` with `payload_started=true`. That state remains held: `os-recover`
+does not infer completion from installed bytes, result files, current health or
+an available process lock. These observations cannot exclude a surviving RPM
+process, scriptlet or delegated job with later effects. A crash after application
+returns but before the durable postcheck record has the same conservative
+disposition. Neither automatic maintenance nor preapply cancellation replays or
+reclassifies this work. Qualification still requires a durable payload-dispatch
+completion protocol and native interruption tests before this recovery path can
+be enabled; operators must retain its stage, journals and maintenance holds.
+
 ## Measured native result
 
 On the disposable Rocky 9.8 x86_64 VMware guest, the signed `linux-firmware-whence` package was set to `20260707-161.1.el9_8` as an explicit test fixture, then upgraded by the exact executor to `20260804-161.2.el9_8`. The latter was the original installed version. This changes the real `/usr/share/licenses/linux-firmware-whence/WHENCE` payload. Both versions were downloaded from the official Rocky 9 BaseOS repository and verified against the enrolled Rocky key.
@@ -26,17 +77,348 @@ The first full-policy attempt exposed an AIDE 0.19.2 compatibility defect: under
 
 The independent source tests cover the OS-specific AIDE chain, unrelated drift, metadata rejection and recovery after a database swap interruption. The native joint test exercises the real RPM executor and full-policy scans, not the production enrollment, timer or healthy-host acceptance path. Full appliance OS runtime acceptance remains unqualified. A private scan baseline is not production enrollment.
 
+## Kernel lifecycle implementation and evidence limits
+
+The kernel recipe plans the exact four signed Rocky kernel packages, resolves
+their dependencies offline, and retains their bytes and vendor-script identities.
+Installation preserves the running kernel and its persistent boot selection.
+The recipe permits a fourth complete kernel set temporarily; another kernel
+installation is refused until accepted retention returns the inventory to three.
+Mixed kernel and unrelated package transactions remain unsupported.
+
+The temporary kernel-default protection setting is published by an atomic,
+same-directory replacement with exact owner, mode, ACL/xattr and SELinux
+metadata. Immutable preimages, postimages and temporary-file identities bind
+interruption recovery. A separate durable RPM-command sentinel distinguishes a
+new schema-2 operation that never started RPM from an attempted command. Only
+the former can perform its first execution after recovery; sentinel-present,
+partial-inventory and legacy ambiguous operations remain held. Focused tests
+exercise failures before and after replacement, changed identities and the
+once-only execution boundary. Native interruption acceptance remains pending.
+
+Before requesting a reboot, lifecycle verifies the retained backup, local
+authentication and the intended candidate initramfs's encrypted-storage unlock
+configuration. It stops services, syncs storage and arms one boot of the new
+kernel. The old kernel remains the persistent default until the actual candidate
+boot, full runtime/security checks and a separate measured promotion all pass.
+GRUB changes use the original AIDE enrollment's authorized-change chain. Exact
+abort restores the prior environment bytes. Interrupted arming, promotion and
+subsequent boot observations retain their original intent and proof records;
+they do not rewrite the original operation's boot identity.
+
+After an aborted reboot request, an explicit same-stage rearm can make a new
+one-shot selection on the original, unchanged boot. It requires the exact
+accepted abort, restored GRUB preimage, unchanged candidate and operation,
+fresh backup and full runtime checks. Its immutable generation retains the
+prior abort's AIDE proof; the original arm and abort records are not rewritten.
+Ordinary initial arming still refuses an existing transition. Rearm is limited
+to eight generations and is refused after fallback, explicit retry reservation
+or rollback ownership. A generation cancelled before its intent cannot later
+execute, including after interruption while restoring its predecessor pointer.
+Rearming an unattempted candidate does not consume or add an actual fallback
+retry; verified fallback retains the separate two-attempt limit below.
+
+Final acceptance uses immutable `kernel-acceptance-<boot UUID>.json` generations
+and an atomic current pointer. A later boot links the prior acceptance digest
+instead of replacing its evidence. `promotion_sha256` identifies the original
+promotion plan; the recursive boot proof distinguishes a completed promotion
+from an interrupted prepared intent. The optional `resume_sha256` identifies a
+separately accepted later-boot transition. Candidate cleanup retains the first
+acceptance and original pending reference, including when interrupted after
+unlinking the pending pointer.
+
+Retention requires that current acceptance, a fresh verified backup and all
+runtime checks before removing only the oldest unprotected kernel. Its four
+original signed RPMs must be retained in an owned transaction stage or the
+factory provenance bundle; installed RPM database headers alone are insufficient.
+An erase intent is never replayed automatically. Missing provenance and partial
+erasure retain maintenance and recovery evidence. A refreshed backup keeps the
+original operation's maintenance gate active and publishes an immutable intent
+before updating its two journal references.
+
+A later boot after an exactly completed erase now has a separate recovery
+path. It revalidates the signed retained plan, exact remaining inventory,
+protected kernels and qualified GRUB transition. A compound AIDE plan allows
+only the original deletions, their permitted parent-directory metadata changes
+and the measured GRUB environment change. Its authority links the original
+erase intent and preparation, current backup and immutable boot-plan ancestry.
+Recovery can retain a database already copied before interruption; it never
+copies an unpublished historical database or reruns RPM. Fresh full scans must
+pass before a new acceptance is published. A second reboot traverses only that
+explicit ancestry, including an intermediate plan that was never prepared.
+
+The optional `retention_integrity_sha256` acceptance field binds the published
+compound AIDE evidence. Older immutable acceptances retain their original bytes
+and provide no such authority. Runtime checks, final current-boot acceptance,
+retention completion and another runtime postcheck precede maintenance release.
+Kernel acceptance records establish the verified kernel and runtime checks;
+they do not establish appliance-wide finalization. The operation journal and
+maintenance gate remain pending until retention and its postcheck complete,
+including when a crash leaves a new kernel acceptance already published.
+Source tests cover the real AIDE report/database chain and lifecycle ordering;
+native interrupted-erase recovery remains unqualified.
+
+A retained plan from an earlier boot with no erase intent now has a separate
+execution-generation workflow. It first verifies that the signed package set,
+full inventory, removal targets and protected artifacts remain unchanged. The
+normal boot integrity path reconciles the qualified GRUB change, and fresh
+runtime checks publish a current-boot kernel acceptance. Only then can a new
+immutable plan bind that acceptance and the accepted GRUB state. The original
+plan and integrity records remain unchanged, as do the kernel removal scope
+and signed RPM evidence.
+
+One durable erase intent governs the entire operation, including all later
+execution generations. Recovery uses the exact generation referenced by that
+intent and its own AIDE preparation. A reboot before intent can create another
+generation after fresh checks; a reboot after erasure follows the compound
+integrity recovery path. An attempted but unchanged or partial inventory
+remains held rather than automatically repeating the erase. Native acceptance
+of the execution-generation workflow is still required.
+
+Factory builds now capture the exact installed four-package kernel set, its
+signed RPM bytes and installed inventory. Sealing and initial AIDE enrollment
+verify that retained bundle offline; enrollment records immutable manifest and
+inventory digests. The verifier measures its original runtime dependencies
+before importing them. Native capture, sealing and first enrollment remain
+unqualified, and existing enrollments require an explicit migration. See the
+[factory build instructions](../appliance/packer/RELEASING.md).
+
+The source suites include real private-file transitions and a combined
+boot/AIDE dispatcher, snapshot and retained-database chain. Their native host
+identity, GRUB renderer and scanner inputs are controlled fixtures. A separate
+native Rocky test established the real GRUB tool's 1024-byte format and exact
+set/unset restoration on disposable private files, leaving live `/boot`
+unchanged. A subsequent isolated VM, using separate disk overlays and copied
+firmware state, exercised the exact `kernel_boot._replace` helper on its live
+XFS `/boot`. The replacement changed the inode, preserved the exact bytes,
+ownership, mode and SELinux/xattr metadata, and survived a real reboot. GRUB
+consumed the one-time selection while retaining the persistent default. Both
+selections identified the existing vendor kernel; this was a bootloader
+mechanism test, not a new-kernel promotion or unattended unlock acceptance.
+A second controlled boot confirmed the vendor reset of `boot_success=1` and
+`boot_indeterminate=1` to zero while preserving the replaced inode and security
+metadata. This also demonstrates why ordinary-boot flag reconciliation is
+required; the native fixture did not authorize those changes through AIDE.
+The original qualification VM and recovery disks were unchanged. None of these
+results establishes a complete installed-appliance kernel update.
+
+## Ordinary boots and late boot-success flags
+
+Source now includes a separate ordinary-boot integrity owner. Initial AIDE
+enrollment binds an immutable snapshot of the installed RPM inventory, boot
+artifacts, kernel modules, GRUB configuration and qualified vendor flag writers.
+Later observations are compared with that root plus the verified chronological
+AIDE change chain. Capturing the running machine never grants authority to
+replace the baseline. Existing enrollments without this root require explicit
+migration; they are not silently re-enrolled.
+
+An ordinary reboot or the vendor user-session success timer can create a new,
+immutable integrity generation. It permits only the qualified GRUB flag-byte
+transition, preserving the kernel/default selection, other environment entries,
+boot artifacts and security metadata. An accepted package/kernel/retention
+transaction is reduced through its retained typed evidence before comparison.
+Metadata not recorded in an older payload receipt requires a full AIDE check
+against the already accepted database before a new checkpoint can be published.
+
+The boot maintenance gate runs before the public edge. Reconciliation,
+full runtime/security checks and current-boot finalization precede gate release.
+Interrupted ordinary generations retain exact ancestry; recovery can retain an
+already copied database but cannot copy an unpublished historical result. An
+unrelated pending update or unexplained drift remains held. No OS update journal
+is invented or reopened to represent an ordinary boot.
+
+If periodic observation fails before a valid generation exists, a separate
+installation-bound failure receipt can retain maintenance without granting any
+baseline authority. Recovery requires valid original evidence, a fresh full
+AIDE check and all runtime checks, including retries after gate-release failure.
+Incomplete or mismatched OS journal pairs cannot be claimed by this owner.
+
+New installations enable `nebulalog-reboot-verify.timer`: an initial check after
+three minutes and another fifteen minutes after the previous verification ends.
+This covers a vendor success flag written after a later user login and retries
+interrupted verification. Source tests exercise these boundaries; production
+enrollment, native reboot/timer recovery and hypervisor acceptance remain open.
+
+On October 15, a read-only capture on the original Rocky x86_64 qualification
+guest measured all 456 installed package identities, 6,253 protected artifacts
+and the 1,024-byte GRUB environment twice with matching results. Native testing
+found and corrected two source assumptions: RPM's `gpg-pubkey` pseudo-package
+omits its architecture tag, and the qualified GRUB packages have epoch `1`.
+Key records remain in the inventory using an explicit `none` pseudo-architecture;
+ordinary packages still require a valid architecture. The same ten writer-file
+hashes passed with the corrected exact package identities. This verifies capture
+and layout compatibility, not AIDE enrollment, reboot recovery or a healthy
+appliance. The guest and its existing baseline were not changed.
+
+An isolated native reboot on October 15 also exposed changes beyond GRUB:
+nine existing EFI files changed inode on VFAT remount, and nine fixed `/etc`
+and `/root` files changed ctime during the successful vendor tmpfiles service.
+Their contents and security metadata matched. The full AIDE check rejected
+these changes before replacing its database; the original baseline remains
+preserved. Signed vendor payload/source inspection supports the explanation,
+and the native read-only helper independently confirmed all eighteen rows,
+including ACLs, against that preserved database. Source integration now binds
+these observations to the original enrollment and exact accepted AIDE history.
+Native acceptance of the resulting database transition is still required.
+No AIDE attributes have been disabled to pass this test.
+
+A second isolated native experiment successfully initialized and verified a
+fresh schema-2 enrollment. Its first reboot then stopped before AIDE preparation
+or database replacement: the report also contained inode-only changes on
+`/boot/efi/EFI/BOOT` and `/boot/efi/EFI/rocky`. Both fixed directories retained
+their mode, owner and security metadata. That terminal run, its original
+database and its enrollment remain preserved; no second reboot or forced
+acceptance followed the failure.
+
+New schema-2 enrollment snapshots include the exact vendor tmpfiles writers,
+effective configuration and EFI volume identity. The source now permits only
+inode changes on the nine fixed EFI files and these two fixed EFI directories,
+plus ctime changes on nine fixed system/root files inside the successful boot
+tmpfiles invocation. The directories must be actual root-owned mode-0700
+directories on the same qualified VFAT volume. Their complete sizes, link
+counts, timestamps, security metadata, exact child names and child contents
+are frozen separately in the initial authority. All must match at every later
+capture; only their inode numbers may change across a new boot. AIDE's native
+directory mask stores zero in unmeasured size, time and link-count columns;
+the parser preserves those zeros and never treats them as measurements.
+
+Content, ownership, modes, ACLs, SELinux labels, xattrs, link counts and every
+other monitored attribute must still match. Same-boot replacements receive no
+exception. Historical timestamps come from the authenticated AIDE database at
+its actual second precision, never from a new capture or invented nanoseconds.
+Existing eighteen-target authorities are unsupported by this extension and
+are never silently recaptured or re-enrolled. Changes to the fixed EFI layout
+or child contents also require an explicit, separately qualified migration.
+The twenty-target extension has source tests; a new isolated native successor
+must still verify its complete reboot and AIDE database transition.
+
+Each preparation retains its native observation, source database/head, typed
+boot ancestry and any interrupted-operation evidence. A copied ready output
+retains its unpublished provenance through recovery; an old uncopied output
+cannot be installed after a later boot. Ordinary payload updates carry a
+same-boot anchor with no metadata exceptions, so their original preparation
+remains immutable through an exact forward-to-rollback sequence. Their output
+rows, rather than the preparation's old measurements, become the input for a
+later qualified boot. Schema-1 enrollments gain no new exceptions; changing
+enrollment schema, vendor writer pins or effective tmpfiles policy requires a
+separately qualified migration.
+
+The retained ancestry includes full snapshots only for the current ordinary
+boot generation. Large snapshots use bounded gzip/base64 encoding inside the
+existing private record limit, with their original canonical JSON hashes
+preserved. Historical validation rejects duplicate keys, changed references,
+extra gzip members, trailing data and excessive expansion. It performs no
+live measurements or recursive acceptance queries. The resulting AIDE database
+is checked against the authorized rows, and the boot identity and current
+database are checked again after replacement and before publishing completion.
+
+These source changes are undergoing integration and native testing. They do
+not resolve the installed vendor kernel's FIPS HKDF self-test failure or
+authorize maintenance release without the existing complete health checks.
+
+### Failed candidate recovery
+
+After the fallback kernel boots, `kernel_recovery_required` holds the candidate
+for an explicit operator decision. Automatic OS/component updates remain
+blocked while this recovery, retention or rollback is incomplete. Returning
+the old runtime to service does not accept the candidate update.
+
+`sudo nebulalog update kernel-retry` permits one additional candidate attempt,
+for at most two attempts total. It requires a verified current fallback boot,
+fresh backup, all runtime/security checks, and encrypted-storage unlock
+readiness. The reservation is bound to the original candidate, even if a later
+operation adopts that candidate. A durable request precedes the reboot; an
+interrupted request cannot silently request another reboot. A failed attempt
+stays held for recovery and never becomes an automatic retry loop.
+
+`sudo nebulalog update kernel-rollback` removes only the exact never-accepted
+candidate's four vendor packages. It verifies retained signed inputs, keeps
+the running recovery kernel and its default, and records one erase attempt
+before RPM runs. Full integrity and current runtime checks precede completion.
+Only then does it quarantine that exact failed version and clear its owned
+pending pointer. Other versions remain eligible for later vendor updates.
+Source RPMs, backups and recovery evidence are retained.
+
+Interrupted rollback handles a verified completed erase on the same or a later
+boot, including AIDE database publication interruptions. An unattempted older
+plan receives a new immutable execution generation. Partial or ambiguous RPM
+results stay held and never cause a second erase command. Completion evidence
+keeps its original boot identity; current recovery requires separate fresh
+boot and health checks.
+
+Source tests exercise retry cancellation, attempt limits, rollback ownership,
+full integrity history, later-boot recovery and failed post-removal health.
+Same-stage rearm and OS storage-finalization tests execute the production Python
+plan, report, database, compare-and-swap, history and lineage paths on isolated
+Rocky. Their scanner subprocess and native host/RPM/service boundaries are
+injected; these tests do not establish native AIDE or reboot acceptance.
+These commands are not yet accepted on the native appliance. In particular,
+a vendor success-timer change after retry arming can retain maintenance rather
+than automatically cancel the arm; the existing exact evidence and one-shot
+selection are preserved for recovery. Native reboot metadata handling above
+must also be qualified before claiming this workflow operational.
+
+The following cases remain explicit qualification or implementation gaps:
+
+- Interruption between the GRUB temporary-file creation and replacement, and
+  the complete candidate-kernel boot/promotion path on a configured appliance.
+- Native qualification of later-boot exact-erasure recovery and its earlier
+  acceptance generations and unattempted plans from earlier boots. Partial
+  erasure remains a held condition requiring a separately qualified recovery.
+- Native qualification of ordinary-reboot integrity reconciliation before the
+  first kernel update, after completed update/retention, and after a late vendor
+  boot-success timer change. Drift during a measured phase must retain its
+  maintenance gate and recover through a new qualified generation.
+- Native interruption qualification of atomic kernel-default protection and
+  its once-only RPM-command boundary.
+- Native retry/rollback qualification after verified fallback, including the
+  armed success-timer interruption described above.
+- Recovery of an interrupted native command without a successful completion
+  acknowledgement, or an older backup/planning attempt without immutable
+  preflight proof, remains held. A missing client process or available lock does
+  not resolve delegated effects or authorize release.
+- A later unrelated boot after an initial kernel arm was aborted remains held;
+  it is not classified as a candidate fallback. Same-stage rearm requires the
+  original boot, and this later-boot cancellation observation needs a separate
+  typed recovery path.
+- The complete general vendor update transaction, critical packages and their
+  service/generated-file migrations, and native VMware/AHV acceptance.
+
 ## Required next work
 
 - Inspect the real currently available Rocky update transaction and classify every resolved package before mutation. Unsupported packages must be reported by name and reason; an all-or-refuse transaction is an interim constraint, not the final automatic-update behavior.
 - Add explicit recipes for RPM scriptlets and installed triggers, with exact qualified outputs. The `hwdata` test candidate was rejected because its `/usr/lib/modprobe.d` payload would invoke a glibc file trigger; a package name alone is not a safe exemption.
 - Qualify systemd-generated files, loader caches, SELinux labeling changes and other generated outputs. Preserve unrelated customer configuration and demonstrate failed/interrupted execution recovery.
 - Implement and verify the AIDE/checker monitor-facts transition using independently verified replacement tools while retaining the prior checker and baseline chain.
-- Bind kernel, initramfs, BLS/EFI configuration and encrypted-storage unlock to the planned new kernel, then cold-boot that kernel on VMware and Nutanix. Secure Boot PCR 7 alone does not authenticate all initramfs/command-line inputs.
+- Qualify the implemented kernel, initramfs, BLS/EFI and encrypted-storage unlock binding by cold-booting the exact update on VMware and Nutanix. Secure Boot PCR 7 alone does not authenticate all initramfs/command-line inputs.
 - Test real unattended OS updates, service recovery, reboot/unlock, retained log data, local authentication and recovery after failures on fully configured appliances. The present kernel crypto self-test warning still blocks normal healthy-host acceptance; it has not been bypassed for these tests.
 
 `nebulalog update os-recover` can accept an interrupted operation only when the retained exact RPM result and fresh integrity/runtime checks pass. It does not claim that `dnf history undo` can reverse arbitrary scripts or persistent application data.
 
 ## Kernel vendor evidence
 
-The public [Red Hat knowledgebase entry 7134366](https://access.redhat.com/solutions/7134366) recognizes the same HKDF extraction failure class during FIPS boot in RHEL 9/10 and remains labeled “Solution In Progress.” Its full subscriber-only guidance was not accessed. The installed Rocky kernel is `5.14.0-687.45.1.el9_8.x86_64`; the live [Rocky 9 BaseOS package index](https://download.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/Packages/k/) and the configured repositories provided no newer x86_64 kernel during this qualification. [RHSA-2026:64808](https://access.redhat.com/errata/RHSA-2026:64808), issued September 8, 2026, ships this same kernel version for other listed security fixes. No supported fixed Rocky package for the observed HKDF failure was verified. This does not exclude subscriber-only guidance or a later vendor fix.
+On October 15, the isolated native Rocky x86_64 guest installed and booted the
+newer signed vendor kernel `5.14.0-687.57.1.el9_8`. The same HKDF self-test
+failure recurred and the first-boot gate refused enrollment. The previous
+kernel and offline recovery disks/firmware were retained. This manual vendor
+transaction provides real package/boot evidence for developing the kernel
+recipe; it is not acceptance of the automatic update manager. See the dated
+measurements in [FIPS qualification](FIPS.md#october-15-vendor-kernel-qualification).
+
+The earlier September qualification used `5.14.0-687.45.1.el9_8.x86_64`;
+the configured repositories provided no newer x86_64 kernel at that time.
+[RHSA-2026:64808](https://access.redhat.com/errata/RHSA-2026:64808), issued
+September 8, ships that version for other listed security fixes. The October
+qualification above supersedes that earlier package-availability observation.
+
+On October 15, source analysis of the signed `687.56.1` and `687.57.1` Rocky
+source RPMs found byte-identical `crypto/hkdf.c` and `crypto/hmac.c`: the first
+HKDF vector's 13-byte salt reaches a generic HMAC FIPS minimum of 14 bytes,
+which returns `-EINVAL` before SHA driver computation. The public
+[Red Hat knowledgebase entry 7134366](https://access.redhat.com/solutions/7134366)
+matches this failure class, was updated September 14, and still showed
+“Solution In Progress” when checked October 15. Subscriber-only guidance was
+not accessed, and no supported vendor fix or CPU-setting remedy was verified.
+The signed-source comparison and references are retained in
+`outputs/vendor-hkdf-analysis-20261015/vendor-remedy-analysis.json` in the
+private T9 build root; this analysis does not relax any acceptance gate.

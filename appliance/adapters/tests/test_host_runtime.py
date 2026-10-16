@@ -114,6 +114,28 @@ class RuntimeFixture(HostFixture):
 
 
 class HostRuntimeTests(RuntimeFixture):
+    def interrupted_preflight_plan(self, after_write):
+        write = runtime.atomic_json
+        before = {path: path.read_bytes() for path in self.host._target_paths()}
+        def interrupted(path, value):
+            if path != self.host.plan_path: return write(path, value)
+            if after_write: write(path, value)
+            raise OSError("interrupted host plan publication")
+        with patch.object(runtime, "atomic_json", side_effect=interrupted), self.assertRaises(OSError):
+            self.host.preflight()
+        retained = self.host.plan_path.read_bytes() if self.host.plan_path.exists() else None
+        self.assertEqual(activation.selection()["sequence"], self.transaction["previous"]["sequence"])
+        self.assertTrue(self.host.preflight()["checks"]["dispatcher_ready"])
+        if retained is not None: self.assertEqual(self.host.plan_path.read_bytes(), retained)
+        for path, raw in before.items(): self.assertEqual(path.read_bytes(), raw)
+        self.assertFalse(self.host.root.exists())
+
+    def test_preflight_retries_before_plan_publication_without_touching_runtime(self):
+        self.interrupted_preflight_plan(False)
+
+    def test_preflight_retries_after_plan_publication_without_replacing_plan(self):
+        self.interrupted_preflight_plan(True)
+
     def test_preflight_binds_exact_fixed_resources_generation_additions_and_preserved_hashes(self):
         result = self.host.preflight()
         plan = self.host.checked_plan()
@@ -148,6 +170,36 @@ class HostRuntimeTests(RuntimeFixture):
         with self.assertRaisesRegex(Refused, "local changes"): self.host.preflight()
         self.assertEqual(target.read_bytes(), before)
         self.assertFalse(self.host.root.exists())
+
+    def test_preactivation_recovery_can_capture_unchanged_host_files_after_partial_backup(self):
+        self.host.preflight()
+        write = self.host._write_retained
+        count = 0
+        def interrupted(path, raw):
+            nonlocal count
+            count += 1
+            if count == 2: raise OSError("interrupted host backup")
+            return write(path, raw)
+        with patch.object(self.host, "_write_retained", side_effect=interrupted), self.assertRaises(OSError):
+            self.host.backup()
+        first = (self.host.root / "old/0").read_bytes()
+        self.transaction["activation_started"] = False
+        self.save_transaction("rolling_back"); activation.restore_previous(self.stage)
+        host = runtime.HostRuntime(self.lifecycle, self.stage)
+        host.backup(preactivation_recovery=True)
+        self.assertEqual((host.root / "old/0").read_bytes(), first)
+        host.runtime_evidence("update-health", accept_integrity=True)
+        self.assertEqual(self.integrity_calls[-1][0], "rollback")
+
+    def test_preactivation_host_backup_recovery_refuses_changed_live_file(self):
+        self.host.preflight()
+        self.transaction["activation_started"] = False
+        self.save_transaction("rolling_back"); activation.restore_previous(self.stage)
+        target = runtime.SYSTEMD / "nebulalog-status.service"
+        target.write_bytes(target.read_bytes() + b"unrelated change")
+        with self.assertRaisesRegex(Refused, "changed before"):
+            runtime.HostRuntime(self.lifecycle, self.stage).backup(preactivation_recovery=True)
+        self.assertTrue(target.read_bytes().endswith(b"unrelated change"))
 
     def test_explicit_policy_identity_network_migration_refusal_is_precise(self):
         original = self.host.source
@@ -263,12 +315,16 @@ class LifecycleHostTests(RuntimeFixture):
         self.lifecycle.cmd = FixtureCommands()
         self.lifecycle.config["schema_revision"] = "1"
         self.lifecycle.encrypted = Mock(return_value=None)
+        # Host-resource tests inject database/storage execution. Dedicated
+        # PostgreSQL suites exercise those barriers and exact catalog checks.
+        self.lifecycle.storage_maintenance = Mock()
+        self.lifecycle.application_schema_catalog = Mock(return_value={"schema_revision": "1"})
         self.lifecycle.api_ready = Mock()
         self.lifecycle.canary = lambda: {"persisted": True, "fixture": True}
         self.lifecycle.compliance = lambda stage: {"passed": True, "fixture": True}
         self.lifecycle.get = lambda path, token=None: json.dumps({"status": "ok", "application_crypto_fips_enabled": True}).encode()
         self.lifecycle.web = lambda: b'<div id="root"></div>'
-        self.lifecycle.maintenance = lambda enabled, stage: atomic_json(self.maintenance, {"active": True}) if enabled else self.maintenance.unlink(missing_ok=True)
+        self.lifecycle.maintenance = lambda enabled, stage: atomic_json(self.maintenance, {"active": True, "release": str(stage)}) if enabled else self.maintenance.unlink(missing_ok=True)
         self.maintenance.unlink(missing_ok=True)
         self.manifest["components"]["nebulalog"].update(database_migration="none", schema_revision="1")
         self.transaction["previous"]["components"]["nebulalog"] = {"version": "0.1.0", "image": IMAGE}
@@ -277,6 +333,33 @@ class LifecycleHostTests(RuntimeFixture):
                        patch.object(lifecycle, "local_auth", return_value=("synthetic token", {"fixture": True})),
                        patch.object(lifecycle, "security_status", return_value={"host_controls_ok": True, "selinux": {"value": "Enforcing"}, "firewalld": {"value": "active"}})):
             mocker.start(); self.addCleanup(mocker.stop)
+
+    def test_partial_database_backup_recovers_unchanged_host_and_finalizes_after_health(self):
+        self.transaction["activation_started"] = False
+        self.save_transaction("preflight")
+        self.lifecycle.preflight(self.stage)
+        capture = self.lifecycle.cmd.capture
+        def interrupted(argv, target, **kwargs):
+            if "--dbname=keycloak" in argv: raise OSError("injected backup interruption")
+            return capture(argv, target, **kwargs)
+        self.lifecycle.api_ready.side_effect = Refused("restart interrupted")
+        with patch.object(self.lifecycle.cmd, "capture", side_effect=interrupted), self.assertRaises(Refused):
+            self.lifecycle.backup(self.stage)
+        partial = (self.stage / "recovery/nebulalog.dump").read_bytes()
+        self.assertFalse((self.stage / "adapter-backup.json").exists())
+        self.lifecycle.api_ready.side_effect = None
+        self.save_transaction("rolling_back"); activation.restore_previous(self.stage)
+        start = len(self.commands)
+        result = self.lifecycle.rollback(self.stage)
+        self.assertTrue(result["unchanged_runtime_recovered"])
+        self.assertTrue(result["host"]["checks"]["runtime_files"])
+        self.assertFalse(any(set(call) & {"dropdb", "createdb", "pg_restore"} for call in self.commands[start:]))
+        self.assertEqual((self.stage / "recovery/nebulalog.dump").read_bytes(), partial)
+        self.assertTrue(self.maintenance.exists())
+        self.assertTrue(self.lifecycle.health(self.stage)["ok"])
+        self.save_transaction("rolled_back")
+        self.lifecycle.finalize(self.stage)
+        self.assertFalse(self.maintenance.exists())
 
     def activate_lifecycle(self):
         first = self.lifecycle.preflight(self.stage)

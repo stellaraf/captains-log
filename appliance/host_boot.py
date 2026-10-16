@@ -19,7 +19,8 @@ SHARE = Path("/usr/share/nebulalog")
 GENERATIONS = Path("/usr/lib/nebulalog/generations")
 STATE = Path("/var/lib/nebulalog/manager/updates")
 FIXED = {"appliance/host_boot.py": Path("/usr/libexec/nebulalog/host-boot"),
-         "appliance/factory_host.py": Path("/usr/libexec/nebulalog/factory-host")}
+         "appliance/factory_host.py": Path("/usr/libexec/nebulalog/factory-host"),
+         "appliance/factory_kernel.py": Path("/usr/libexec/nebulalog/factory-kernel")}
 SHA = re.compile(r"[a-f0-9]{64}")
 COMMANDS = {"nebulalog": ("cli", ()), "bootstrap-runtime": ("bootstrap", ()),
             "github-updates": ("github_updates", ()), "os-updates": ("os_updates", ()),
@@ -31,7 +32,8 @@ COMMANDS = {"nebulalog": ("cli", ()), "bootstrap-runtime": ("bootstrap", ()),
 STAGED = {"update-preflight", "update-backup", "update-prepare", "update-activate", "update-health",
           "update-rollback", "update-finalize"}
 ADAPTERS = STAGED | {"update-os-preflight", "update-os-postcheck", "update-os-recover", "update-reboot-prepare",
-                     "update-reboot-abort", "update-boot-gate", "update-reboot-complete"}
+                     "update-reboot-abort", "update-boot-gate", "update-reboot-complete",
+                     "update-kernel-retry", "update-kernel-rollback"}
 PHASES = {"preflight", "preflight_failed", "preparing", "activating", "checking", "committed",
           "rolling_back", "rolled_back", "recovery_required"}
 PROBES = {"verify-selected", "probe-selected"}

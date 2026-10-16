@@ -20,7 +20,7 @@ PREFIXES = ("appliance/bin/", "appliance/nebulalog_manager/", "appliance/adapter
             "appliance/httpd/", "appliance/security/", "appliance/packer/http/")
 RECIPE = "appliance/packer/nebulalog.pkr.hcl"
 REALM = "deploy/keycloak/realm.json"
-REQUIRED = {RECIPE, REALM, "appliance/install-host.sh", "appliance/provision_guard.py", "appliance/host_boot.py", "appliance/factory_host.py",
+REQUIRED = {RECIPE, REALM, "appliance/install-host.sh", "appliance/provision_guard.py", "appliance/host_boot.py", "appliance/factory_host.py", "appliance/factory_kernel.py",
             "appliance/packer/http/nebulalog.ks", "appliance/packer/http/nebulalog-uefi.ks", "appliance/bin/nebulalog-seal",
             "appliance/bin/nebulalog-firstboot", "appliance/bin/bootstrap-runtime",
             "appliance/bin/nebulalog-aide", "appliance/security/aide-policy.conf", "appliance/security/aide.conf",
@@ -117,6 +117,7 @@ def write_new(path, raw, mode):
 
 def variables(output, build_disk_id):
     return {"appliance_source_directory": str(output / "appliance"),
+            "provenance_directory": str(output),
             "keycloak_realm_template": str(output / REALM),
             "kickstart_directory": str(output / "appliance/packer/http"),
             "build_disk_id": build_disk_id}

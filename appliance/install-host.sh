@@ -6,6 +6,7 @@ set -euo pipefail
 [ "$ID" = rocky ] && [ "${VERSION_ID%%.*}" = 9 ]
 [ "$(cat /proc/sys/crypto/fips_enabled)" = 1 ]
 fips-mode-setup --check
+[ "$(cat /sys/module/module/parameters/sig_enforce)" = Y ]
 [ "$(getenforce)" = Enforcing ]
 APPLIANCE_SOURCE=$(cd "$(dirname "$0")" && pwd)
 # Serialize the complete provisioner and sealer without creating a lock file.
@@ -21,6 +22,7 @@ install -o root -g root -m 0600 "$APPLIANCE_SOURCE/security/github-updates.json"
 install -m 0755 "$APPLIANCE_SOURCE/provision_guard.py" /usr/libexec/nebulalog/provision-guard
 install -m 0755 "$APPLIANCE_SOURCE/host_boot.py" /usr/libexec/nebulalog/host-boot
 install -m 0755 "$APPLIANCE_SOURCE/factory_host.py" /usr/libexec/nebulalog/factory-host
+install -m 0755 "$APPLIANCE_SOURCE/factory_kernel.py" /usr/libexec/nebulalog/factory-kernel
 install -m 0644 "$APPLIANCE_SOURCE"/nebulalog_manager/*.py /usr/lib/nebulalog/nebulalog_manager/
 install -d -m 0755 /usr/lib/nebulalog/nebulalog_adapters
 install -m 0644 "$APPLIANCE_SOURCE"/adapters/nebulalog_adapters/*.py /usr/lib/nebulalog/nebulalog_adapters/
@@ -54,6 +56,10 @@ fi
 install -m 0644 "$APPLIANCE_SOURCE/security/storage.conf" /etc/containers/storage.conf
 install -d -m 0755 /etc/dracut.conf.d
 install -m 0644 "$APPLIANCE_SOURCE/security/dracut-nebulalog.conf" /etc/dracut.conf.d/90-nebulalog.conf
+install -d -m 0755 /usr/share/nebulalog/baselines
+for baseline_file in baseline-catalog.json baseline-cis.xml baseline-stig.xml; do
+  install -m 0644 "$APPLIANCE_SOURCE/security/$baseline_file" "/usr/share/nebulalog/baselines/$baseline_file"
+done
 install -d -m 0755 /usr/share/nebulalog/aide
 install -m 0644 "$APPLIANCE_SOURCE/security/aide-policy.conf" /usr/share/nebulalog/aide/policy.conf
 install -o root -g root -m 0600 "$APPLIANCE_SOURCE/security/aide.conf" /etc/aide.conf
@@ -70,6 +76,9 @@ key=Path('/etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9').read_bytes()
 if trust['schema'] != 1 or hashlib.sha256(key).hexdigest() != trust['rocky_key_sha256']:
     raise SystemExit('Installed Rocky release key differs from the independently reviewed key')
 PYTRUST
+# Capture the exact installed vendor kernel before factory provenance is sealed.
+# This downloads signed RPM bytes only; it never replaces an installed kernel.
+PYTHONPATH=/usr/lib/nebulalog python3 "$APPLIANCE_SOURCE/factory_kernel.py"
 if [ -f /tmp/nebulalog-image-bundle/manifest.json ]; then
   install -d -m 0755 /usr/share/nebulalog/images
   install -m 0644 /tmp/nebulalog-image-bundle/*.oci.tar /usr/share/nebulalog/images/
@@ -143,7 +152,7 @@ with p.open("w") as f:c.write(f)
 PYCONFIG
 # The OS timer's service requires enrolled maintenance policy; its adapter then
 # verifies encrypted storage, healthy services/authentication and backups before DNF.
-systemctl enable nebulalog-firstboot.service nebulalog-storage.timer nebulalog-aide.timer nebulalog-os-update.timer nebulalog-app-update.timer nebulalog-reboot-verify.service nebulalog-status.timer
+systemctl enable nebulalog-firstboot.service nebulalog-storage.timer nebulalog-aide.timer nebulalog-os-update.timer nebulalog-app-update.timer nebulalog-reboot-verify.service nebulalog-reboot-verify.timer nebulalog-status.timer
 if [ -f /etc/systemd/system/nebulalog-console.service ]; then
   systemctl enable nebulalog-console.service
 fi

@@ -29,3 +29,18 @@ python3 appliance/packer/render_quadlets.py --images <verified-images.json> --ou
 The image JSON has four keys: `NEBULALOG_IMAGE`, `POSTGRESQL_IMAGE`, `CLICKHOUSE_IMAGE`, `KEYCLOAK_FIPS_IMAGE`; every value must be a registry reference ending in `@sha256:<64hex>`. Rendering does not pull images, apply host settings or validate the Podman generator. Run the generator's `--dryrun` inside the exact Rocky/Podman build before promotion.
 
 See [appliance validation](../docs/APPLIANCE_VALIDATION.md) for evidence, [OVA installation](../docs/INSTALL_OVA.md) for build gates and [updates](../docs/UPDATES.md) for lifecycle qualification. Guarded encrypted setup, the local console wizard, runtime provisioning, sanitized host-status bridge and fixed lifecycle adapters are implemented with local test coverage. Final installed-guest enrollment, provider, storage, update/recovery and hypervisor acceptance remain outstanding. Privileged UI-to-host mutations are not implied by the read-only status bridge. No production-ready or certified appliance is claimed.
+
+## Vendor-only patching decision (October 13, 2026)
+
+The appliance retains vendor-supplied Rocky kernels. Automatic OS updates are
+enabled by initial setup and evaluated every 15 minutes; transactions run only
+in the configured maintenance window. Package signature/repository controls,
+backup, host security and runtime checks remain mandatory. Required reboots
+follow preparation and unlock checks within that window. This is automatic
+vendor patching with controlled reboots, not reboot-free kernel live patching.
+
+On October 13, the 20 OS-update and activation regression tests passed. The
+qualification guest's OS-update timer was enabled and active, but its maintenance
+policy was absent because firstboot remains blocked by the vendor kernel HKDF
+self-test failure. Automatic patch installation and reboot acceptance therefore
+remain unverified. No custom kernel repair is selected for release.

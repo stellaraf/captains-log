@@ -8,6 +8,7 @@ import (
 	"github.com/stellaraf/captains-log/internal/query"
 	"github.com/stellaraf/captains-log/internal/store"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -102,7 +103,11 @@ func signature(in Search) string {
 }
 func (s *Server) logs(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	v := r.URL.Query()
+	v, queryErr := url.ParseQuery(r.URL.RawQuery)
+	if queryErr != nil {
+		problem(w, http.StatusBadRequest, "Invalid query parameters")
+		return
+	}
 	in := Search{Query: v.Get("query"), LogType: v.Get("type"), From: v.Get("from"), To: v.Get("to"), Sort: v.Get("sort"), Order: v.Get("order")}
 	var cur cursor
 	if token := v.Get("cursor"); token != "" {
@@ -160,7 +165,7 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	p["limit"] = strconv.Itoa(limit + 1)
-	rows, e := s.Store.CH.EventRows(r.Context(), "SELECT * EXCEPT expires_at FROM events WHERE "+where+" ORDER BY "+in.Sort+" "+in.Order+", id "+in.Order+" LIMIT {limit:UInt32}", p)
+	rows, e := s.Store.CH.EventPageRows(r.Context(), "SELECT * EXCEPT expires_at FROM events WHERE "+where+" ORDER BY "+in.Sort+" "+in.Order+", id "+in.Order+" LIMIT {limit:UInt32}", p)
 	if e != nil {
 		databaseError(w, e)
 		return

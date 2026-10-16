@@ -27,6 +27,7 @@ def words(value, section, key):
 class StartupContracts(unittest.TestCase):
     def setUp(self):
         self.units = {path.name: unit(path) for path in (APPLIANCE / "systemd").glob("*.service")}
+        self.units.update({path.name: unit(path) for path in (APPLIANCE / "systemd").glob("*.timer")})
         self.units.update({path.name.removesuffix(".container.in") + ".service": unit(path) for path in (APPLIANCE / "quadlet").glob("*.container.in")})
 
     def test_declared_startup_order_is_acyclic(self):
@@ -71,6 +72,15 @@ class StartupContracts(unittest.TestCase):
             self.assertIn(name, words(verify, "Unit", "Wants"))
         self.assertFalse(words(verify, "Unit", "Conflicts"))
 
+    def test_boot_verification_rechecks_late_vendor_flags_and_interrupted_work(self):
+        timer = self.units['nebulalog-reboot-verify.timer']
+        self.assertEqual(words(timer, 'Timer', 'Unit'), {'nebulalog-reboot-verify.service'})
+        self.assertEqual(words(timer, 'Timer', 'OnBootSec'), {'3min'})
+        self.assertEqual(words(timer, 'Timer', 'OnUnitInactiveSec'), {'15min'})
+        enabled = [line for line in (APPLIANCE / 'install-host.sh').read_text().splitlines()
+                   if line.startswith('systemctl enable ')]
+        self.assertTrue(any('nebulalog-reboot-verify.timer' in line.split() for line in enabled))
+
     def test_console_can_enroll_before_runtime_gate_is_ready(self):
         value = self.units["nebulalog-console.service"]
         dependencies = words(value, "Unit", "After") | words(value, "Unit", "Requires")
@@ -93,6 +103,16 @@ class StartupContracts(unittest.TestCase):
         self.assertIn("@@define DBDIR /var/lib/nebulalog/manager/aide\n", config)
         self.assertIn("database_in=file:@@{DBDIR}/aide.db.gz\n", config)
         self.assertNotIn("aide --init", installer)
+
+    def test_vendor_only_factory_keeps_os_and_app_updates_without_livepatch_timer(self):
+        installer = (APPLIANCE / 'install-host.sh').read_text()
+        enabled = set()
+        for line in installer.splitlines():
+            if line.startswith('systemctl enable '):
+                enabled.update(line.split()[2:])
+        self.assertIn('nebulalog-os-update.timer', enabled)
+        self.assertIn('nebulalog-app-update.timer', enabled)
+        self.assertNotIn('nebulalog-livepatch.timer', enabled)
 
 
 if __name__ == "__main__":

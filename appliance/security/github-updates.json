@@ -2,5 +2,6 @@
   "schema": 1,
   "repository": "stellaraf/captains-log",
   "automatic_updates": true,
+  "automatic_livepatch": false,
   "poll_interval_seconds": 900
 }

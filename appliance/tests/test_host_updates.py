@@ -59,7 +59,11 @@ class HostUpdateFixture(HostFixture):
         self.crash = None
         self.omit_host = False
         self.fail_evidence = None
-        self.manager = updates.UpdateManager(self.state, self.root / "unused-hooks", self.runner)
+        hooks = self.root / "unused-hooks"
+        hooks.mkdir()
+        for name in dispatch.HOOK_STATES:
+            (hooks / name).write_text("inert fixed hook fixture")
+        self.manager = updates.UpdateManager(self.state, hooks, self.runner)
 
     def sign(self):
         (self.bundle / "manifest.json").write_bytes(payload.encoded(self.manifest))
@@ -76,7 +80,13 @@ class HostUpdateFixture(HostFixture):
         self.calls.append((name, "legacy", None))
         if name == "update-backup": result.update(postgresql=True, configuration=True)
         if name == "update-health": result["checks"] = {key: True for key in updates.REQUIRED_CHECKS}
-        if self.fail == name: raise Refused("fixture failure")
+        stage = Path(argv[1])
+        journal = dispatch.HookJournal(stage, json.loads((self.state / "transaction.json").read_text()))
+        ticket = journal.enter(name)
+        if self.fail == name:
+            journal.finish(ticket, "failed")
+            raise Refused("fixture failure")
+        journal.finish(ticket, "success", result=result)
         return json.dumps(result)
 
     def hook(self, pin, name, stage):
@@ -84,12 +94,20 @@ class HostUpdateFixture(HostFixture):
         tx, manifest = dispatch.transaction_binding(stage)
         self.calls.append((name, pin["generation"], tx["state"]))
         self.assertEqual(command[-3], str(self.generations / self.old["generation"]))
+        journal = dispatch.HookJournal(stage, tx)
+        ticket = journal.enter(name)
         if self.crash == name: raise PowerLoss()
-        if self.fail == name: raise Refused("fixture hook failure")
+        if self.fail == name:
+            journal.finish(ticket, "failed")
+            raise Refused("fixture hook failure")
         result = {"ok": True}
         plan_path = stage / "host-runtime-plan.json"
         if not plan_path.exists():
             atomic_json(plan_path, {"fixture": "lifecycle evidence only", "sequence": tx["sequence"]})
+        if name == "update-preflight":
+            # This mocked hook models the durable proof produced by real preflight;
+            # adapter tests independently validate its contents and recovery use.
+            atomic_json(stage / "adapter-backup-intent.json", {"fixture": "preactivation evidence only"})
         if name == "update-backup":
             atomic_json(self.maintenance, {"active": True})
             result.update(postgresql=True, configuration=True)
@@ -105,6 +123,7 @@ class HostUpdateFixture(HostFixture):
                 "candidate_generation": self.new["generation"], "checks": checks,
                 "plan_sha256": payload.digest(plan_path.read_bytes())}
         if name == "update-finalize": self.maintenance.unlink(missing_ok=True)
+        journal.finish(ticket, "success", result=result)
         return result
 
     def install(self):
@@ -118,6 +137,13 @@ class HostSignatureTests(HostUpdateFixture):
     def verify(self, **kwargs):
         return updates.verify_release(self.bundle / "manifest.json", self.bundle / "manifest.sig", self.public, self.bundle,
             current_sequence=9, current_versions={"host": "0.1.0", "nebulalog": "0.1.0"}, now=datetime(2026, 9, 9, tzinfo=timezone.utc), **kwargs)
+
+    def test_livepatch_recovery_prevents_component_activation(self):
+        with patch.object(updates.livepatch, 'require_settled', side_effect=Refused('Livepatch recovery')) as gate:
+            with self.assertRaisesRegex(Refused, 'Livepatch recovery'):
+                self.install()
+        gate.assert_called_once_with(self.state)
+        self.assertEqual(self.calls, [])
 
     def test_signed_host_bundle_and_metadata_only_contract(self):
         self.assertTrue(self.verify()["artifacts_verified"])
@@ -154,7 +180,7 @@ class HostEngineTests(HostUpdateFixture):
     def test_status_recovery_action_tracks_durable_state_and_prioritizes_os_recovery(self):
         for state in ("preflight", "preparing", "activating", "checking", "rolling_back", "recovery_required", "committed", "rolled_back", "preflight_failed"):
             for finalization in ("pending", "complete"):
-                transaction = {"state": state, "finalization": finalization}
+                transaction = {**self.transaction, "state": state, "finalization": finalization}
                 atomic_json(self.state / "transaction.json", transaction)
                 expected = None if state == "preflight_failed" else "nebulalog update finalize" if state in {"committed", "rolled_back"} and finalization != "complete" else None if state in {"committed", "rolled_back"} else "nebulalog update recover"
                 with self.subTest(state=state, finalization=finalization):
@@ -170,6 +196,9 @@ class HostEngineTests(HostUpdateFixture):
                     "sequence": 10, "manifest_sha256": payload.digest((self.bundle / "manifest.json").read_bytes())}
         def refuse(pin, name, stage):
             atomic_json(stage / "host-refusal.json", expected)
+            journal = dispatch.HookJournal(stage, json.loads((self.state / "transaction.json").read_text()))
+            ticket = journal.enter(name)
+            journal.finish(ticket, "failed")
             raise Refused("private fixture exception must never enter transaction")
         with patch.object(dispatch, "run_hook", side_effect=refuse), self.assertRaises(Refused): self.install()
         transaction = self.manager.status()["transaction"]
@@ -227,7 +256,7 @@ class HostEngineTests(HostUpdateFixture):
         self.assertEqual([name for name, _, _ in self.calls[before:]], ["update-health", "update-finalize"])
         self.assertTrue(all(pin == self.old["generation"] for _, pin, _ in self.calls))
 
-    def test_interrupted_activation_recovers_without_candidate_archive_or_code(self):
+    def test_interrupted_activation_stays_held_without_terminal_even_if_candidate_archive_is_gone(self):
         self.crash = "update-activate"
         with self.assertRaises(PowerLoss): self.install()
         self.assertEqual(self.manager.status()["transaction"]["state"], "activating")
@@ -235,11 +264,12 @@ class HostEngineTests(HostUpdateFixture):
         self.corrupt_generation(self.new)
         (self.retained() / "host.tar").unlink()
         self.crash = None
-        result = self.manager.recover(self.public)
-        self.assertEqual(result["state"], "rolled_back")
-        self.assertEqual(result["finalization"], "complete")
-        self.assertEqual(self.manager.status()["current"], {**self.initial, "sequence": 10})
-        self.assertEqual(activation.selection()["generation"], self.old["generation"])
+        before = list(self.calls)
+        with self.assertRaisesRegex(Refused, "outcome is unresolved"):
+            self.manager.recover(self.public)
+        self.assertEqual(self.calls, before)
+        self.assertEqual(activation.selection()["generation"], self.new["generation"])
+        self.assertTrue(self.manager.status()["hook_outcome_unsettled"])
 
     def test_crash_before_host_preparation_journal_recovers_still_selected_previous(self):
         with patch.object(activation, "prepare", side_effect=PowerLoss), self.assertRaises(PowerLoss): self.install()

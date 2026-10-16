@@ -1,9 +1,11 @@
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import tempfile
+from types import SimpleNamespace
 import unittest
 import xml.etree.ElementTree as ET
 from unittest.mock import patch
@@ -43,6 +45,15 @@ class RuntimeBoundaryTests(unittest.TestCase):
         self.assertNotIn("GroupAdd=20001", lines)
         self.assertIn("Environment=COLLECTOR_TLS_CA_PATH=/etc/nebulalog/tls/ca.crt", lines)
         self.assertIn("Environment=COLLECTOR_TLS_CERT_PATH=/etc/nebulalog/tls/server.crt", lines)
+
+    def test_application_roles_mount_only_the_read_only_host_storage_fence(self):
+        for role in ("api", "ingest"):
+            with self.subTest(role=role):
+                lines = (REPO / ("appliance/quadlet/nebulalog-" + role + ".container.in")).read_text().splitlines()
+                self.assertEqual([line for line in lines if "storage-maintenance" in line], [
+                    "Environment=STORAGE_MAINTENANCE_PATH=/run/nebulalog-storage-maintenance/gate.json",
+                    "Volume=/var/lib/nebulalog/manager/storage-maintenance:/run/nebulalog-storage-maintenance:ro,z",
+                ])
 
     def test_realm_has_no_password_grant_and_requires_second_factor(self):
         template = json.loads((REPO / "deploy/keycloak/realm.json").read_text())
@@ -93,6 +104,9 @@ class ProvisioningTests(unittest.TestCase):
         self.manager.setup = copy.deepcopy(SETUP)
         self.manager.secret = {key: "a" * 64 for key in ("postgresql_admin", "postgresql_app", "postgresql_keycloak", "clickhouse", "keycloak_bootstrap", "identity_service")}
         self.manager.runtime = copy.deepcopy(RUNTIME)
+        schema_probe = patch.object(self.manager, "_schema_revision", return_value="2")
+        schema_probe.start()
+        self.addCleanup(schema_probe.stop)
         self.manager.state = {"installation_id": SETUP["installation_id"], "completed": []}
 
     def test_existing_administrator_is_never_reset(self):
@@ -176,6 +190,9 @@ class ProvisioningTests(unittest.TestCase):
             self.manager.prepare(self.manager.bootstrap / "setup.json", self.manager.bootstrap / "secrets.json")
         self.assertLess(stages.index("lifecycle"), stages.index("edge"))
         self.assertLess(stages.index("edge"), stages.index("installed-release"))
+        self.assertLess(stages.index("directories"), stages.index("storage-maintenance"))
+        self.assertLess(stages.index("storage-maintenance"), stages.index("images"))
+        self.assertLess(stages.index("storage-maintenance"), stages.index("postgresql"))
 
     def test_evidence_requires_recent_clean_aide_only_for_final_completion(self):
         from nebulalog_manager.firstboot import FINAL_CHECKS, RUNTIME_CHECKS
@@ -271,7 +288,7 @@ class ProvisioningTests(unittest.TestCase):
         descriptor.write_text(json.dumps({"schema": 1, "sequence": 7, "publisher": {"mode": "private-unsealed"}}))
         mapping = {"nebulalog": "NEBULALOG_IMAGE", "postgresql": "POSTGRESQL_IMAGE", "clickhouse": "CLICKHOUSE_IMAGE", "keycloak": "KEYCLOAK_FIPS_IMAGE"}
         self.manager.pins = {image: "qualified/" + name + "@sha256:" + "a" * 64 for name, image in mapping.items()}
-        receipt = {"schema": 1, "ok": True, "status": "enrolled", "installation_id": SETUP["installation_id"], "initial_release_sha256": hashlib.sha256(descriptor.read_bytes()).hexdigest(), "current": {"sequence": 7, "version": "0.1.0", "components": {name: {"version": "0.1.0", "image": self.manager.pins[image], "schema_revision": "1"} for name, image in mapping.items()}}, "publisher_trust": "not_enrolled", "qualification_status": "pending", "build_mode": "private-unsealed", "update_ready": False}
+        receipt = {"schema": 1, "ok": True, "status": "enrolled", "installation_id": SETUP["installation_id"], "initial_release_sha256": hashlib.sha256(descriptor.read_bytes()).hexdigest(), "current": {"sequence": 7, "version": "0.1.0", "components": {name: {"version": "0.1.0", "image": self.manager.pins[image], "schema_revision": "2"} for name, image in mapping.items()}}, "publisher_trust": "not_enrolled", "qualification_status": "pending", "build_mode": "private-unsealed", "update_ready": False}
         host = {"generation": "1" * 64, "version": "0.0.0-factory.fixture", "host_source_sha256": "2" * 64, "abi": 1}
         receipt["current"]["components"]["host"] = host
         calls = []
@@ -298,6 +315,10 @@ class ProvisioningTests(unittest.TestCase):
             with self.assertRaisesRegex(Refused, "host generation"):
                 self.manager._installed_release()
             receipt["current"]["components"]["host"] = host
+            receipt["current"]["components"]["baseline"] = {"version": "guessed-from-package-version"}
+            with self.assertRaisesRegex(Refused, "inventory is incomplete"):
+                self.manager._installed_release()
+            receipt["current"]["components"].pop("baseline")
             receipt["current"]["components"]["clickhouse"]["image"] = "different@sha256:" + "b" * 64
             with self.assertRaises(Refused):
                 self.manager._installed_release()
@@ -498,6 +519,158 @@ class CertificateTests(unittest.TestCase):
                     manager._edge_certificates()
                 self.assertEqual((edge / "server.key").read_bytes(), original["server.key"])
                 self.assertEqual((manager.tls / "server.crt").read_bytes(), original["server.crt"])
+
+
+class StorageMaintenanceBootstrapTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.data = self.root / "data"
+        self.data.mkdir(mode=0o700)
+        self.calls = []
+        self.manager = Bootstrap(Locations(self.root / "etc", self.data, self.root / "run"),
+                                 runner=lambda argv, **kwargs: self.calls.append(argv))
+        self.manager.state = {"completed": ["directories"]}
+        self.directory = self.data / "manager/storage-maintenance"
+        self.gate = self.directory / "gate.json"
+        self.foreign_inodes = set()
+        if os.geteuid() != 0:
+            # macOS developer runs retain real modes, types, bytes and descriptor
+            # identity. The root Rocky run uses the actual ownership checks too.
+            actual = os.fstat
+            def ownership(fd):
+                info = actual(fd)
+                fields = {key: getattr(info, key) for key in (
+                    "st_mode", "st_uid", "st_gid", "st_size", "st_dev", "st_ino", "st_nlink", "st_mtime_ns", "st_ctime_ns")}
+                fields.update(st_uid=10001 if info.st_ino in self.foreign_inodes else 0, st_gid=0)
+                return SimpleNamespace(**fields)
+            for replacement in (patch("nebulalog_manager.bootstrap.os.fstat", side_effect=ownership),
+                                patch("nebulalog_manager.bootstrap.os.fchown")):
+                replacement.start()
+                self.addCleanup(replacement.stop)
+
+    def create(self):
+        result = self.manager._storage_maintenance()
+        self.manager.state["completed"].append("storage-maintenance")
+        return result
+
+    def test_fresh_gate_exact_permissions_and_byte_preserving_retry(self):
+        expected = {"schema": 1, "held": False, "delivery_held": False, "operation": None}
+        previous_umask = os.umask(0o077)  # Match the appliance systemd services.
+        try:
+            self.assertEqual(self.create(), expected)
+        finally:
+            os.umask(previous_umask)
+        self.assertEqual(self.directory.stat().st_mode & 0o7777, 0o755)
+        self.assertEqual(self.gate.stat().st_mode & 0o7777, 0o644)
+        if os.geteuid() == 0:
+            for path in (self.directory, self.gate):
+                self.assertEqual((path.stat().st_uid, path.stat().st_gid), (0, 0))
+        before = self.gate.read_bytes(), self.gate.stat().st_ino, self.gate.stat().st_mtime_ns
+        self.assertEqual(self.manager._storage_maintenance(), expected)
+        self.assertEqual((self.gate.read_bytes(), self.gate.stat().st_ino, self.gate.stat().st_mtime_ns), before)
+        self.assertEqual(self.calls, [["restorecon", "-RF", str(self.directory)]])
+
+    def test_existing_foreign_operation_hold_is_preserved_without_normalization(self):
+        self.create()
+        for delivery in (False, True):
+            value = {"schema": 1, "held": True, "delivery_held": delivery, "operation": "f" * 64}
+            raw = json.dumps(value, indent=3).encode() + b"\n"
+            self.gate.write_bytes(raw)
+            before = self.gate.stat().st_ino, self.gate.stat().st_mtime_ns
+            self.assertEqual(self.manager._storage_maintenance(), value)
+            self.assertEqual(self.gate.read_bytes(), raw)
+            self.assertEqual((self.gate.stat().st_ino, self.gate.stat().st_mtime_ns), before)
+
+    def test_lost_gate_or_directory_after_initialization_is_not_recreated(self):
+        self.create()
+        self.gate.unlink()
+        with self.assertRaises(Refused):
+            self.manager._storage_maintenance()
+        self.assertFalse(self.gate.exists())
+        self.directory.rmdir()
+        with self.assertRaises(Refused):
+            self.manager._storage_maintenance()
+        self.assertFalse(self.directory.exists())
+
+    def test_existing_empty_directory_and_older_runtime_are_not_adopted(self):
+        self.directory.mkdir(parents=True, mode=0o755)
+        with self.assertRaises(Refused):
+            self.manager._storage_maintenance()
+        self.assertEqual(list(self.directory.iterdir()), [])
+        self.directory.rmdir()
+        self.manager.state["completed"].append("images")
+        with self.assertRaisesRegex(Refused, "lost"):
+            self.manager._storage_maintenance()
+        self.assertFalse(self.directory.exists())
+
+    def test_symlink_directory_and_gate_are_refused_without_touching_targets(self):
+        self.create()
+        raw = self.gate.read_bytes()
+        target = self.root / "retained.json"
+        self.gate.rename(target)
+        self.gate.symlink_to(target)
+        with self.assertRaises(Refused):
+            self.manager._storage_maintenance()
+        self.assertEqual(target.read_bytes(), raw)
+        self.gate.unlink()
+        self.directory.rmdir()
+        self.directory.symlink_to(self.root)
+        with self.assertRaises(Refused):
+            self.manager._storage_maintenance()
+        self.assertFalse((self.root / "gate.json").exists())
+
+    def test_symlink_manager_is_refused_before_creation(self):
+        (self.data / "manager").symlink_to(self.root)
+        with self.assertRaises(Refused):
+            self.manager._storage_maintenance()
+        self.assertFalse((self.root / "storage-maintenance").exists())
+
+    def test_bad_directory_or_file_permissions_and_owner_are_not_repaired(self):
+        self.create()
+        for path, bad, good in ((self.directory, 0o777, 0o755), (self.gate, 0o666, 0o644), (self.gate, 0o600, 0o644)):
+            with self.subTest(path=path.name, mode=oct(bad)):
+                path.chmod(bad)
+                with self.assertRaises(Refused):
+                    self.manager._storage_maintenance()
+                self.assertEqual(path.stat().st_mode & 0o777, bad)
+                path.chmod(good)
+        if os.geteuid() == 0:
+            os.chown(self.gate, 10001, 10001)
+        else:
+            self.foreign_inodes.add(self.gate.stat().st_ino)
+        with self.assertRaisesRegex(Refused, "root-owned"):
+            self.manager._storage_maintenance()
+
+    def test_nonregular_hardlinked_and_oversized_gate_are_refused(self):
+        self.create()
+        os.link(self.gate, self.root / "extra-link")
+        with self.assertRaises(Refused):
+            self.manager._storage_maintenance()
+        (self.root / "extra-link").unlink()
+        self.gate.write_bytes(b" " * 4097)
+        with self.assertRaises(Refused):
+            self.manager._storage_maintenance()
+        self.assertEqual(self.gate.stat().st_size, 4097)
+        self.gate.unlink()
+        os.mkfifo(self.gate, 0o644)
+        with self.assertRaises(Refused):
+            self.manager._storage_maintenance()
+
+    def test_invalid_duplicate_and_inconsistent_json_is_preserved(self):
+        self.create()
+        valid = {"schema": 1, "held": False, "delivery_held": False, "operation": None}
+        malformed = [b"{}", b"not-json", b'{"schema":1,"schema":1,"held":false,"delivery_held":false,"operation":null}']
+        for change in ({"schema": True}, {"held": None}, {"delivery_held": True}, {"operation": "a" * 64},
+                       {"held": True}, {"held": True, "operation": "a" * 63}, {"extra": False}):
+            malformed.append(json.dumps({**valid, **change}).encode())
+        for raw in malformed:
+            with self.subTest(raw=raw):
+                self.gate.write_bytes(raw)
+                with self.assertRaises(Refused):
+                    self.manager._storage_maintenance()
+                self.assertEqual(self.gate.read_bytes(), raw)
 
 
 if __name__ == "__main__":

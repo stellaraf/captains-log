@@ -75,6 +75,27 @@ class SocketTests(unittest.TestCase):
                 self.assertEqual(result["reason"], "peer_not_authorized")
                 service.handle.assert_not_called()
 
+    def test_refused_peer_without_write_eof_does_not_hold_connection_open(self):
+        client, server = self.pair()
+        client.sendall(struct.pack("!I", 2) + b"{}")
+        service = Mock()
+        wire.handle_connection(server, service, credentials=lambda _: (42, 0, 0))
+        response = b""
+        while part := client.recv(65536):
+            response += part
+        self.assertEqual(json.loads(response[4:])["reason"], "peer_not_authorized")
+        service.handle.assert_not_called()
+
+    def test_refusal_drain_is_bounded_even_if_peer_keeps_sending(self):
+        connection = Mock()
+        connection.recv.side_effect = lambda count: b"x" * count
+        service = Mock()
+        wire.handle_connection(connection, service, credentials=lambda _: (42, 0, 0))
+        self.assertEqual(sum(call.args[0] for call in connection.recv.call_args_list), wire.MAX_REQUEST + 4)
+        connection.setblocking.assert_called_once_with(False)
+        connection.close.assert_called_once()
+        service.handle.assert_not_called()
+
     def test_linux_peer_credentials_exact_struct_and_platform(self):
         connection = Mock()
         with patch.object(wire.platform, "system", return_value="Linux"), patch.object(wire.socket, "SO_PEERCRED", 17, create=True):

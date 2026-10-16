@@ -81,7 +81,7 @@ def locked(path: Path):
     fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        yield
+        yield fd
     except BlockingIOError as exc:
         raise Refused("Another appliance transaction is already running") from exc
     finally:

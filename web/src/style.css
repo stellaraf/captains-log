@@ -2858,6 +2858,132 @@ fieldset {
   font-size: 11px;
   margin-top: 7px;
 }
+.emergency-storage {
+  margin-top: 24px;
+}
+.emergency-storage h3,
+.emergency-observation > div,
+.emergency-save {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.emergency-storage .section-toolbar p,
+.emergency-observation p,
+.emergency-minimums p {
+  max-width: 90ch;
+  line-height: 1.65;
+}
+.emergency-storage fieldset {
+  border: 0;
+  padding: 0;
+  margin: 18px 0;
+  min-width: 0;
+}
+.emergency-storage .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.emergency-enable,
+.emergency-confirm {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  line-height: 1.6;
+}
+.emergency-storage input[type="checkbox"] {
+  min-height: 0;
+  margin: 4px 0 0;
+  flex: none;
+}
+.emergency-observation {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  background: var(--raised);
+}
+.emergency-observation p {
+  margin: 9px 0 0;
+}
+.emergency-thresholds {
+  display: flex;
+  gap: 16px 32px;
+  flex-wrap: wrap;
+  margin: 18px 0;
+}
+.emergency-thresholds label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.emergency-thresholds input {
+  width: 68px;
+}
+.emergency-thresholds span {
+  color: var(--muted);
+}
+.emergency-minimums {
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: 14px 0;
+  margin: 18px 0;
+}
+.emergency-minimums summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.emergency-confirm {
+  max-width: 90ch;
+  margin: 16px 0;
+}
+.emergency-history {
+  border-top: 1px solid var(--border);
+  padding-top: 4px;
+  margin-top: 20px;
+}
+.emergency-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.emergency-table-scroll table {
+  width: 100%;
+  min-width: 700px;
+  border-collapse: collapse;
+  text-align: left;
+}
+.emergency-table-scroll th,
+.emergency-table-scroll td {
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+  line-height: 1.6;
+}
+.emergency-table-scroll th {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+.emergency-table-scroll td:last-child {
+  max-width: 420px;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 600px) {
+  .emergency-storage .section-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .emergency-thresholds {
+    flex-direction: column;
+  }
+}
 @media (max-width: 768px) {
   .provider-state-action {
     align-items: flex-start;

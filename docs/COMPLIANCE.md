@@ -2,7 +2,7 @@
 
 Captain’s Log separates **selected policy**, **completed assessment**, **automated results**, and **explicit review**. Selecting Unified, producing an HTML report, or approving an exception does not make failed rules pass and does not certify the appliance. FIPS, encryption, SELinux, auditing and firewall requirements remain mandatory independently of baseline selection.
 
-The first-boot workflow is implemented by `nebulalog-baseline`. It invokes the existing `security.scan` OpenSCAP adapter without `--remediate`, preserves evidence on encrypted appliance storage, and binds a separate review receipt to the installation and exact assessment. These are host workflow commands; the final administrator-facing UI integration and actual guest qualification remain release requirements.
+The first-boot workflow is implemented by `nebulalog-baseline`. Its assessment command invokes the `security.scan` OpenSCAP adapter without `--remediate`, preserves evidence on encrypted appliance storage, and binds a separate review receipt to the installation and exact assessment. These are host workflow commands; the final administrator-facing UI integration and actual guest qualification remain release requirements.
 
 ## Installed content and applicability
 
@@ -60,10 +60,10 @@ Content review expires within one year. The datastream must contain the exact ch
 For Unified, include exactly one CIS and one STIG assessment plus `unified_mapping: {"path": "/absolute/path/to/reviewed-mapping.json", "sha256": "ACTUAL_SHA256"}`. The mapping document requires:
 
 - `schema: 1`, `baseline: "unified"`, `coverage_reviewed: true`, and a `review` object with the same explicit review fields as above.
-- `assessments` keyed by `cis` and `stig`, each with the selected `sha256` and `profile_id`.
+- `assessments` keyed by `cis` and `stig`, each binding `sha256`, `base_profile_id`, effective `profile_id`, `tailoring_sha256` (null for an untailored profile), and `selection_sha256`. The selection hash covers canonical rule, value and group decisions, including their review rationale. `assessment_binding` and the factory review-input builder produce this exact identity. Paths and initial-console reviewer/timestamps are excluded; they cannot authorize a change in the assessment's meaning.
 - A nonempty `controls` array. Each entry records unique `control`, `cis_rule`, `stig_rule`, `decision`, `rationale`, and `effective_setting`.
 
-Decisions are `same-once`, `stricter-compatible`, `direct-conflict`, `application-exception`, `cis-only`, or `stig-only`. Rule IDs must exist in the corresponding pinned benchmark; an absent side uses JSON null for a one-sided control. Duplicate control IDs/pairs are rejected. Document STIG precedence for direct conflicts, or the explicit reason for a different decision. Machine validation checks references and binding; complete control coverage and the correctness of effective settings still require human review. This scanner does not apply the mapping or perform remediation.
+Decisions are `same-once`, `stricter-compatible`, `direct-conflict`, `application-exception`, `cis-only`, or `stig-only`. Rule IDs must exist in the corresponding pinned benchmark; an absent side uses JSON null for a one-sided control. Duplicate control IDs/pairs and omitted original benchmark rules are rejected. Document STIG precedence for direct conflicts, or the explicit reason for a different decision. Machine validation checks complete rule coverage and binding; semantic compatibility and the correctness of effective settings still require review. The assessment operation does not remediate the host. The separate initial-hardening operation can apply one explicitly reviewed merged profile as described below.
 
 After reviewing the concrete policy and its hash:
 
@@ -74,6 +74,42 @@ nebulalog-baseline status
 ```
 
 ## Assessment evidence
+
+### Initial application of a selected policy
+
+The initial setup console now exposes **HARDENING** before file-integrity
+enrollment. For a selected, reviewed CIS Level 2 or STIG policy, it confirms the
+operation locally and invokes `nebulalog-baseline remediate` with the selected
+policy's exact hash. The equivalent CLI is:
+
+```sh
+nebulalog-baseline remediate --confirm-policy-sha256 ACTUAL_SELECTED_POLICY_SHA256
+```
+
+This operation requires the actual installation's encrypted configuration and
+host-ready gate. It serializes with firstboot, runtime preparation, and AIDE;
+completed setup or any existing AIDE enrollment state refuses initial
+remediation. It snapshots the reviewed SCAP content, applies that profile's
+OpenSCAP fixes, and retains the policy, inputs, reports, scanner exit code, and
+host security postconditions in `configuration/baseline-remediations/`.
+Existing assessment acceptance is invalidated before changes begin. A failed
+run preserves its evidence and requires review; it does not claim rollback of
+arbitrary operating-system fixes.
+
+A completed remediation command is not compliance acceptance. Findings can
+remain even with successful command execution. Enroll file integrity after
+applying hardening, then perform a fresh assessment and findings review.
+Unified remediation requires a `unified_remediation` profile derived from the
+pinned STIG base and bound by the mapping to its exact source, effective profile
+and tailoring hash. Every control decision must name its `applied_rule`, or an
+explicit `application-exception` with no applied rule. The effective merged rule
+set must equal that register. One merged profile is applied once; CIS and STIG
+are then assessed independently. Applying the two original profiles sequentially
+would not implement the reviewed conflict mapping.
+
+This implementation still needs native guest qualification and a complete,
+reviewed Unified factory policy for out-of-box setup. Source changes do not
+establish that an existing frozen candidate contains them.
 
 Assessment runs only as root on the actual supported Rocky 9 x86_64 guest. Each scan records installation ID, selected policy/hash, machine identity hash, OS/kernel and scanner/package versions, host security status, raw per-rule results, counts and original automated result. It retains policy, datastream, XML and HTML snapshots under `configuration/baseline-assessments/<scan-id>/` with SHA-256 hashes. Unified also retains its reviewed mapping. The current receipt is `configuration/baseline-assessment.json`.
 
@@ -114,6 +150,134 @@ The command writes `configuration/baseline-review.json` and an audit event. `bas
 
 The legacy `nebulalog compliance status` measures host controls, and `nebulalog compliance scan --policy ... --output ...` remains the low-level scanner. Running it alone does not create the installation-bound first-boot review receipt. The final CLI/UI dispatcher must use the baseline workflow for that purpose.
 
-Tailored profiles are explicitly unavailable in this workflow: the existing scanner validates profile IDs against the source datastream, whereas normal tailoring creates a distinct effective profile. This implementation refuses tailoring rather than silently assessing its base profile. A proper base/effective-profile adapter, reviewed baseline remediation, signed content updates, comprehensive unified coverage mapping, and the final UI workflow remain required. [OpenSCAP tailoring documentation](https://static.open-scap.org/openscap-1.4.1/oscap_user_manual.html).
+Tailored rule selections are supported with explicit base/effective-profile binding as described below. Native qualification of initial remediation, signed content updates, comprehensive unified coverage mapping, and the final UI workflow remain required. [OpenSCAP tailoring documentation](https://static.open-scap.org/openscap-1.4.1/oscap_user_manual.html).
 
 Targeted fixture tests exercise actual scanner command construction, retained artifacts, strict selection, explicit approval, manual evidence, failure/expiry/tamper gates, failed-rescan invalidation and unavailable content. They do not prove guest results or benchmark alignment. Release evidence still requires scans on each selected baseline, a qualified coverage/license review, deliberate failure/manual/exception cases, and actual first-boot integration on the built Rocky appliance.
+
+
+### Appliance profile tailoring
+
+The baseline manager supports a restricted XCCDF 1.2 tailoring format for
+appliance-specific rule selections. A reviewed policy must name both the actual
+installed `base_profile_id` and distinct effective `profile_id`, pin
+`tailoring_sha256`, and include `tailoring_decisions` with a rule ID, boolean
+selection, rationale, and effective control for every override. The tailoring
+must contain exactly one profile extending that base, with a local datastream
+filename in its benchmark reference. Extra profiles, free-form values, group
+disabling, embedded fixes, unknown rules, and unrecorded selections are refused.
+Enabling a group requires the complete source-derived descendant inventory and
+explicit rationale, as well as exact effective-rule coverage for Unified.
+
+Assessment and remediation explicitly pass the effective profile and tailoring
+file to OpenSCAP. Remediation captures both inputs together before applying
+fixes; assessment retains the exact tailoring alongside its policy and reports.
+Tailoring does not grant compliance approval: excluded controls still require
+explicit findings/profile review. The packaged CIS source identifies a RHEL
+benchmark; tailoring must not be advertised as proof of full coverage of the
+current Rocky-specific CIS benchmark.
+
+Factory tailoring choices and their native-guest validation remain release
+requirements. In particular, blindly applying the raw CIS profile can remove
+httpd, and crypto-policy remediations can conflict with the appliance FIPS
+configuration. Those conflicts must be resolved and documented before offering
+an out-of-box profile as release-ready.
+
+
+### Bundled first-boot content
+
+The factory image installs `baseline-catalog.json`, `baseline-cis.xml`, and
+`baseline-stig.xml` as measured host-generation defaults. The catalog pins the
+Rocky RPM datastream SHA-256 and exact benchmark versions; a changed installed
+datastream is refused until its adaptation is reviewed and repackaged.
+
+When no policy has been selected, the local HARDENING action presents the
+benchmark limitations and every appliance exception. The operator explicitly
+accepts that content and enters a name for a 90-day content-review record.
+A separate APPLY confirmation runs remediation. Neither action creates a
+compliance findings approval or completes setup. Cancellation before content
+acceptance writes no policy. An already selected policy retains its identity.
+
+The shipped candidates preserve the HTTPS endpoint, pinned FIPS policy, disabled
+SSH access, and the appliance's installation-bound AIDE lifecycle. These are
+explicit exceptions, not claims that the corresponding benchmark controls have
+passed. Unified remains unavailable until its executable conflict mapping is
+complete. The candidates require native OpenSCAP and appliance service testing
+before release; unit tests alone do not qualify their effective hardening.
+
+
+The October 12 build candidates use Rocky `scap-security-guide-0.1.82-2.el9_8.rocky.1.1`
+with datastream SHA-256
+`769e4de0ee8ee67334745f97088043591d97694f3f494d07d9d0fa44fed02a51`.
+Its CIS profile still identifies RHEL 9 v2.0.0; its STIG profile identifies V2R9.
+OpenSCAP 1.3.14 parsed both effective profiles, validated their XSD schemas, and
+generated syntactically valid shell remediation plans with the declared fixes
+excluded and no crypto-policy reset remaining. The Rocky tool lacks Tailoring
+Schematron rules, so XSD validation explicitly used `--skip-schematron`; this is
+not a claim of full Schematron validation or guest compliance. The generated
+plans contain 396 CIS and 469 STIG rule entries, including rules without fixes.
+No generated plan was executed as part of this tooling validation.
+
+
+To resolve differing benchmark values, a tailoring may use `refine-value` with
+an exact named selector already defined by the pinned datastream. Every override
+must also appear in `tailoring_values` as `value_id`, `selector`, and `rationale`.
+Unknown selectors, duplicate decisions, free-form `set-value`, and XML overrides
+without matching policy decisions are refused. First boot displays value choices
+alongside rule exceptions. This mechanism supports explicit stronger-setting and
+conflict decisions; it does not itself establish a complete Unified mapping.
+
+### Unified factory preparation and value conflicts
+
+The factory loader supports a reviewed Unified catalog entry with fixed files
+`baseline-unified.xml` and `baseline-unified-mapping.json`. The catalog binds
+both hashes. Its two independent assessment candidates must remain the exact
+bundled CIS/STIG candidates recorded in the coverage review. Reusing profile IDs
+after changing assessment rules, values, tailoring bytes or decision rationale
+does not preserve that approval. An older mapping with only source hash and
+profile ID must undergo a fresh exact selection review. Initial-console content acceptance does not create
+or renew the mapping's coverage review, approve a site exception, or accept scan
+findings. Missing, expired, unreviewed or changed mappings are refused. The
+currently shipped catalog still contains only CIS and STIG: this loader does
+not make the outstanding Unified content review complete.
+
+For an executable Unified policy, the register also requires a
+`value_decisions` entry for every differing original CIS/STIG source value.
+Each entry binds `value_id`, both original `choices` (selector and value), a
+decision, rationale and the exact merged `effective` selector/value. Decisions
+are `stricter-compatible`, `direct-conflict`, or `application-exception`.
+Conflicts are measured before appliance tailoring, so changing both assessment
+profiles cannot hide a difference. Duplicate, missing or invented choices, and
+a merged value that differs from the register, are refused. The validator does
+not infer that a larger number, smaller number, or a STIG value is always more
+secure; those semantics require explicit review.
+
+Release-content maintainers can generate deterministic, unapproved review input
+using the pinned datastream and OpenSCAP build tooling:
+
+```sh
+PYTHONPATH=appliance python3 appliance/packer/build_unified_baseline.py \
+  --catalog-directory /absolute/path/to/factory-content review-inputs \
+  --datastream /absolute/path/to/ssg-rl9-ds.xml > unified-review-draft.json
+```
+
+The output keeps `coverage_reviewed: false`, `review.approved: false` and every
+decision pending. It lists all original selected rules, source value conflicts,
+and existing appliance adaptations. Matching rule identifiers alone do not
+prove that different rules can safely modify the same resource.
+
+After a complete merged policy and its coverage/conflict review exist, the
+`package` action validates them and captures fixed-name files into a new output
+directory. It refuses to overwrite an existing directory or package incomplete
+review. It preserves the existing mapping review unchanged:
+
+```sh
+PYTHONPATH=appliance python3 appliance/packer/build_unified_baseline.py \
+  --catalog-directory /absolute/path/to/factory-content package \
+  --policy /absolute/path/to/reviewed-unified-policy.json \
+  --output /absolute/path/to/new-unified-package
+```
+
+The package is build input. It still needs inclusion in the measured host
+payload, native OpenSCAP validation, guest remediation and fresh independent
+assessments. Neither the package receipt nor the fixture tests claim release
+qualification.

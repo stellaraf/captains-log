@@ -13,6 +13,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from nebulalog_manager import publisher_inputs
+from nebulalog_manager.image_bundle import ApplicationSchema as application_schema
 
 
 def sha(data):
@@ -102,6 +103,7 @@ def capture(root: Path, bundle: Path, output: Path, *, sequence: int, schema_rev
     if output.exists() or output.is_symlink():
         raise ValueError("Provenance output must be a new directory")
     manifest, commit, dirty = source_snapshot(root)
+    application_schema.bind_source(manifest["files"], schema_revision)
     publisher = publisher_provenance(root, manifest["files"], private_unsealed=private_unsealed)
     source = (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode()
     bundle_manifest = bundle / "manifest.json"

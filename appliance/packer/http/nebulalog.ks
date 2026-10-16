@@ -10,7 +10,7 @@ rootpw --lock
 selinux --enforcing
 firewall --enabled --service=ssh
 services --enabled="chronyd,firewalld,auditd,sshd,qemu-guest-agent" --disabled="kdump"
-bootloader --append="fips=1 audit=1 audit_backlog_limit=8192"
+bootloader --append="fips=1 module.sig_enforce=1 audit=1 audit_backlog_limit=8192"
 # The build layout uses vda for the disposable system disk. Never use this
 # Kickstart against an existing server; data disk vdb is excluded from clearing.
 ignoredisk --only-use=vda
@@ -26,6 +26,7 @@ logvol /var/log --fstype=xfs --vgname=system --name=log --size=8000
 logvol /var/log/audit --fstype=xfs --vgname=system --name=audit --size=8000
 logvol /home --fstype=xfs --vgname=system --name=home --size=1024
 logvol /tmp --fstype=xfs --vgname=system --name=tmp --size=4096
+logvol /var/tmp --fstype=xfs --vgname=system --name=var_tmp --size=4096 --fsoptions="nodev,nosuid,noexec"
 logvol swap --fstype=swap --vgname=system --name=swap --size=4096
 reboot
 
@@ -55,6 +56,7 @@ qemu-guest-agent
 open-vm-tools
 policycoreutils-python-utils
 openssl
+keyutils
 sudo
 openssh-server
 postgresql

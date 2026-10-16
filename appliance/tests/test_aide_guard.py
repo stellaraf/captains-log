@@ -24,7 +24,7 @@ class AideGuardTests(unittest.TestCase):
         self.content = b"reviewed installed source\n"
         self.descriptor = {"source_snapshot_sha256": "a" * 64, "source_dirty": True}
         source_paths = ("appliance/nebulalog_manager/aide.py", "appliance/security/aide-policy.conf", "appliance/security/aide.conf", "appliance/bin/nebulalog-aide",
-                        "appliance/systemd/nebulalog-aide.service", "appliance/systemd/nebulalog-aide.timer")
+                        "appliance/systemd/nebulalog-aide.service", "appliance/systemd/nebulalog-aide.timer", "appliance/factory_kernel.py")
         source = {"schema": 1, "files": {name: aide.sha(self.content) for name in source_paths}}
         self.files = {"/etc/nebulalog/bootstrap/image-state": b"sealed\n",
                       "/etc/nebulalog/bootstrap/runtime-ready.json": json.dumps({"installation_id": INSTALLATION}).encode(),
@@ -36,6 +36,7 @@ class AideGuardTests(unittest.TestCase):
         enrolled = {"installation_id": INSTALLATION, "initial_release_sha256": "b" * 64, "provenance": self.descriptor, "current": current}
         self.enrolled, self.current = enrolled, current
         patches = [patch.object(aide, "protected_bytes", side_effect=lambda path, **_: self.files.get(str(path), self.content)),
+                   patch.object(aide, 'initial_boot_snapshot', return_value={'ordinary_boot_snapshot_sha256': 'f' * 64}),
                    patch.object(aide.pwd, "getpwnam", side_effect=KeyError("no build user")),
                    patch.object(Path, "exists", return_value=False), patch.object(Path, "is_symlink", return_value=False),
                    patch("nebulalog_manager.update_enrollment.UpdateEnrollment._descriptor", return_value=(self.descriptor, "b" * 64, "c" * 64)),
@@ -47,6 +48,9 @@ class AideGuardTests(unittest.TestCase):
         self.runner = Mock(side_effect=self.command)
 
     def command(self, argv, **kwargs):
+        if argv == ['/usr/bin/python3', '-I', '-B', '/usr/libexec/nebulalog/factory-kernel', '--verify']:
+            return aide.Result(0, json.dumps({'schema': 1, 'verified': True, 'kernel': '5.14.0-687.57.1.el9_8.x86_64',
+                                              'manifest_sha256': aide.sha(self.content), 'inventory_sha256': aide.sha(self.content)}))
         if argv[:2] == ["/usr/bin/rpm", "--query"]:
             return aide.Result(0, "aide-0.19.2-5.el9_8.1.x86_64\n")
         if argv == ["/usr/bin/rpm", "--verify", "aide"]:
@@ -65,7 +69,21 @@ class AideGuardTests(unittest.TestCase):
         self.assertEqual(value["source_snapshot_sha256"], "a" * 64)
         self.assertTrue(value["source_dirty"])
         self.assertEqual(value["aide_binary_sha256"], hashlib.sha256(self.content).hexdigest())
-        self.assertEqual(self.runner.call_count, 3)
+        self.assertEqual(self.runner.call_count, 4)
+        self.assertEqual(value['factory_kernel_manifest_sha256'], aide.sha(self.content))
+        self.assertEqual(value['factory_kernel_inventory_sha256'], aide.sha(self.content))
+        self.assertEqual(value['ordinary_boot_snapshot_sha256'], 'f' * 64)
+
+    def test_initial_factory_provenance_missing_changed_or_unverified_refuses(self):
+        self.files['/usr/libexec/nebulalog/factory-kernel'] = b'changed helper'
+        with self.assertRaisesRegex(Refused, 'factory_kernel_helper_changed'): self.facts()
+        del self.files['/usr/libexec/nebulalog/factory-kernel']
+        self.files['/usr/share/nebulalog/kernel-provenance/manifest.json'] = b'changed manifest'
+        with self.assertRaisesRegex(Refused, 'factory_kernel_provenance_changed'): self.facts()
+        del self.files['/usr/share/nebulalog/kernel-provenance/manifest.json']
+        previous = self.runner.side_effect
+        self.runner.side_effect = lambda argv, **kwargs: aide.Result(1, '', 'unverified RPM') if '--verify' in argv and 'factory-kernel' in ' '.join(argv) else previous(argv, **kwargs)
+        with self.assertRaisesRegex(Refused, 'factory_kernel_provenance_not_verified'): self.facts()
 
     def test_unsealed_marker_or_build_account_refuses_before_any_aide_command(self):
         self.files["/etc/nebulalog/bootstrap/image-state"] = b"unsealed\n"

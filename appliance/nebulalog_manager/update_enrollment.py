@@ -19,8 +19,9 @@ import uuid
 
 from .common import Refused, atomic_json, audit, locked, require_linux_root, run
 from .firstboot import FirstBoot
-from .image_bundle import ImageBundleLoader, run_private, strict_json, verify_bundle
+from .image_bundle import ApplicationSchema as application_schema, ImageBundleLoader, run_private, strict_json, verify_bundle
 from . import publisher_inputs
+from .baseline import ContentUpdate
 
 STATE = Path("/var/lib/nebulalog/manager/updates")
 PUBLIC_KEY = Path("/etc/nebulalog/release-public.pem")
@@ -29,7 +30,8 @@ COMPONENT_IMAGES = {"nebulalog": "NEBULALOG_IMAGE", "postgresql": "POSTGRESQL_IM
                     "clickhouse": "CLICKHOUSE_IMAGE", "keycloak": "KEYCLOAK_FIPS_IMAGE"}
 ROOT_UID = 0
 FIXED_HOST_FILES = {"appliance/host_boot.py": Path("/usr/libexec/nebulalog/host-boot"),
-                    "appliance/factory_host.py": Path("/usr/libexec/nebulalog/factory-host")}
+                    "appliance/factory_host.py": Path("/usr/libexec/nebulalog/factory-host"),
+                    "appliance/factory_kernel.py": Path("/usr/libexec/nebulalog/factory-kernel")}
 FIXED_HOST_ROOT = Path("/")
 
 
@@ -231,6 +233,7 @@ class UpdateEnrollment:
                     or any(part in (".", "..", ".local", "node_modules", ".git") for part in path.split("/"))
                     or not isinstance(digest, str) or not SHA256.fullmatch(digest)):
                 raise Refused("Unsafe or invalid captured source manifest entry")
+        application_schema.bind_source(manifest["files"], value["schema_revision"])
         publisher_inputs.binding(value["publisher"], manifest["files"])
         return value, _hash(raw), application_source_digest(manifest["files"])
 
@@ -385,6 +388,9 @@ class UpdateEnrollment:
             if not isinstance(lifecycle, dict) or lifecycle.get("schema_revision") != descriptor["schema_revision"]:
                 raise Refused("Runtime schema revision differs from the initial release")
             inspector = ImageBundleLoader(data=self.data, runner=self.runner)
+            # Runtime enrollment precedes the console's policy-selection action.
+            # A later accepted content bridge measures selection independently;
+            # it must never rewrite this immutable initial host/OCI identity.
             components, measurements = {"host": host}, {"host": {**host, "generation_files_verified": True}}
             for component, pin in COMPONENT_IMAGES.items():
                 item = verified["images"][pin]
@@ -428,6 +434,21 @@ class UpdateEnrollment:
                     "initial_release_sha256": descriptor_sha, "current": current,
                     "publisher_trust": publisher_trust,
                     "qualification_status": "pending"}
+
+    def _content(self, installation_id):
+        """Measure selected content; never infer or adopt an installed release label."""
+        path = self.data / "configuration/security-policy.json"
+        before = _read(path)
+        policy = strict_json(before)
+        setup = _json(self.data / "configuration/bootstrap/setup.json")
+        if (not isinstance(policy, dict) or policy.get("installation_id") != installation_id
+                or setup.get("installation_id") != installation_id
+                or policy.get("baseline") != setup.get("baseline")):
+            raise Refused("Selected compliance content is not bound to this installation and baseline")
+        measured = ContentUpdate.measure(path, runner=self.runner)
+        if _read(path) != before or measured["policy_sha256"] != _hash(before):
+            raise Refused("Selected compliance policy changed during content measurement")
+        return measured
 
     def trust_factory(self):
         """Enroll only public trust carried by the trusted initial appliance image.

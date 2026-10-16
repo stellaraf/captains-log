@@ -36,6 +36,9 @@
   <background_message_broker_schedule_pool_size>2</background_message_broker_schedule_pool_size>
   <background_distributed_schedule_pool_size>2</background_distributed_schedule_pool_size>
   <merge_tree>
+    <!-- Bound merge blocks for wide PAN-OS rows; total merge memory still needs qualification. -->
+    <merge_max_block_size>1024</merge_max_block_size>
+    <merge_max_block_size_bytes>1048576</merge_max_block_size_bytes>
     <number_of_free_entries_in_pool_to_lower_max_size_of_merge>2</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
     <number_of_free_entries_in_pool_to_execute_mutation>2</number_of_free_entries_in_pool_to_execute_mutation>
     <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>2</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>

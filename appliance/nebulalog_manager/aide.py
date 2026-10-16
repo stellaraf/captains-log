@@ -43,7 +43,8 @@ BINARY = Path("/usr/sbin/aide")
 DATA = Path("/var/lib/nebulalog")
 RUNTIME_STAGES = {"directories", "certificates", "images", "environment", "realm", "postgresql", "migrations", "identity", "lifecycle", "edge", "installed-release"}
 FACTS = {"installation_id", "aide_version", "aide_package", "aide_binary_sha256", "policy_sha256",
-         "default_config_sha256", "source_snapshot_sha256", "source_dirty", "installed_release_sha256", "runtime_ready_sha256", "runtime_configuration_sha256"}
+         "default_config_sha256", "source_snapshot_sha256", "source_dirty", "installed_release_sha256", "runtime_ready_sha256", "runtime_configuration_sha256",
+         "factory_kernel_manifest_sha256", "factory_kernel_inventory_sha256", "ordinary_boot_snapshot_sha256"}
 MONITOR_FACTS = {"installation_id", "aide_version", "aide_package", "aide_binary_sha256", "policy_sha256", "default_config_sha256"}
 
 
@@ -171,6 +172,88 @@ def default_monitor(identity, policy, runner, tmpdir):
             "default_config_sha256": sha(protected_bytes(DEFAULT_CONFIG, maximum=65536, private=True))}
 
 
+def factory_kernel_facts(source, runner, tmpdir):
+    """Initial enrollment only; later pruning cannot rewrite factory facts."""
+    helper = Path('/usr/libexec/nebulalog/factory-kernel')
+    if source['files'].get('appliance/factory_kernel.py') != sha(protected_bytes(helper, maximum=2 * 1024 * 1024)):
+        raise Refused('aide_factory_kernel_helper_changed')
+    result = runner(['/usr/bin/python3', '-I', '-B', str(helper), '--verify'], tmpdir=tmpdir, timeout=600)
+    if result.code != 0 or result.stderr.strip():
+        raise Refused('aide_factory_kernel_provenance_not_verified')
+    value = strict_json(result.stdout)
+    exact(value, {'schema', 'verified', 'kernel', 'manifest_sha256', 'inventory_sha256'})
+    root = Path('/usr/share/nebulalog/kernel-provenance')
+    if (type(value['schema']) is not int or value['schema'] != 1 or value['verified'] is not True
+            or not re.fullmatch(r'5\.14\.0-[0-9.]+\.el9_8\.x86_64', str(value['kernel']))
+            or value['manifest_sha256'] != sha(protected_bytes(root / 'manifest.json', maximum=65536, private=True))
+            or value['inventory_sha256'] != sha(protected_bytes(root / 'installed-inventory.xml', maximum=MAX_DATABASE, private=True))):
+        raise Refused('aide_factory_kernel_provenance_changed')
+    return {'factory_kernel_manifest_sha256': value['manifest_sha256'],
+            'factory_kernel_inventory_sha256': value['inventory_sha256']}
+
+
+def verify_initial_boot_snapshot(identity, expected_sha):
+    """Read the immutable enrollment root, never recapture a later boot."""
+    from . import kernel_updates, ordinary_boot_state
+    digest_value(expected_sha)
+    path = identity.root / 'manager/boot-integrity/initial.json'
+    PrivateRecords(lambda: identity).directory(path.parent, identity)
+    raw = protected_bytes(path, maximum=MAX_DATABASE, private=True, device=identity.device)
+    value = strict_json(raw)
+    ordinary_boot_state.validate_snapshot(value)
+    if raw != kernel_updates.encode(value) or sha(raw) != expected_sha:
+        raise Refused('aide_initial_boot_snapshot_changed')
+    return value
+
+
+def initial_boot_snapshot(identity, runner, tmpdir):
+    """Capture before the first init and require exact stability through enroll.
+
+    A late writer invalidates the candidate; its original snapshot is retained.
+    Missing evidence after any candidate or enrollment exists requires explicit
+    recovery, never automatic recapture or re-enrollment.
+    """
+    from . import kernel_updates, ordinary_boot_state
+    path = identity.root / 'manager/boot-integrity/initial.json'
+    state = identity.root / 'manager/aide'
+    records = PrivateRecords(lambda: identity)
+
+    def native(argv, *, timeout=120):
+        maximum = kernel_updates.rpm.MAX_XML if argv == ['/usr/bin/rpm', '--query', '--all', '--xml'] else MAX_REPORT
+        result = runner(argv, tmpdir=tmpdir, timeout=timeout, maximum=maximum)
+        if result.code != 0 or result.stderr.strip():
+            raise Refused('aide_initial_boot_command_failed')
+        return result.stdout.strip()
+
+    if not present(path):
+        if any(present(item) for item in (state.parent / 'aide-enrollment.json',
+                state / 'candidate.json', state / 'candidate.db.gz', state / 'aide.db.gz', state / 'commit-pending.json')):
+            raise Refused('aide_initial_boot_snapshot_missing')
+        records.directory(path.parent, identity, create=True)
+        if any(path.parent.iterdir()):
+            raise Refused('aide_unowned_boot_integrity_state')
+        value = ordinary_boot_state.capture(runner=native)
+        ordinary_boot_state.validate_snapshot(value)
+        raw = kernel_updates.encode(value)
+        if not 0 < len(raw) <= MAX_DATABASE:
+            raise Refused('aide_initial_boot_snapshot_too_large')
+        # Reuse AIDE's private atomic writer and durability barriers. The caller
+        # already holds manager/firstboot/runtime/baseline locks.
+        Aide(storage_guard=lambda: identity, reader=protected_bytes)._write_bytes(path, raw, identity)
+    raw = protected_bytes(path, maximum=MAX_DATABASE, private=True, device=identity.device)
+    checksum = sha(raw)
+    retained = verify_initial_boot_snapshot(identity, checksum)
+    current = ordinary_boot_state.capture(runner=native)
+    ordinary_boot_state.validate_snapshot(current)
+    if current != retained:
+        raise Refused('aide_initial_boot_snapshot_not_current')
+    # Retry also crosses durability barriers after a prior rename succeeded
+    # but its directory fsync failed; reading the retained file is not enough.
+    Aide(storage_guard=lambda: identity, reader=protected_bytes)._sync(
+        path, path.parent, path.parent.parent, identity.root)
+    return {'ordinary_boot_snapshot_sha256': checksum}
+
+
 def default_facts(identity, policy, runner, tmpdir):
     """Bind the first baseline to sealed setup, measured AIDE and captured code."""
     base = Path("/etc/nebulalog")
@@ -230,7 +313,8 @@ def default_facts(identity, policy, runner, tmpdir):
     selected = strict_json(protected_bytes(identity.root / "configuration/security-policy.json", maximum=1024 * 1024, private=True, device=identity.device))
     if selected.get("installation_id") != identity.installation_id or selected.get("baseline") != strict_json(setup).get("baseline"):
         raise Refused("aide_baseline_policy_not_selected")
-    return {**monitor,
+    factory = factory_kernel_facts(source, runner, tmpdir)
+    return {**monitor, **factory, **initial_boot_snapshot(identity, runner, tmpdir),
             "source_snapshot_sha256": descriptor["source_snapshot_sha256"], "source_dirty": descriptor["source_dirty"],
             "installed_release_sha256": descriptor_hash, "runtime_ready_sha256": sha(ready),
             "runtime_configuration_sha256": digest({"setup": sha(setup), "state": sha(state)})}
@@ -238,10 +322,12 @@ def default_facts(identity, policy, runner, tmpdir):
 
 class Aide:
     def __init__(self, *, storage_guard=runtime_storage, facts=default_facts, policy=POLICY,
-                 runner=command, reader=protected_bytes, clock=timestamp, monitor=default_monitor, lock_paths=coordination_locks):
+                 runner=command, reader=protected_bytes, clock=timestamp, monitor=default_monitor, lock_paths=coordination_locks,
+                 boot_snapshot=verify_initial_boot_snapshot):
         self.guard, self.facts, self.policy, self.runner, self.reader, self.clock = storage_guard, facts, policy, runner, reader, clock
         self.monitor = monitor
         self.lock_paths = lock_paths
+        self.boot_snapshot = boot_snapshot
         self.records = PrivateRecords(storage_guard)
 
     @contextlib.contextmanager
@@ -540,6 +626,7 @@ class Aide:
         digest_value(value["database_sha256"])
         uuid_value(value["verified_report_id"])
         exact(value["facts"], FACTS)
+        self.boot_snapshot(identity, value['facts']['ordinary_boot_snapshot_sha256'])
         if self.records.read(state / "commit-pending.json", identity) != value:
             raise Refused("aide_enrollment_receipt_changed")
         candidate = self._candidate(state, identity)
@@ -646,31 +733,63 @@ class Aide:
 
     def check(self):
         with self._locked() as (state, identity):
-            marker = state.parent / "aide-enrollment.json"
-            if not present(marker):
-                raise Refused("aide_baseline_not_enrolled")
-            attempt = {"schema": 1, "id": str(uuid.uuid4()), "observed_at": self.clock(), "state": "running", "report_id": None}
+            return self._check_locked(state, identity)
+
+    def check_for_transaction(self, manager_lock_fd):
+        """Check without reacquiring the caller's live manager-lock descriptor.
+
+        The caller retains and closes the descriptor. No database acceptance or
+        baseline change is performed; ordinary check/report semantics apply.
+        """
+        from .aide_updates import _locked as coordination
+        identity = self.guard()
+        manager = identity.root / "manager"
+        self.records.directory(manager, identity)
+        try:
+            if type(manager_lock_fd) is not int:
+                raise Refused("aide_transaction_lock_descriptor_required")
+            info = os.fstat(manager_lock_fd)
+            self.records._file(info, identity, allow_empty=True)
+            expected = (manager / "transaction.lock").lstat()
+            self.records._file(expected, identity, allow_empty=True)
+            if (info.st_dev, info.st_ino) != (expected.st_dev, expected.st_ino):
+                raise Refused("aide_transaction_lock_identity_changed")
+            # Same open description as the outer transaction: reacquiring is
+            # harmless. An unrelated competing lock refuses nonblockingly.
+            fcntl.flock(manager_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with coordination(self) as (state, current):
+                if current != identity:
+                    raise Refused("aide_transaction_storage_changed")
+                return self._check_locked(state, identity)
+        except OSError:
+            raise Refused("aide_transaction_lock_unavailable") from None
+
+    def _check_locked(self, state, identity):
+        marker = state.parent / "aide-enrollment.json"
+        if not present(marker):
+            raise Refused("aide_baseline_not_enrolled")
+        attempt = {"schema": 1, "id": str(uuid.uuid4()), "observed_at": self.clock(), "state": "running", "report_id": None}
+        self.records.write(state / "last-attempt.json", attempt, identity)
+        try:
+            enrolled = self._enrolled(state, identity)
+            policy = self._monitor(identity, state, enrolled)
+            facts = enrolled["facts"]
+            if enrolled.get("installation_id") != identity.installation_id:
+                raise Refused("aide_monitor_context_changed")
+            _, database_sha = self._database(state / "aide.db.gz", identity)
+            if database_sha != enrolled.get("database_sha256"):
+                raise Refused("aide_enrolled_database_changed")
+            config = self._config(state, identity, policy, stage="enrolled")
+            result = self._report(state, identity, config, "check", facts, database_sha)
+            if self._database(state / "aide.db.gz", identity)[1] != database_sha or self._monitor(identity, state, enrolled) != policy:
+                raise Refused("aide_context_changed_during_check")
+            attempt.update(state="complete", report_id=result["id"])
             self.records.write(state / "last-attempt.json", attempt, identity)
-            try:
-                enrolled = self._enrolled(state, identity)
-                policy = self._monitor(identity, state, enrolled)
-                facts = enrolled["facts"]
-                if enrolled.get("installation_id") != identity.installation_id:
-                    raise Refused("aide_monitor_context_changed")
-                _, database_sha = self._database(state / "aide.db.gz", identity)
-                if database_sha != enrolled.get("database_sha256"):
-                    raise Refused("aide_enrolled_database_changed")
-                config = self._config(state, identity, policy, stage="enrolled")
-                result = self._report(state, identity, config, "check", facts, database_sha)
-                if self._database(state / "aide.db.gz", identity)[1] != database_sha or self._monitor(identity, state, enrolled) != policy:
-                    raise Refused("aide_context_changed_during_check")
-                attempt.update(state="complete", report_id=result["id"])
-                self.records.write(state / "last-attempt.json", attempt, identity)
-                return result
-            except Exception:
-                attempt["state"] = "error"
-                self.records.write(state / "last-attempt.json", attempt, identity)
-                raise
+            return result
+        except Exception:
+            attempt["state"] = "error"
+            self.records.write(state / "last-attempt.json", attempt, identity)
+            raise
 
     def status(self):
         with self._locked() as (state, identity):

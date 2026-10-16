@@ -31,6 +31,8 @@ class ArchiveSourceTests(unittest.TestCase):
                          "appliance/packer/recipe.hcl": b"fixture recipe\n",
                          "appliance/tests/fixture.py": b"# test source\n", "docs/example.md": b"documentation\n",
                          ".gitignore": b".local/\n.env*\nnode_modules/\n"}
+        for name in ("postgres.sql", "clickhouse.sql", "host_stepup.sql"):
+            self.contents["migrations/" + name] = (SCRIPT.parents[2] / "migrations" / name).read_bytes()
         for name, raw in self.contents.items():
             self.write(name, raw)
         self.git("init", "--quiet")
@@ -54,7 +56,7 @@ class ArchiveSourceTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.root), *args], env=environment, check=True, capture_output=True)
 
     def capture(self):
-        return capture(self.root, self.bundle, self.provenance, sequence=1, schema_revision="1", private_unsealed=True)
+        return capture(self.root, self.bundle, self.provenance, sequence=1, schema_revision="2", private_unsealed=True)
 
     def archive(self):
         return archiver.archive_sources(self.root, self.provenance, self.output)
@@ -182,7 +184,7 @@ class ArchiveSourceTests(unittest.TestCase):
             with self.subTest(name=name), tempfile.TemporaryDirectory(dir=self.base) as temporary:
                 path = self.write(name, b"fixture\n")
                 provenance = Path(temporary) / "capture"
-                capture(self.root, self.bundle, provenance, sequence=1, schema_revision="1", private_unsealed=True)
+                capture(self.root, self.bundle, provenance, sequence=1, schema_revision="2", private_unsealed=True)
                 with self.assertRaises(ValueError):
                     archiver.archive_sources(self.root, provenance, self.output)
                 self.assert_unpublished()
@@ -226,9 +228,13 @@ class ArchiveSourceTests(unittest.TestCase):
                 calls += 1
                 if calls == when:
                     target = self.root / ".gitignore"
+                    before = target.stat()
                     target.write_bytes(b"changed during archive\n")
                     if restore:
                         target.write_bytes(self.contents[".gitignore"])
+                        # Make the metadata change observable even on a source
+                        # filesystem whose timestamps have one-second precision.
+                        os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
                 return raw
             with self.subTest(when=when, restore=restore), patch.object(archiver, "source_bytes", side_effect=reader), self.assertRaises(ValueError):
                 self.archive()

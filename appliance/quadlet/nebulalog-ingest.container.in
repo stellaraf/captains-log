@@ -13,6 +13,7 @@ GroupAdd=20001
 ReadOnly=true
 NoNewPrivileges=true
 Environment=REQUIRE_FIPS=true
+Environment=STORAGE_MAINTENANCE_PATH=/run/nebulalog-storage-maintenance/gate.json
 Environment=COLLECTOR_STATUS_PATH=/var/lib/nebulalog/runtime/collector.json
 DropCapability=all
 EnvironmentFile=/etc/nebulalog/ingest.env
@@ -22,6 +23,7 @@ Environment=SYSLOG_TLS=:6514
 Environment=SPOOL_DIR=/var/lib/nebulalog/spool
 Volume=/var/lib/nebulalog/spool:/var/lib/nebulalog/spool:Z
 Volume=/var/lib/nebulalog/runtime:/var/lib/nebulalog/runtime:z
+Volume=/var/lib/nebulalog/manager/storage-maintenance:/run/nebulalog-storage-maintenance:ro,z
 Volume=/var/lib/nebulalog/configuration/tls:/etc/nebulalog/tls:ro,z
 Tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m
 PublishPort=514:5514/udp

@@ -37,7 +37,8 @@ PACKAGES = ("rocky-release", "kernel-core", "kernel-modules-core", "kernel-modul
             "container-selinux", "systemd", "podman", "skopeo", "cryptsetup", "cryptsetup-libs", "lvm2", "xfsprogs",
             "dracut", "dracut-fips", "audit", "firewalld", "httpd", "mod_ssl", "python3", "openscap-scanner", "scap-security-guide", "aide")
 CORE_UNITS = ("nebulalog-firstboot.service", "nebulalog-console.service", "nebulalog-edge.service",
-              "nebulalog-maintenance-gate.service", "nebulalog-reboot-verify.service", "nebulalog-status.service", "nebulalog-status.timer")
+              "nebulalog-maintenance-gate.service", "nebulalog-reboot-verify.service", "nebulalog-reboot-verify.timer",
+              "nebulalog-status.service", "nebulalog-status.timer")
 CONTAINERS = ("postgresql", "clickhouse", "keycloak", "api", "ingest")
 LABELS = {"/var/lib/nebulalog": "var_lib_t", "/var/lib/nebulalog/configuration": "var_lib_t",
           "/var/lib/nebulalog/configuration/tls": "container_file_t", "/var/lib/nebulalog/configuration/edge-tls": "httpd_config_t",
@@ -208,7 +209,7 @@ class Collector:
         host = self.guard()  # No inventory probes run if host/VM identity fails.
         result = {"schema": 1, "collector": "nebulalog-guest-validation", "observed_at": self.clock().isoformat(),
                   "host": host, "read_only": True, "qualification": "pending", "certification": "not asserted"}
-        for name, operation in (("image_state", self.markers), ("fips", self.fips), ("packages", self.packages),
+        for name, operation in (("image_state", self.markers), ("fips", self.fips), ("module_signatures", self.module_signatures), ("algorithm_policy", self.algorithm_policy), ("packages", self.packages),
                                 ("selinux", self.selinux), ("boot_drivers", self.drivers), ("systemd", self.systemd),
                                 ("data_disks", self.disks), ("listeners", self.listeners), ("enrolled_runtime", self.runtime)):
             result[name] = self.section(operation)
@@ -248,6 +249,27 @@ class Collector:
                 "sshd_active": ssh.stdout.strip() == "active", "sshd_enabled": ssh_enabled.stdout.strip() == "enabled",
                 "sealed_identity_checks": "passed" if sealed_valid and lock_observed and not build_user and ssh.stdout.strip() == "inactive" and ssh_enabled.stdout.strip() == "disabled" else "pending" if private_build else "failed",
                 "universal_secret_absence": "not established by this observation"}
+
+    def algorithm_policy(self):
+        """Exercise default fetch policy; provider presence alone is insufficient."""
+        expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        default = self.call(["openssl", "dgst", "-sha256", "/dev/null"])
+        explicit = self.call(["openssl", "dgst", "-propquery", "fips=yes", "-sha256", "/dev/null"])
+        prohibited = self.call(["openssl", "dgst", "-md5", "/dev/null"])
+        def matches(result):
+            return (result.code == 0 and not result.stderr.strip()
+                    and re.fullmatch(r"(?:SHA256|SHA2-256)\(/dev/null\)= " + expected, result.stdout.strip()) is not None)
+        refused = (prohibited.code != 0 and not prohibited.stdout.strip()
+                   and "inner_evp_generic_fetch:unsupported" in prohibited.stderr)
+        checks = {"default_sha256_known_digest": matches(default), "explicit_fips_sha256_known_digest": matches(explicit),
+                  "default_md5_fetch_refused": refused}
+        return {"status": "passed" if all(checks.values()) else "failed", **checks,
+                "scope": "three OpenSSL CLI fetch/digest probes; does not establish every application cryptographic boundary"}
+
+    def module_signatures(self):
+        enforced = small_file(Path("/sys/module/module/parameters/sig_enforce"), 16).strip() == "Y"
+        return {"status": "passed" if enforced else "failed", "enforced": enforced,
+                "scope": "running kernel module signature enforcement; livepatch signer trust requires separate qualification"}
 
     def fips(self):
         kernel = small_file(Path("/proc/sys/crypto/fips_enabled"), 16).strip()

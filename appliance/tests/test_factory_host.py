@@ -57,6 +57,7 @@ class FactoryHostTests(unittest.TestCase):
             (self.source / name).write_bytes(raw)
             snapshot["files"][name] = payload.digest(raw)
         snapshot["files"]["cmd/nebulalog/main.go"] = "a" * 64
+        snapshot["files"].update(enrollment.application_schema.SCHEMAS["1"])
         for entry in payload.CATALOG:
             if not entry["path"].startswith("bin/"): continue
             name = Path(entry["path"]).name

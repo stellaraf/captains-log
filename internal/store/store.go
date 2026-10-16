@@ -12,8 +12,9 @@ import (
 )
 
 type Store struct {
-	CH *ClickHouse
-	PG *pgxpool.Pool
+	StorageMaintenancePath string
+	CH                     *ClickHouse
+	PG                     *pgxpool.Pool
 }
 type Retention struct {
 	GlobalDays int            `json:"global_days"`
@@ -95,7 +96,7 @@ func (s *Store) Insert(ctx context.Context, events []panos.Event) error {
 			devices[serial] = row
 		}
 	}
-	if e := s.CH.InsertRows(ctx, rows); e != nil {
+	if e := s.insertEmergencyGuarded(ctx, rows); e != nil {
 		return e
 	}
 	// Log data is already durable. Metadata failure must not turn an acknowledged
