@@ -90,6 +90,55 @@ func emergencyString(row map[string]any, key string) (string, error) {
 }
 
 func observeEmergency(ctx context.Context, ch emergencyClickHouse, now time.Time) (EmergencyMeasurement, error) {
+	// ClickHouse reads free_space and unreserved_space separately. A concurrent
+	// cleanup can increase the latter between those reads. Resample the whole
+	// identity and capacity observation, never clamp or use the rejected tuple.
+	type capacitySample struct {
+		Capacity, Free, Unreserved, KeepFree uint64
+	}
+	var rejected []capacitySample
+	fail := func(m EmergencyMeasurement, err error) (EmergencyMeasurement, error) {
+		if len(rejected) > 0 {
+			err = fmt.Errorf("%w; rejected capacity observations: %+v", err, rejected)
+		}
+		return m, err
+	}
+	var identity EmergencyIdentity
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return fail(EmergencyMeasurement{ObservedAt: now.UTC()}, err)
+		}
+		m, err := readEmergencyMeasurement(ctx, ch, now)
+		if err != nil {
+			return fail(m, err)
+		}
+		inconsistent := m.Capacity == 0 || m.Free > m.Capacity || m.Unreserved > m.Free
+		if inconsistent {
+			rejected = append(rejected, capacitySample{m.Capacity, m.Free, m.Unreserved, m.KeepFree})
+		}
+		if err := ctx.Err(); err != nil {
+			return fail(m, err)
+		}
+		if attempt > 0 && m.Identity != identity {
+			return fail(m, errors.New("storage identity changed during capacity resampling"))
+		}
+		identity = m.Identity
+		if inconsistent {
+			if m.Capacity > 0 && m.Free <= m.Capacity && m.Unreserved <= m.Capacity && attempt < 2 {
+				continue
+			}
+			return fail(m, errors.New("inconsistent disk capacity observation"))
+		}
+		m.Available = m.Unreserved // ClickHouse already subtracts keep_free_space from total/free/unreserved.
+		m.UsedPercent = 100 * (1 - float64(m.Available)/float64(m.Capacity))
+		return m, nil
+	}
+	panic("unreachable capacity resampling state")
+}
+
+// Each attempt validates every identity and scalar before capacity consistency
+// is evaluated. Read, schema and identity errors are never retried.
+func readEmergencyMeasurement(ctx context.Context, ch emergencyClickHouse, now time.Time) (EmergencyMeasurement, error) {
 	m := EmergencyMeasurement{ObservedAt: now.UTC()}
 	tables, err := ch.Rows(ctx, `SELECT toString(uuid) AS uuid,engine,partition_key,storage_policy,data_paths,(SELECT engine FROM system.databases WHERE name='nebulalog') AS database_engine FROM system.tables WHERE database='nebulalog' AND name='events'`, nil)
 	if err != nil {
@@ -115,6 +164,9 @@ func observeEmergency(ctx context.Context, ch emergencyClickHouse, now time.Time
 	id.DataPath, ok = paths[0].(string)
 	if !ok {
 		return m, errors.New("invalid table data path")
+	}
+	if err := ctx.Err(); err != nil {
+		return m, err
 	}
 	disks, err := ch.Rows(ctx, `SELECT name,path,type,total_space,free_space,unreserved_space,keep_free_space,is_read_only,is_remote FROM system.disks WHERE name='default'`, nil)
 	if err != nil {
@@ -146,11 +198,6 @@ func observeEmergency(ctx context.Context, ch emergencyClickHouse, now time.Time
 			return m, err
 		}
 	}
-	if m.Capacity == 0 || m.Free > m.Capacity || m.Unreserved > m.Free {
-		return m, errors.New("inconsistent disk capacity observation")
-	}
-	m.Available = m.Unreserved // ClickHouse already subtracts keep_free_space from total/free/unreserved.
-	m.UsedPercent = 100 * (1 - float64(m.Available)/float64(m.Capacity))
 	m.Identity = id
 	return m, nil
 }
