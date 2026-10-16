@@ -85,6 +85,9 @@ func (c *ClickHouse) request(ctx context.Context, sql string, params map[string]
 		// the query cap. Wide sort keys cannot benefit from deferred payload
 		// reads; the default 1 GB remerge threshold exceeds our 512 MiB budget.
 		q.Set("max_bytes_before_remerge_sort", "67108864")
+		// Ordered reads may buffer chunks from many parts even with two reader
+		// threads. Avoid that extra buffering within the page memory budget.
+		q.Set("read_in_order_use_buffering", "0")
 	}
 	if profile == queryEventPageLazy {
 		// ClickHouse 25.8 otherwise only defers wide columns for LIMIT <= 10.

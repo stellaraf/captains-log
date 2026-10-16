@@ -1,5 +1,12 @@
 # Bounded database scale benchmark
 
+The September measurements below are historical. An isolated **100,000,000-row**
+dataset was subsequently populated and queried on October 16. The broader run
+exposed a page-memory failure; a focused correction passed, while qualification
+of the complete matrix with that correction remains open. See the
+[100M continuation report](validation/QUERY_100M_CONTINUATION.md) for the measured
+results and their limits.
+
 Measured on 2026-09-07 against ClickHouse 25.8.33.6. The representative synthetic table reached **10,000,000 events**. All 33 search cases completed three measured repetitions. **100 million events were not tested:** the measured active data projects to 21.39 GiB at 100M before merge reserve, or **32.08 GiB with 50% reserve**, exceeding the authorized 20 GiB benchmark budget. No search, retention, or capacity claim at 100M follows from these results.
 
 ## Environment and isolation

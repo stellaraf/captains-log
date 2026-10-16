@@ -76,8 +76,8 @@ func TestEventReadProfileIsScopedAndPreservesPayload(t *testing.T) {
 				t.Fatal("event parameter binding changed")
 			}
 			if test.name == "page" {
-				if settings.Get("max_bytes_before_remerge_sort") != "67108864" {
-					t.Fatal("page retained sort blocks can exceed the query budget")
+				if settings.Get("max_bytes_before_remerge_sort") != "67108864" || settings.Get("read_in_order_use_buffering") != "0" {
+					t.Fatal("page sort or ordered-read buffers can exceed the query budget")
 				}
 				if settings.Get("query_plan_optimize_lazy_materialization") != "1" || settings.Get("query_plan_max_limit_for_lazy_materialization") != "1001" || settings.Get("param_limit") != "1001" {
 					t.Fatal("page payload deferral or lookahead binding changed")
@@ -85,8 +85,8 @@ func TestEventReadProfileIsScopedAndPreservesPayload(t *testing.T) {
 			} else if settings.Has("query_plan_optimize_lazy_materialization") || settings.Has("query_plan_max_limit_for_lazy_materialization") {
 				t.Fatal("page optimization leaked into another query profile")
 			}
-			if test.name != "page" && settings.Has("max_bytes_before_remerge_sort") {
-				t.Fatal("page sort remerge changed another query profile")
+			if test.name != "page" && (settings.Has("max_bytes_before_remerge_sort") || settings.Has("read_in_order_use_buffering")) {
+				t.Fatal("page memory settings changed another query profile")
 			}
 			if test.name == "export" {
 				if settings.Get("max_bytes_before_external_sort") != "134217728" || settings.Get("max_temporary_data_on_disk_size_for_query") != "1073741824" {

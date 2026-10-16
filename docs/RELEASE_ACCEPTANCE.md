@@ -2,7 +2,22 @@
 
 This is the release contract for the full request in [SPECIFICATION.md](SPECIFICATION.md), including the later Stellar branding/UI standards, Okta/Entra defaults with in-app instructions, and adjustable/pauseable refresh. It does not replace or narrow that request. Snapshot: **2026-09-07 local date, source checkpoint `44e2eb1`**. Concurrent Rocky image and first-boot implementation work is not accepted here until its actual results are recorded. **Version 1 is not complete; user sign-off has not occurred.**
 
-## Current source and native evidence — October 15, 2026
+## Query qualification update — October 16, 2026
+
+The isolated database now contains 100,000,000 synthetic full-payload Traffic
+records. A run using the actual Go store completed 29 of 33 case pairs before a
+seven-day destination-port page exceeded its 512 MiB query budget. Disabling
+ordered-read chunk buffering for event pages passed a separate 20-sample
+diagnostic under the same budget. The page-only change is implemented; all
+33 case pairs must still be measured with the final profile. The
+[continuation report](validation/QUERY_100M_CONTINUATION.md) preserves the failure,
+diagnostic evidence, platform and response-retention limitations.
+
+These results do not close the full performance, mixed-log ingestion, native
+appliance, OVA, hypervisor or final sign-off requirements. The source and native
+checkpoints below remain historical evidence with their original scope.
+
+## Source and native evidence — October 15, 2026
 
 Source checkpoint `b4e40401a44b240b2c157eb9357189502ef5906a` and public
 checkpoint `82772678992e443e66cfec1f2ae0e66865c12437` have the same Git tree,

@@ -41,7 +41,7 @@ func TestPageCapabilitiesRequireBothExactSettings(t *testing.T) {
 				q := r.URL.Query()
 				if string(body) == pageCapabilitiesSQL {
 					probes.Add(1)
-					if q.Has("query_id") || q.Has("query_plan_optimize_lazy_materialization") || q.Has("query_plan_max_limit_for_lazy_materialization") || q.Get("max_execution_time") != "1" || q.Get("max_threads") != "1" {
+					if q.Has("read_in_order_use_buffering") || q.Has("query_id") || q.Has("query_plan_optimize_lazy_materialization") || q.Has("query_plan_max_limit_for_lazy_materialization") || q.Get("max_execution_time") != "1" || q.Get("max_threads") != "1" {
 						t.Error("capability probe depends on optional settings or lacks its bound")
 					}
 					if test.exception {
@@ -55,7 +55,7 @@ func TestPageCapabilitiesRequireBothExactSettings(t *testing.T) {
 				if string(body) != sql+" FORMAT JSONEachRow" || q.Get("param_raw") != params["raw"] || q.Get("param_limit") != params["limit"] || q.Get("query_id") != "page-diagnostic-id" {
 					t.Error("probe changed page SQL, supported sort, or parameter binding")
 				}
-				for key, want := range map[string]string{"max_memory_usage": "536870912", "max_execution_time": "30", "max_threads": "2", "max_block_size": "8192", "wait_end_of_query": "1", "max_bytes_before_remerge_sort": "67108864"} {
+				for key, want := range map[string]string{"max_memory_usage": "536870912", "max_execution_time": "30", "max_threads": "2", "max_block_size": "8192", "wait_end_of_query": "1", "max_bytes_before_remerge_sort": "67108864", "read_in_order_use_buffering": "0"} {
 					if q.Get(key) != want {
 						t.Errorf("page %s=%q, want %q", key, q.Get(key), want)
 					}
