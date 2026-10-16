@@ -53,6 +53,10 @@ func TestLogPagesUseEventBudgetAndPreserveCursorContract(t *testing.T) {
 			}
 			ch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				body, _ := io.ReadAll(r.Body)
+				if strings.HasPrefix(string(body), "SELECT name FROM system.settings WHERE ") {
+					_, _ = io.WriteString(w, "query_plan_max_limit_for_lazy_materialization\nquery_plan_optimize_lazy_materialization\n")
+					return
+				}
 				params := r.URL.Query()
 				requests <- eventReadRequest{string(body), params}
 				start := 0
@@ -81,6 +85,9 @@ func TestLogPagesUseEventBudgetAndPreserveCursorContract(t *testing.T) {
 				}
 				request := <-requests
 				requireEventReadBudget(t, request)
+				if request.Params.Get("query_plan_optimize_lazy_materialization") != "1" || request.Params.Get("query_plan_max_limit_for_lazy_materialization") != "1001" {
+					t.Fatal("page payload deferral does not cover the cursor lookahead")
+				}
 				if request.Params.Get("param_limit") != strconv.Itoa(test.limit+1) || request.Params.Get("param_q0") != "alert" {
 					t.Fatal("lookahead limit or bound manual filter changed")
 				}

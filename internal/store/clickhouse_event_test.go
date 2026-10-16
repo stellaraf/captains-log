@@ -18,6 +18,11 @@ func TestEventReadProfileIsScopedAndPreservesPayload(t *testing.T) {
 	requests := make(chan url.Values, 5)
 	const payload = `{"id":"event","raw":"original\\line\n","raw_base64":"AP8=","fields":{"unrecognized":"kept"},"extra_fields":["extra"],"bytes":18446744073709551615}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if string(body) == pageCapabilitiesSQL {
+			_, _ = io.WriteString(w, pageCapabilitiesResponse)
+			return
+		}
 		requests <- r.URL.Query()
 		_, _ = io.WriteString(w, payload+"\n")
 	}))
@@ -36,6 +41,13 @@ func TestEventReadProfileIsScopedAndPreservesPayload(t *testing.T) {
 				if len(rows) != 1 || rows[0]["bytes"] != json.Number("18446744073709551615") || rows[0]["raw"] != "original\\line\n" || rows[0]["raw_base64"] != "AP8=" || !reflect.DeepEqual(rows[0]["fields"], map[string]any{"unrecognized": "kept"}) || !reflect.DeepEqual(rows[0]["extra_fields"], []any{"extra"}) {
 					t.Fatal("event profile changed full event payload or integer precision")
 				}
+			}
+			return err
+		}, "2", "8192", "30", "1"},
+		{"page", func() error {
+			rows, err := client.EventPageRows(context.Background(), "SELECT * FROM events ORDER BY received_at DESC,id DESC LIMIT {limit:UInt32}", map[string]string{"limit": "1001"})
+			if err == nil && (len(rows) != 1 || rows[0]["bytes"] != json.Number("18446744073709551615") || rows[0]["raw_base64"] != "AP8=") {
+				t.Fatal("page profile changed event payload or integer precision")
 			}
 			return err
 		}, "2", "8192", "30", "1"},
@@ -62,6 +74,13 @@ func TestEventReadProfileIsScopedAndPreservesPayload(t *testing.T) {
 			}
 			if test.name == "event" && settings.Get("param_filter") != "quoted' value" {
 				t.Fatal("event parameter binding changed")
+			}
+			if test.name == "page" {
+				if settings.Get("query_plan_optimize_lazy_materialization") != "1" || settings.Get("query_plan_max_limit_for_lazy_materialization") != "1001" || settings.Get("param_limit") != "1001" {
+					t.Fatal("page payload deferral or lookahead binding changed")
+				}
+			} else if settings.Has("query_plan_optimize_lazy_materialization") || settings.Has("query_plan_max_limit_for_lazy_materialization") {
+				t.Fatal("page optimization leaked into another query profile")
 			}
 			if test.name == "export" {
 				if settings.Get("max_bytes_before_external_sort") != "134217728" || settings.Get("max_temporary_data_on_disk_size_for_query") != "1073741824" {
@@ -103,6 +122,10 @@ func TestEventRowsWideReadClickHouse(t *testing.T) {
 			}
 			if len(bounded) != limit || !reflect.DeepEqual(ordinary, bounded) {
 				t.Fatal("bounded event read changed rows, fields or ordering")
+			}
+			page, err := client.EventPageRows(context.Background(), sql, params)
+			if err != nil || !reflect.DeepEqual(ordinary, page) {
+				t.Fatalf("page optimization changed complete rows: %v", err)
 			}
 			if bounded[0]["raw"] != strings.Repeat("r", 8192) {
 				t.Fatal("wide payload was truncated")

@@ -160,7 +160,7 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	p["limit"] = strconv.Itoa(limit + 1)
-	rows, e := s.Store.CH.EventRows(r.Context(), "SELECT * EXCEPT expires_at FROM events WHERE "+where+" ORDER BY "+in.Sort+" "+in.Order+", id "+in.Order+" LIMIT {limit:UInt32}", p)
+	rows, e := s.Store.CH.EventPageRows(r.Context(), "SELECT * EXCEPT expires_at FROM events WHERE "+where+" ORDER BY "+in.Sort+" "+in.Order+", id "+in.Order+" LIMIT {limit:UInt32}", p)
 	if e != nil {
 		databaseError(w, e)
 		return
