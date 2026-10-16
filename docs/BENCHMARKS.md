@@ -1,11 +1,24 @@
 # Bounded database scale benchmark
 
-The September measurements below are historical. An isolated **100,000,000-row**
-dataset was subsequently populated and queried on October 16. The broader run
-exposed a page-memory failure; a focused correction passed, while qualification
-of the complete matrix with that correction remains open. See the
+The September measurements below are historical. On October 16, an isolated
+**100,000,000-row** dataset was populated and queried. After a page-memory
+correction, **33 case pairs, 66 modes and 660 samples** met their declared median
+targets through the actual Go store. The result combines 31 accepted pairs from
+an interrupted run with a bounded two-pair continuation; the original budget
+failure and an intervening failed ID-control attempt remain preserved. The final
+continuation verified the exact 100M dataset before and after its measurements.
+
+A separate nine-query check passed on Altinity 25.3.8.30001, confirming the new
+setting and ordered full-payload fallback pages, without establishing scale
+performance on that engine. See the
 [100M continuation report](validation/QUERY_100M_CONTINUATION.md) for the measured
-results and their limits.
+matrix, cache and machine limits, retained failures and compatibility evidence.
+
+The separate October 16 all-family ingestion run failed after a partial INSERT
+and retry produced 429 duplicate rows among 60,642 unique events. It did not
+complete the sustained or burst requirement. Query performance and ingestion
+reliability remain separate acceptance gates; see the release blocker in the
+[continuation report](validation/QUERY_100M_CONTINUATION.md#separate-ingestion-release-blocker).
 
 Measured on 2026-09-07 against ClickHouse 25.8.33.6. The representative synthetic table reached **10,000,000 events**. All 33 search cases completed three measured repetitions. **100 million events were not tested:** the measured active data projects to 21.39 GiB at 100M before merge reserve, or **32.08 GiB with 50% reserve**, exceeding the authorized 20 GiB benchmark budget. No search, retention, or capacity claim at 100M follows from these results.
 
@@ -87,7 +100,7 @@ The successful CSV stream returned **100,000 rows plus a header**, **11,125,265 
 4. The first successful search and TTL run was followed by an export failure before its checkpoint had been saved. The script now persists each completed stage before starting the next one. Searches and TTL were repeated, and the second run's results are preserved.
 5. At 10M, linear active-data projection alone exceeds 20 GiB for 100M; the required 50% merge reserve increases this to 32.08 GiB. The script therefore stopped without inserting further rows. No normalized-only substitute dataset was used to evade this boundary.
 
-The host, disk, and memory limits remained unchanged. The database table guard never required deleting real data or disabling live collection. 90-day scale, 100M performance, concurrent user loads, mixed PAN log types, long-running steady ingestion, hardware appliance performance, and guest FIPS/security qualification remain unmeasured.
+The host, disk, and memory limits remained unchanged. The database table guard never required deleting real data or disabling live collection. At that September checkpoint, 90-day scale, 100M performance, concurrent user loads, mixed PAN log types, long-running steady ingestion, hardware appliance performance, and guest FIPS/security qualification were unmeasured. The October query results and ingestion failure are reported above.
 
 ## Receipts and cleanup
 

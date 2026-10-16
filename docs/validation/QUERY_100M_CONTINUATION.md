@@ -2,8 +2,16 @@
 
 Measured October 16, 2026. The isolated ClickHouse dataset contains exactly
 **100,000,000 synthetic Traffic records**, including raw messages, Base64 and
-field representations. A query-memory correction passed a focused diagnostic.
-**The complete query matrix with that correction is not yet qualified.**
+field representations. The final page profile completed **33 case pairs,
+66 modes and 660 samples** through the actual Go store, with all declared
+median targets met. This combines 31 accepted pairs from an interrupted run
+with a separately bounded two-pair continuation; it was not one uninterrupted
+run. Retained failures and their limits are described below.
+
+A separate nine-query check passed on the selected Altinity 25.3 engine. That
+check proves bounded fallback compatibility, not 100M performance on that engine.
+A separate all-family ingestion test failed with duplicate delivery after a
+partial INSERT; query completion does not close that release blocker.
 
 ## Dataset and execution boundary
 
@@ -30,10 +38,11 @@ resource limits or replace the requested payload with a narrower one.
 
 The preceding run completed 29 case pairs: 58 modes and 580 measured samples.
 Their recorded medians met the declared targets. Case 29 (zero-based),
-destination port 443 over seven days, then failed during its normalized mode
-with native ClickHouse error 241, exceeding the 512 MiB query limit. Its full
-payload mode and the final three case pairs were not measured. That run did
-not complete its final dataset-prefix check and remains failed/incomplete.
+destination port 443 over seven days, then failed in both projections with
+native ClickHouse error 241, exceeding the 512 MiB query limit. It retained
+one normalized sample before failure and no successful full-payload sample;
+the final three pairs were not attempted. That run did not complete its final
+dataset-prefix check and remains failed/incomplete.
 
 The focused candidate reran that exact case through the Go store. Each mode
 returned 200 rows in the expected order on all ten samples. The pinned worker
@@ -64,8 +73,8 @@ decoded response hashes, exact source/build identities and executor results.
 Independent review checked those chains. The diagnostic did **not** retain the
 20 actual HTTP response bodies, so an independent reviewer cannot reparse them;
 field validation relies on execution of the pinned worker and oracle. The
-planned full-matrix successor retains bounded response bodies once per SHA-256
-and links each sample to its actual body.
+subsequent final-profile matrix retained bounded response bodies once per
+SHA-256 and linked each sample to its actual body.
 
 | Retained receipt | SHA-256 |
 | --- | --- |
@@ -82,11 +91,173 @@ The production change applies the setting only to event-page profiles,
 including the capability fallback; detail, export, aggregate and capability
 probe profiles retain their existing settings.
 
-All 33 case pairs, 66 modes and 660 samples still require fresh qualification
-using the final production profile. The previous 29 passing pairs cannot be
-combined with this diagnostic to claim a complete run under one profile.
-The new setting also requires execution against the selected appliance
-ClickHouse fork, separate from earlier compatibility checks. Mixed PAN-OS
-families, the 265 EPS retention population, 30/90-day production-equivalent
-scale, native Rocky/FIPS performance, OVA import and final acceptance remain
-open. Earlier 10M results remain in [the original report](../BENCHMARKS.md).
+## Final-profile matrix: 33 pairs across the retained run and continuation
+
+The final-profile run used source commit
+`09c60b2185076ef1f37cb4034a45df6b9d931333` and the same local ARM64 execution
+boundary and query caps. Between 11:16:04 and 11:24:23 UTC it completed cases
+0–30: **31 pairs, 62 modes and 620 samples**. All measured medians met the
+declared targets. The 1,364 worker requests have matching successful native
+finishes and retained response bodies; maximum native memory was 450,923,585
+bytes. Independent review reparsed the body, request and native evidence.
+
+The supervisor reached its **548-read limit** before dispatching case 31.
+That same exhausted budget prevented its final dataset-prefix check. This was
+a harness accounting failure, not a new page-query memory failure. Neither of
+the remaining pairs was launched: seven-day **time range** (case 31) and
+**denied/drop Traffic** (case 32). The original result remains held and has no
+final dataset-prefix proof.
+
+A separately bounded continuation attempted only the missing pairs with the
+same binary, source, oracle and page profile. It stopped at 11:54:40 UTC after
+three successful metadata queries and one failed **independent ID-control
+query** for case 31. That `SELECT id` used the ordinary event-read profile,
+without the page-specific buffering and remerge settings. Native error 241
+reported a proposed allocation of 513.09 MiB against its unchanged 512 MiB cap.
+The worker returned before either production-page mode; **zero new samples**
+were measured and case 32 was never started. This is a control-query limit,
+not a measured failure of the corrected production-page profile.
+
+The continuation's reserved terminal proof succeeded: exactly 100,000,000
+unique ordinal IDs, 0 through 99,999,999, with no foreign or malformed rows.
+Its executor exited one and was reaped without timeout or forced kill. Both
+held runs remain intact. A second continuation used generator-derived literal
+ordered IDs for only the two unmeasured pairs. The derivation enumerates complete
+timestamp ties and preserves descending ID order; its vectors were independently
+checked against comparable successful controls. Production page settings and the
+full-column oracle remained unchanged. This avoids repeating the memory-failing
+native ID-control query; it does not weaken the page or payload assertions.
+
+| Retained receipt | SHA-256 |
+| --- | --- |
+| Final-profile held result, 31 pairs | `b02b681c0fd6ba495ba07635ee9b38cde9042661f3afa2abc9e8d87d920ee32a` |
+| Final-profile host terminal | `e42f893714b6bb444e42be2590e353a792d32a13f89c2033d06dc90ba6b53739` |
+| Independent budget/failure diagnosis | `077231627b5d03a6f21102edd038644b03b6d13774d7aa5a2d75beeceef3d81e` |
+| Two-case continuation held result, zero samples | `d306dfa31c617e5d0e4f0a4e9c7c6902212b2c08980ba34dc1f4f7d83c6449fd` |
+| Two-case continuation host terminal | `a2c3ae884d05b04f9b5c611049577d29c82d652332deed4b106f3b9b5ae5260e` |
+
+## Completed local 100M query measurements
+
+The final continuation ran from **12:15:39 to 12:16:48 UTC** and completed both
+remaining pairs: 40 new samples, 86 worker SELECTs with 86 successful native
+finishes and no native errors, plus 75 supervisor reads. Its executor exited
+zero and was reaped within its 20-minute authority. The initial and final checks
+both found exactly 100,000,000 unique ordinal IDs, 0 through 99,999,999, with no
+foreign or malformed rows. Its maximum native query memory was 70,922,687 bytes.
+
+Combined with the preserved 620 samples, this establishes **33 pairs, 66 modes,
+660 measured samples and 1,450 qualifying worker requests** on the same source
+and page profile. The four requests from the failed ID-control attempt remain
+separate; neither failed run has been relabeled successful. Independent review
+revalidated the request/native/settings chains and reparsed 30 retained body
+artifacts (26 distinct content hashes) referenced by the 660 samples against
+the unchanged 44-column synthetic oracle.
+
+Each cell below is the **normalized / full-payload median in milliseconds**,
+from ten samples per mode. The declared median targets were 1,000 ms for the
+recent-hour window, 2,000 ms for 24 hours and 5,000 ms for seven days. Every mode
+met its target. These are first-page results, usually capped at 200 rows.
+
+| Filter | Recent 1 hour | 24 hours | 7 days |
+| --- | ---: | ---: | ---: |
+| Source IP | 29.913 / 46.736 | 55.096 / 286.688 | 119.141 / 1016.484 |
+| Destination IP | 41.785 / 143.972 | 35.659 / 140.445 | 50.814 / 160.089 |
+| Source CIDR | 39.364 / 61.777 | 28.916 / 66.907 | 50.133 / 88.559 |
+| Application | 42.951 / 76.090 | 45.005 / 67.655 | 50.348 / 86.192 |
+| Rule | 39.977 / 66.922 | 28.977 / 71.682 | 46.709 / 88.541 |
+| Action | 33.029 / 72.790 | 45.311 / 70.800 | 55.377 / 93.847 |
+| Firewall | 39.064 / 54.332 | 26.247 / 55.807 | 45.434 / 71.403 |
+| Destination port | 30.380 / 63.391 | 43.591 / 57.275 | 50.496 / 89.925 |
+| Source + destination | 30.037 / 37.392 | 34.119 / 35.250 | 32.270 / 51.084 |
+| Time range | 39.331 / 55.533 | 39.609 / 59.209 | 51.422 / 82.952 |
+| Denied/drop Traffic | 35.561 / 66.329 | 36.324 / 71.445 | 64.669 / 91.913 |
+
+The two final pairs retained these p50/p95 results:
+
+| Seven-day case | Projection | p50 | p95 |
+| --- | --- | ---: | ---: |
+| Time range | Normalized | 51.422 ms | 63.553 ms |
+| Time range | Full payload | 82.952 ms | 92.561 ms |
+| Denied/drop Traffic | Normalized | 64.669 ms | 89.120 ms |
+| Denied/drop Traffic | Full payload | 91.913 ms | 100.405 ms |
+
+The p95 values interpolate only ten samples and are not stable tail-latency
+estimates. No cache reset occurred. The initial 31 pairs ran a narrow database
+control before page measurements; the final two used literal IDs and metadata
+reads before page measurements. Both used the same page settings, but their
+warm-up histories differ. The all-family producer had already stopped before
+the final continuation; its services remained present. This shared development
+host is not a controlled concurrency or native appliance performance result.
+
+| Retained receipt | SHA-256 |
+| --- | --- |
+| Successful two-pair result and 33-pair aggregate | `b5f85a6ecad14d0a27a9a0f2abdb940e411fa76692831682c38b2e841a5fa017` |
+| Successful continuation host terminal | `5b1f3c159d9b56fd1eec0527efd147beccd421996b0b7071e6cb61b0ff7621f6` |
+| Independent actual native/body review | `eacd3222ce0042430dafa0071f660292722fbd8b108a506e64601e350fade3ac` |
+
+## Altinity 25.3 fallback compatibility
+
+The current Go store was also exercised against the pinned
+**25.3.8.30001.altinityfips** image, using a small deterministic 4,096-row
+synthetic source. The image and worker ran as amd64 containers on the shared
+ARM64 development host. This is an engine compatibility check, not a native
+x86 appliance or performance measurement.
+
+The first attempt stopped after two successful native SELECTs, before any
+event-page request. Its synthetic expression
+`toUInt64('18446744073709551615') - number` produced an `Int64`: for ordinal
+4,095 the value was −4,096, rather than the expected UInt64
+18,446,744,073,709,547,520. The literal oracle correctly rejected that fixture.
+Read-only reconciliation found both native finishes, no native errors or
+active queries, and confirmed that `bitNot(toUInt64(number))` produces the
+expected UInt64. The failed fixture and evidence were preserved, and its
+container was stopped.
+
+A new fixture changed only that synthetic expression, retaining the oracle
+and production page code. It **passed at 11:40:13 UTC**: nine SELECTs, nine
+native starts and finishes, and zero native errors. Three fallback pages
+returned **200 ascending, 1,001 descending and 200 cursor-paginated rows**.
+Their order and full decoded payloads matched the independent literal oracle,
+including the large UInt64 values; retained raw bodies were independently
+reparsed. Native settings explicitly reported `read_in_order_use_buffering=0`.
+The new owned container was then stopped with all evidence retained.
+
+This proves that the selected fork recognizes the setting and supports those
+bounded fallback pages. It does **not** prove lazy materialization on 25.3,
+native FIPS operation, appliance acceptance or performance at scale. The image
+name alone is not a FIPS qualification result.
+
+| Retained receipt | SHA-256 |
+| --- | --- |
+| First-attempt reconciliation and synthetic type proof | `a279b9bc24e419fd7da8c1b64be9eb3e0946c3bb20e739d62d0aee0f5d1f19e7` |
+| Corrected compatibility terminal | `7f52a0685e42c490dd4eb8426db44b4c3ca9c5446b93f72d2c4c34beb1f17a3b` |
+
+Mixed PAN-OS families, the 265 EPS retention population, 30/90-day
+production-equivalent scale, native Rocky/FIPS performance, OVA import and
+final acceptance remain open. Earlier 10M results remain in
+[the original report](../BENCHMARKS.md).
+
+## Separate ingestion release blocker
+
+These query results do not establish ingestion reliability. A separate split-role
+collector run covered 26 sanitized templates across 14 categories. Its 312-record
+transport controls passed, but the sustained phase stopped at 12:06:46 UTC on a
+ClickHouse total/server-memory error. It did not complete the required two hours
+or the five-minute burst.
+
+The producer had acknowledged 60,642 sends. Read-only reconciliation found
+**61,071 stored rows and 60,642 unique IDs**: 429 IDs each had two identical
+copies. Unique-event raw and bound SHA-256 checksum aggregates matched the sent
+set; no missing or altered unique payload was detected by that reconciliation.
+The failed INSERT reported `written_rows=555` in its native query log; that
+counter is not a committed-row count. The collector retried the retained batch. An empty queue and 60,642 inserted-event counter did
+not detect the duplicate copies.
+
+This is a delivery-idempotency defect as well as a fixture memory failure.
+Changing the memory budget alone cannot qualify retries after partial database
+writes. The original rows, payloads, WAL and failure evidence remain preserved;
+a corrected delivery path and a fresh complete workload are required before
+release acceptance. The independent query dataset and page timings are separate.
+
+Retained duplicate/payload reconciliation SHA-256:
+`6b9a0d1b57ec386efbca183dc7068d7b7966a89592bae97bc8ceba303687e02d`.
