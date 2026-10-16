@@ -55,7 +55,7 @@ func TestPageCapabilitiesRequireBothExactSettings(t *testing.T) {
 				if string(body) != sql+" FORMAT JSONEachRow" || q.Get("param_raw") != params["raw"] || q.Get("param_limit") != params["limit"] || q.Get("query_id") != "page-diagnostic-id" {
 					t.Error("probe changed page SQL, supported sort, or parameter binding")
 				}
-				for key, want := range map[string]string{"max_memory_usage": "536870912", "max_execution_time": "30", "max_threads": "2", "max_block_size": "8192", "wait_end_of_query": "1"} {
+				for key, want := range map[string]string{"max_memory_usage": "536870912", "max_execution_time": "30", "max_threads": "2", "max_block_size": "8192", "wait_end_of_query": "1", "max_bytes_before_remerge_sort": "67108864"} {
 					if q.Get(key) != want {
 						t.Errorf("page %s=%q, want %q", key, q.Get(key), want)
 					}

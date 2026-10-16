@@ -36,6 +36,7 @@ const (
 	queryEventRead
 	queryExport
 	queryEventPage
+	queryEventPageLazy
 	queryPageCapabilities
 )
 
@@ -71,14 +72,21 @@ func (c *ClickHouse) request(ctx context.Context, sql string, params map[string]
 	q.Set("wait_end_of_query", "1")
 	q.Set("buffer_size", "1048576")
 	stream := profile == queryExport
-	if profile == queryEventRead || profile == queryEventPage || stream {
+	page := profile == queryEventPage || profile == queryEventPageLazy
+	if profile == queryEventRead || page || stream {
 		// Wide event maps can exhaust the query budget while reading blocks,
 		// even when the final page is small. Bound those readers without
 		// changing analytics or ingestion defaults or raising the memory cap.
 		q.Set("max_threads", "2")
 		q.Set("max_block_size", "8192")
 	}
-	if profile == queryEventPage {
+	if page {
+		// Keep only the leading page rows before retained sort blocks approach
+		// the query cap. Wide sort keys cannot benefit from deferred payload
+		// reads; the default 1 GB remerge threshold exceeds our 512 MiB budget.
+		q.Set("max_bytes_before_remerge_sort", "67108864")
+	}
+	if profile == queryEventPageLazy {
 		// ClickHouse 25.8 otherwise only defers wide columns for LIMIT <= 10.
 		// Include the largest 1000-record page plus its cursor lookahead row;
 		// keep the existing query memory, concurrency and response limits.
@@ -166,19 +174,19 @@ func (c *ClickHouse) Rows(ctx context.Context, sql string, params map[string]str
 	return c.rows(ctx, sql, params, queryDefault)
 }
 
-// EventRows bounds wide reads for paginated logs and individual event details.
+// EventRows bounds wide reads for individual event details.
 // It preserves every selected field and the ordinary complete-response budget.
 func (c *ClickHouse) EventRows(ctx context.Context, sql string, params map[string]string) ([]map[string]any, error) {
 	return c.rows(ctx, sql, params, queryEventRead)
 }
 
-// EventPageRows enables deferred payload reads only when both settings exist.
-// Older builds and failed probes retain the ordinary event-read profile. Filters,
-// ordering, duplicate rows and cursor lookahead remain in the same query.
+// EventPageRows bounds retained sort blocks and enables deferred payload reads
+// only when both optional settings exist. Filters, ordering, duplicate rows and
+// cursor lookahead remain in the same query on all supported database builds.
 func (c *ClickHouse) EventPageRows(ctx context.Context, sql string, params map[string]string) ([]map[string]any, error) {
-	profile := queryEventRead
+	profile := queryEventPage
 	if c.pageCapabilities(ctx) {
-		profile = queryEventPage
+		profile = queryEventPageLazy
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err

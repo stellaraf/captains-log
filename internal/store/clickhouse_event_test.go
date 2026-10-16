@@ -76,11 +76,17 @@ func TestEventReadProfileIsScopedAndPreservesPayload(t *testing.T) {
 				t.Fatal("event parameter binding changed")
 			}
 			if test.name == "page" {
+				if settings.Get("max_bytes_before_remerge_sort") != "67108864" {
+					t.Fatal("page retained sort blocks can exceed the query budget")
+				}
 				if settings.Get("query_plan_optimize_lazy_materialization") != "1" || settings.Get("query_plan_max_limit_for_lazy_materialization") != "1001" || settings.Get("param_limit") != "1001" {
 					t.Fatal("page payload deferral or lookahead binding changed")
 				}
 			} else if settings.Has("query_plan_optimize_lazy_materialization") || settings.Has("query_plan_max_limit_for_lazy_materialization") {
 				t.Fatal("page optimization leaked into another query profile")
+			}
+			if test.name != "page" && settings.Has("max_bytes_before_remerge_sort") {
+				t.Fatal("page sort remerge changed another query profile")
 			}
 			if test.name == "export" {
 				if settings.Get("max_bytes_before_external_sort") != "134217728" || settings.Get("max_temporary_data_on_disk_size_for_query") != "1073741824" {
@@ -129,6 +135,64 @@ func TestEventRowsWideReadClickHouse(t *testing.T) {
 			}
 			if bounded[0]["raw"] != strings.Repeat("r", 8192) {
 				t.Fatal("wide payload was truncated")
+			}
+		})
+	}
+}
+
+// This read-only regression produces enough distinct wide sort keys to exercise
+// bounded top-N remerging, without creating or modifying a database table.
+// Expected rows and cursor boundaries are derived from the numeric sequence,
+// independently of ClickHouse's sorting implementation.
+func TestEventPageRowsWideSortClickHouse(t *testing.T) {
+	endpoint := os.Getenv("NEBULALOG_TEST_CH_URL")
+	if endpoint == "" {
+		t.Skip("set NEBULALOG_TEST_CH_URL for read-only wide sort and cursor regression")
+	}
+	client := NewClickHouse(endpoint, os.Getenv("NEBULALOG_TEST_CH_USER"), os.Getenv("NEBULALOG_TEST_CH_PASSWORD"))
+	const count = 1000000
+	const selectSQL = `SELECT toString(number) AS id, number AS bytes,
+	 concat('raw-',toString(number)) AS raw, map('index',toString(number)) AS fields,
+	 [toString(number)] AS extra_fields,
+	 concat(leftPad(toString(1000000-number),7,'0'),repeat('r',900)) AS raw_base64
+	 FROM numbers(1000000)`
+	for _, direction := range []string{"ASC", "DESC"} {
+		t.Run(direction, func(t *testing.T) {
+			var previous []map[string]any
+			for _, offset := range []int{0, 1000} {
+				params := map[string]string{"limit": "1001"}
+				filter := ""
+				if offset != 0 {
+					last := previous[999]
+					params["cursor_key"] = last["raw_base64"].(string)
+					params["cursor_id"] = last["id"].(string)
+					op := ">"
+					if direction == "DESC" {
+						op = "<"
+					}
+					filter = " WHERE (raw_base64,id) " + op + " ({cursor_key:String},{cursor_id:String})"
+				}
+				rows, err := client.EventPageRows(context.Background(), selectSQL+filter+" ORDER BY raw_base64 "+direction+",id "+direction+" LIMIT {limit:UInt32}", params)
+				if err != nil || len(rows) != 1001 {
+					t.Fatalf("wide page offset %d: rows=%d err=%v", offset, len(rows), err)
+				}
+				for i, row := range rows {
+					number := offset + i
+					if direction == "ASC" {
+						number = count - 1 - number
+					}
+					id := strconv.Itoa(number)
+					key := strconv.Itoa(count - number)
+					key = strings.Repeat("0", 7-len(key)) + key + strings.Repeat("r", 900)
+					want := map[string]any{"id": id, "bytes": json.Number(id), "raw": "raw-" + id, "fields": map[string]any{"index": id}, "extra_fields": []any{id}, "raw_base64": key}
+					if !reflect.DeepEqual(row, want) {
+						t.Fatalf("wide sort/cursor changed complete row at offset %d index %d", offset, i)
+					}
+				}
+				if offset != 0 && !reflect.DeepEqual(previous[1000], rows[0]) {
+					t.Fatal("cursor did not preserve the lookahead boundary")
+				}
+				previous = rows
 			}
 		})
 	}

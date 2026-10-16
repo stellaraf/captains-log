@@ -85,6 +85,9 @@ func TestLogPagesUseEventBudgetAndPreserveCursorContract(t *testing.T) {
 				}
 				request := <-requests
 				requireEventReadBudget(t, request)
+				if request.Params.Get("max_bytes_before_remerge_sort") != "67108864" {
+					t.Fatal("page sort retention exceeds the bounded query profile")
+				}
 				if request.Params.Get("query_plan_optimize_lazy_materialization") != "1" || request.Params.Get("query_plan_max_limit_for_lazy_materialization") != "1001" {
 					t.Fatal("page payload deferral does not cover the cursor lookahead")
 				}
