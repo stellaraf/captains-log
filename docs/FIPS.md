@@ -48,6 +48,44 @@ Retained evidence in the private T9 build root:
 - `outputs/vendor-hkdf-analysis-20261015/vendor-remedy-analysis.json`
 - `outputs/vendor-hkdf-analysis-20261015/source-687.57.1-receipt.json`
 
+## October 16 vendor-kernel qualification
+
+A fresh isolated x86_64 child of the preserved pre-install recovery disks
+installed the four official, signed Rocky kernel packages for
+`5.14.0-687.58.1.el9_8`. The offline vendor transaction exited 0, added exactly
+those four packages and removed none. The child then booted that exact kernel;
+verification of all four installed RPMs reported no modified payload files.
+
+The candidate again reported
+`basic hdkf test(hmac(sha256-avx2)): hkdf_extract failed with -22` in its
+current-boot kernel journal. First boot refused enrollment because of the
+cryptographic self-test failure and exited with status 1. Kernel FIPS remained
+`1`, `fips-mode-setup --check` passed, the crypto policy was `FIPS`, SELinux was
+Enforcing, audit/firewall services were active, and module-signature enforcement
+was `Y`. Secure Boot remained disabled. No custom kernel, diagnostic module,
+crypto substitution or security-gate bypass was used.
+
+This two-vCPU, 3-GiB QEMU/TCG guest also recorded a 27-second soft lockup in
+`mount` during the candidate boot, with kernel taint `16384`; its cold baseline
+had taint zero. That additional failure is retained separately from the HKDF
+failure, without assigning a cause. The historical guest and disabled Secure
+Boot do not qualify the current application, production FIPS boundary,
+automatic update lifecycle, OVA, VMware or Nutanix deployment. The vendor-only
+kernel qualification remains failed.
+
+The install observer conservatively held when systemd removed the completed
+oneshot unit's cgroup. Its five errors remain preserved. Read-only reconciliation
+verified the same original invocation, normal exit, completed jobs and absence
+of remaining installation processes before the single candidate reboot.
+
+Retained evidence in the private T9 build root:
+
+- `outputs/vendor-kernel-687.58.1-staged-20261016/staging-receipt.json`
+- `outputs/vendor-kernel-687.58.1-native-20261016/native-qualification.json`
+- `outputs/vendor-kernel-687.58.1-native-20261016/reconciled-install-settlement.json`
+- `outputs/vendor-kernel-687.58.1-native-20261016/qualification-result.json`
+- `outputs/vendor-kernel-687.58.1-native-20261016/stopped-seal.json`
+
 ## October 12 local qualification evidence
 
 The new T9 build booted Rocky 9.8 kernel
