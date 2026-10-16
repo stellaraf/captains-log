@@ -10,8 +10,9 @@ run. Retained failures and their limits are described below.
 
 A separate nine-query check passed on the selected Altinity 25.3 engine. That
 check proves bounded fallback compatibility, not 100M performance on that engine.
-A separate all-family ingestion test failed with duplicate delivery after a
-partial INSERT; query completion does not close that release blocker.
+A separate all-family ingestion test stopped on total-server-memory pressure.
+Its at-least-once retry preserved all unique events with identical replay copies;
+query completion does not close the sustained or burst acceptance gates.
 
 ## Dataset and execution boundary
 
@@ -237,27 +238,31 @@ production-equivalent scale, native Rocky/FIPS performance, OVA import and
 final acceptance remain open. Earlier 10M results remain in
 [the original report](../BENCHMARKS.md).
 
-## Separate ingestion release blocker
+## Separate ingestion workload failure
 
 These query results do not establish ingestion reliability. A separate split-role
 collector run covered 26 sanitized templates across 14 categories. Its 312-record
 transport controls passed, but the sustained phase stopped at 12:06:46 UTC on a
-ClickHouse total/server-memory error. It did not complete the required two hours
+ClickHouse total/server-memory exception 241. It did not complete the required two hours
 or the five-minute burst.
 
-The producer had acknowledged 60,642 sends. Read-only reconciliation found
+The producer recorded 60,642 completed sends. Read-only reconciliation found
 **61,071 stored rows and 60,642 unique IDs**: 429 IDs each had two identical
 copies. Unique-event raw and bound SHA-256 checksum aggregates matched the sent
 set; no missing or altered unique payload was detected by that reconciliation.
 The failed INSERT reported `written_rows=555` in its native query log; that
-counter is not a committed-row count. The collector retried the retained batch. An empty queue and 60,642 inserted-event counter did
-not detect the duplicate copies.
+counter is not a committed-row count. The collector retried the retained batch
+and subsequently reported an empty queue and 60,642 inserted events. That counter
+tracks logical events after database and WAL acknowledgment, not physical rows
+written by all attempts; it does not measure or exclude replay copies.
 
-This is a delivery-idempotency defect as well as a fixture memory failure.
-Changing the memory budget alone cannot qualify retries after partial database
-writes. The original rows, payloads, WAL and failure evidence remain preserved;
-a corrected delivery path and a fresh complete workload are required before
-release acceptance. The independent query dataset and page timings are separate.
+Identical replay copies after partial or ambiguously acknowledged database writes
+are permitted by the existing [at-least-once delivery contract](../SYSLOG.md#durable-buffering).
+This observation does not establish an exactly-once guarantee or a violation of
+that contract. The total-memory failure remains a failed sustained-load result;
+resource sizing and a fresh complete sustained and burst workload require
+qualification. The original rows, payloads, WAL and failure evidence remain
+preserved. The independent query dataset and page timings are separate.
 
 Retained duplicate/payload reconciliation SHA-256:
 `6b9a0d1b57ec386efbca183dc7068d7b7966a89592bae97bc8ceba303687e02d`.

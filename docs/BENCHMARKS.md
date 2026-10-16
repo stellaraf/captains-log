@@ -14,11 +14,14 @@ performance on that engine. See the
 [100M continuation report](validation/QUERY_100M_CONTINUATION.md) for the measured
 matrix, cache and machine limits, retained failures and compatibility evidence.
 
-The separate October 16 all-family ingestion run failed after a partial INSERT
-and retry produced 429 duplicate rows among 60,642 unique events. It did not
-complete the sustained or burst requirement. Query performance and ingestion
-reliability remain separate acceptance gates; see the release blocker in the
-[continuation report](validation/QUERY_100M_CONTINUATION.md#separate-ingestion-release-blocker).
+The separate October 16 all-family ingestion run stopped on ClickHouse
+total-server-memory exception 241. After retry and drain, the collector reported
+60,642 logically acknowledged events; storage contained 61,071 rows, including
+429 identical replay copies. All 60,642 unique events and their original payloads
+were found, with no unique-event loss detected. Replay is permitted by the
+documented at-least-once delivery contract. The run did not complete the sustained
+or burst requirement; see the separate ingestion acceptance limits in the
+[continuation report](validation/QUERY_100M_CONTINUATION.md#separate-ingestion-workload-failure).
 
 Measured on 2026-09-07 against ClickHouse 25.8.33.6. The representative synthetic table reached **10,000,000 events**. All 33 search cases completed three measured repetitions. **100 million events were not tested:** the measured active data projects to 21.39 GiB at 100M before merge reserve, or **32.08 GiB with 50% reserve**, exceeding the authorized 20 GiB benchmark budget. No search, retention, or capacity claim at 100M follows from these results.
 
