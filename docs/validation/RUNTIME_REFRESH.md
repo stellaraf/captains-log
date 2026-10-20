@@ -173,6 +173,36 @@ production-source/module files in the earlier source manifest still match.
 This reconciliation does not claim one combined full-environment run or native
 appliance acceptance.
 
+## Development build alignment
+
+The development Dockerfile now uses the same pinned Go 1.27.2 and Node 24
+manifests as the appliance build. Compose explicitly selects `linux/amd64` for
+the application, preventing a host-default architecture from selecting a
+different final runtime on Apple Silicon.
+
+A complete development image build passed, including the TypeScript/Vite
+frontend. The resulting binary's build information confirmed Go 1.27.2,
+`GOARCH=amd64` and `GOFIPS140=v1.0.0`. Its normal entrypoint successfully ran
+`version` with `REQUIRE_FIPS=true`, UID 10001, networking disabled, a read-only
+root and all capabilities dropped. The frontend index and exact project
+license were present. Compose configuration parsed with synthetic credentials.
+This is a development-image build/startup check, not a live database,
+browser-login or native appliance FIPS qualification.
+
+The owned BuildKit container/cache volume, temporary image, probe container,
+private Buildx configuration, source copy and extracted binary were removed.
+Independent readback confirmed absence and preserved all four current release
+archives.
+
+A read-only check of the official npm registry's stable dist-tags also found
+pending upgrades: React/React DOM 19.3.1, Playwright 1.64.1, Lucide 1.60.0,
+TypeScript 7.0.2, Vite 8.3.4, its React plugin 6.1.2 and Vitest 5.0.5.
+The corresponding React type packages also have newer versions. This
+observation is dated 2026-10-20 UTC; availability does not establish migration
+compatibility. These updates, the older development database/identity images,
+and transitive/OS dependency review remain open. The development build's
+`npm ci` reported zero known vulnerabilities at execution time.
+
 ## Remaining acceptance
 
 Existing-appliance interpreter installation and fixed-host migration,

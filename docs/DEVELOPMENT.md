@@ -55,8 +55,11 @@ npm test
 npm run build
 ```
 
-Go1.25+ and Node24+ are the baseline toolchains. The runtime dependencies are
-locked by go.sum and package-lock.json. See INSTALL_DOCKER.md for a real local
+Go 1.25 remains the minimum language version declared by `go.mod`. Both
+container build paths use the pinned Go 1.27.2 compiler and Node 24 manifests;
+Compose selects `linux/amd64` for the application. Use those build inputs for
+reproducible runtime qualification. Dependencies are locked by `go.sum` and
+`package-lock.json`. See INSTALL_DOCKER.md for a real local
 stack. Schema initialization uses `nebulalog migrate`; no SQLite/memory metadata
 fallback exists.
 

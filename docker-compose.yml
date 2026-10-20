@@ -61,6 +61,7 @@ services:
     mem_limit: 1g
   app:
     profiles: ["application"]
+    platform: linux/amd64
     restart: unless-stopped
     stop_grace_period: 45s
     user: "${DEV_UID:-501}:${DEV_GID:-20}"

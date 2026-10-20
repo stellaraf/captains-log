@@ -5,6 +5,11 @@ host controls, strict Keycloak FIPS bundle or encrypted appliance data disk.
 Use only trusted local networks while developing; browser/identity HTTP is
 loopback-only, and the temporary Syslog TLS certificate expires after 30 days.
 
+The application image targets Linux x86-64 (`linux/amd64`). Compose selects
+that platform explicitly, including on Apple Silicon development hosts where
+Docker uses emulation. Its Go 1.27.2 and Node 24 build inputs use the same
+immutable manifests as the appliance application build.
+
 1. Install Docker with Compose, Python 3 and OpenSSL.
 2. Run `python3 scripts/dev-init.py`. Unique secrets are stored in `.local/dev.env`
    with mode 0600. Back this file up privately; do not regenerate credentials
