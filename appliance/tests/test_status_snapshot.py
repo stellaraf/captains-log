@@ -51,6 +51,7 @@ class SnapshotTests(unittest.TestCase):
         self.addCleanup(self.trust.stop); self.addCleanup(self.identity.stop)
 
     def test_publishes_only_allowlisted_measured_fields(self):
+        self.current["os_transaction"] = {}
         value = self.collector.collect()
         self.assertNotIn("NEVER_PUBLISH_SECRET", json.dumps(value))
         self.assertEqual(value["schema"], 1)
@@ -151,6 +152,30 @@ class SnapshotTests(unittest.TestCase):
         atomic_json(self.collector.github_policy, {"schema": 1, "repository": "stellaraf/renamed", "automatic_updates": True, "poll_interval_seconds": 900})
         value = self.collector.collect()["updates"]["github"]
         self.assertEqual(value, {"status": "unavailable", "automatic_updates": False})
+
+    def test_kernel_recovery_blocks_advertised_automatic_updates_after_healthy_fallback(self):
+        self.github_fixture()
+        for field in ("kernel_finalization", "kernel_retention", "kernel_rollback"):
+            for phase in ("pending", "failed", "recovery_required", "unknown"):
+                with self.subTest(field=field, phase=phase):
+                    self.current["os_transaction"] = {"state": "complete", "finalization": "complete", field: phase}
+                    result = self.collector.collect()["updates"]
+                    self.assertEqual(result["github"]["status"], "blocked")
+                    self.assertFalse(result["github"]["automatic_updates"])
+
+    def test_kernel_recovery_hint_prioritizes_owned_work_over_component_release(self):
+        self.github_fixture()
+        self.current["maintenance_release_pending"] = True
+        self.current["os_transaction"] = {"state": "complete", "finalization": "complete",
+            "kernel_finalization": "recovery_required", "kernel_outcome": "recovery", "kernel_retry": "held"}
+        self.assertEqual(self.collector.collect()["updates"]["recovery_action"], "nebulalog update kernel-rollback")
+        self.current["os_transaction"].update(state="reboot_requested", kernel_retry="requested", boot_id="old-boot")
+        self.assertEqual(self.collector.collect()["updates"]["recovery_action"], "nebulalog update reboot-complete")
+        self.current["os_transaction"].update(kernel_rollback="failed")
+        self.assertEqual(self.collector.collect()["updates"]["recovery_action"], "nebulalog update kernel-rollback")
+        self.current["os_transaction"] = {"state": "complete", "finalization": "complete", "kernel_retention": "pending"}
+        self.assertEqual(self.collector.collect()["updates"]["recovery_action"], "nebulalog update reboot-complete")
+
 
     def test_fully_grown_disk_reports_measured_false(self):
         self.inspector.return_value = Snapshot(self.storage_identity, 1024*MIB, 1022*MIB, MIB,

@@ -1,5 +1,6 @@
 """Real RSA, host archives, OCI blobs and evidence hashes; no native tests or publishing."""
 import copy
+import io
 from datetime import datetime, timezone
 import json
 import os
@@ -8,21 +9,47 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tarfile
 import unittest
 from unittest.mock import patch
 
 from nebulalog_manager import host_payload as payload, publisher_inputs
 from nebulalog_manager.common import Refused
+from nebulalog_manager.image_bundle import ApplicationSchema, RestoredAuthContract
 import test_host_payload as hosts
 import test_image_bundle as images
 import test_manager as manager
+from test_restore_auth_contract import build_receipt, behavior_receipt
 
 PACKER = Path(__file__).resolve().parents[1] / "packer"
 sys.path.insert(0, str(PACKER))
 import assemble_release as release
+from nebulalog_manager.baseline import ContentUpdate
 
 NOW = datetime(2026, 9, 9, tzinfo=timezone.utc)
 COMMIT = "a" * 40
+
+
+def content_archive(path):
+    """Synthetic closed source graph; no native policy qualification asserted."""
+    raw = b'''<data-stream-collection xmlns="http://scap.nist.gov/schema/scap/source/1.2"
+        xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:x="http://checklists.nist.gov/xccdf/1.2">
+        <data-stream id="stream"><checklists><component-ref id="ref" xlink:href="#benchmark"/></checklists></data-stream>
+        <component id="benchmark"><x:Benchmark id="fixture"><x:Rule id="fixture_rule"/></x:Benchmark></component>
+        </data-stream-collection>'''
+    descriptor = {"schema": 1, "kind": ContentUpdate.KIND, "version": "1.2.3", "platform": "rocky9-x86_64",
+        "source_url": "https://example.invalid/synthetic", "content_revision": "synthetic-fixture-v1",
+        "engine": {"scanner_nevra": "openscap-scanner-1.3.14-1.el9.x86_64", "version_sha256": "e" * 64},
+        "files": {"source.xml": {"bytes": len(raw), "sha256": payload.digest(raw)}},
+        "policies": {name: {"schema": 1, "baseline": name,
+            "assessments": [{"datastream": "source.xml", "sha256": payload.digest(raw)}]}
+            for name in ("cis-level2", "stig", "unified")}}
+    with tarfile.open(path, "w", format=tarfile.USTAR_FORMAT) as archive:
+        for name, body in (("content.json", ContentUpdate.encoded(descriptor)), ("source.xml", raw)):
+            entry = tarfile.TarInfo(name)
+            entry.size, entry.mode = len(body), 0o644
+            archive.addfile(entry, io.BytesIO(body))
+    return descriptor
 
 
 class ReleaseTests(unittest.TestCase):
@@ -39,8 +66,17 @@ class ReleaseTests(unittest.TestCase):
         der = subprocess.check_output(["openssl", "pkey", "-pubin", "-in", str(self.public), "-pubout", "-outform", "DER"], stderr=subprocess.DEVNULL)
         descriptor = {"schema": 1, "publisher": "Test fixture", "repository": release.REPOSITORY, "key_id": "fixture",
                       "algorithm": "RSA-PSS-SHA256", "spki_sha256": payload.digest(der)}
+        legacy, additive, stepup = ApplicationSchema.reviewed_sql()
+        # These existing tests exercise the immutable schema-2 release contract.
+        # Current source migrations now describe fresh schema 3.
+        migrations = {"postgres.sql": (legacy + additive).encode(), "host_stepup.sql": stepup.encode(),
+                      "clickhouse.sql": (PACKER.parents[1] / "migrations/clickhouse.sql").read_bytes()}
+        migrations["clickhouse.sql"] = migrations["clickhouse.sql"].replace(
+            b"SETTINGS index_granularity=8192;", b"TTL expires_at DELETE\nSETTINGS index_granularity=8192;")
+        self.assertEqual(payload.digest(migrations["clickhouse.sql"]), ApplicationSchema.SCHEMAS["2"]["migrations/clickhouse.sql"])
         for name, raw in ((publisher_inputs.PUBLIC_SOURCE, raw_public), (publisher_inputs.DESCRIPTOR_SOURCE, payload.encoded(descriptor)),
-                          ("go.mod", b"module fixture\n"), ("cmd/nebulalog/main.go", b"package main\n")):
+                          ("go.mod", b"module fixture\n"), ("cmd/nebulalog/main.go", b"package main\n"),
+                          *(("migrations/" + name, raw) for name, raw in migrations.items())):
             path = self.source / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(raw)
@@ -49,17 +85,82 @@ class ReleaseTests(unittest.TestCase):
         self.images = self.root / "images"
         self.pins, self.image_manifest, _ = images.fixture_bundle(self.images, application_source_sha256=release.application_hash(snapshot))
         self.recipe = {"schema": 1, "repository": release.REPOSITORY, "sequence": 2, "version": "0.1.1",
-            "issued_at": "2026-09-01T00:00:00Z", "expires_at": "2027-09-01T00:00:00Z", "schema_revision": "1", "source_commit": COMMIT,
+            "issued_at": "2026-09-01T00:00:00Z", "expires_at": "2027-09-01T00:00:00Z", "schema_revision": "2", "source_commit": COMMIT,
             "components": {name: {"version": "0.1.1", "from_versions": ["0.1.0"]} for name in ("host", "nebulalog")}, "evidence_artifacts": []}
         self.recipe_path = self.root / "recipe.json"
         self.output = self.root / "release"
         self.evidence = self.root / "evidence"
         self.evidence.mkdir()
 
-    def assemble(self, *, signed=True):
+    def assemble(self, *, signed=True, content=None):
         self.recipe_path.write_bytes(payload.encoded(self.recipe))
         return release.assemble(self.source, self.snapshot_path, self.images, self.recipe_path, self.output,
-            signing_key=self.private.resolve() if signed else None, evidence_directory=self.evidence, now=NOW)
+            signing_key=self.private.resolve() if signed else None, evidence_directory=self.evidence, content_archive=content, now=NOW)
+
+    def content(self):
+        path = self.root / "candidate-content.tar"
+        descriptor = content_archive(path)
+        self.recipe["components"]["baseline"] = {"version": descriptor["version"], "from_versions": ["sha256:" + "a" * 64],
+            "content_schema": 1, "descriptor_sha256": payload.digest(ContentUpdate.encoded(descriptor))}
+        return path
+
+    def test_content_package_binds_actual_archive_descriptor_and_measured_source_version(self):
+        path = self.content()
+        result = self.assemble(content=path)
+        verified = self.verify()
+        change = verified["manifest"]["components"]["baseline"]
+        self.assertEqual(change, {**self.recipe["components"]["baseline"], "rollback_safe": True, "artifact": "baseline-content.tar"})
+        self.assertEqual((self.output / change["artifact"]).read_bytes(), path.read_bytes())
+        self.assertFalse(result["native_qualified"])
+
+    def test_content_input_and_recipe_must_be_paired_and_standalone_content_is_refused(self):
+        path = self.content()
+        with self.assertRaisesRegex(Refused, "supplied exactly"): self.assemble()
+        original = self.recipe["components"].pop("baseline")
+        with self.assertRaisesRegex(Refused, "supplied exactly"): self.assemble(content=path)
+        self.recipe["components"] = {"baseline": original}
+        with self.assertRaisesRegex(Refused, "requires host"): self.assemble(content=path)
+        self.assertFalse(self.output.exists())
+
+    def test_content_declared_version_descriptor_and_inventory_tamper_refuse(self):
+        path = self.content()
+        original = copy.deepcopy(self.recipe["components"]["baseline"])
+        for changes in ({"descriptor_sha256": "f" * 64}, {"version": "9.9.9"}, {"content_schema": True},
+                        {"from_versions": ["*"]}, {"engine_update": True}):
+            self.recipe["components"]["baseline"] = {**original, **changes}
+            with self.subTest(changes=changes), self.assertRaises(Refused): self.assemble(content=path)
+            self.assertFalse(self.output.exists())
+        self.recipe["components"]["baseline"] = original
+        raw = path.read_bytes().replace(b'fixture_rule', b'changed_rule')
+        path.write_bytes(raw)
+        with self.assertRaises(Refused): self.assemble(content=path)
+        self.assertFalse(self.output.exists())
+
+    def test_content_copy_race_is_reverified_before_release_publication(self):
+        path = self.content()
+        copy_asset = release.file_info
+        def replace(source, *args, **kwargs):
+            if Path(source) == path:
+                path.write_bytes(path.read_bytes().replace(b'fixture_rule', b'changed_rule'))
+            return copy_asset(source, *args, **kwargs)
+        with patch.object(release, "file_info", side_effect=replace), self.assertRaises(Refused):
+            self.assemble(content=path)
+        self.assertFalse(self.output.exists())
+
+    def test_signed_content_enrollment_bridge_is_explicit_and_preserved(self):
+        self.recipe["content_enrollment"] = "selected-baseline-v1"
+        self.assemble()
+        manifest = self.verify()["manifest"]
+        self.assertEqual(manifest["content_enrollment"], "selected-baseline-v1")
+        self.assertNotIn("baseline", manifest["components"])
+
+    def test_content_bridge_refuses_unsupported_or_combined_content_activation(self):
+        self.recipe["content_enrollment"] = True
+        with self.assertRaisesRegex(Refused, "Content enrollment"): self.assemble()
+        self.recipe["content_enrollment"] = "selected-baseline-v1"
+        path = self.content()
+        with self.assertRaisesRegex(Refused, "Content enrollment"): self.assemble(content=path)
+        self.assertFalse(self.output.exists())
 
     def verify(self):
         return release.verify_package(self.output, expected_manifest=release.file_info(self.output / "manifest.json")["sha256"],
@@ -79,6 +180,48 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertFalse(payload.PRIVATE_KEY.search(path.read_bytes()))
         self.assertFalse(result["network_used"])
+
+    def restored_auth(self):
+        snapshot = json.loads(self.snapshot_path.read_bytes())
+        for name in RestoredAuthContract.REQUIRED_SOURCE | set(ApplicationSchema.SCHEMAS["3"]):
+            raw = ((PACKER.parents[1] / name).read_bytes() if name.startswith("migrations/") else (name + " fixture\n").encode())
+            path = self.source / name
+            path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(raw)
+            snapshot["files"][name] = payload.digest(raw)
+        self.snapshot_path.write_bytes(payload.encoded(snapshot))
+        shutil.rmtree(self.images)  # Only this test's generated tiny OCI fixture.
+        self.pins, self.image_manifest, _ = images.fixture_bundle(self.images, application_source_sha256=release.application_hash(snapshot))
+        image = release.image_bundle.verify_bundle(self.images, self.pins)["images"]["NEBULALOG_IMAGE"]
+        self.recipe.update(schema_revision="3", restore_auth=RestoredAuthContract.CONTRACT,
+                           evidence_artifacts=sorted(RestoredAuthContract.EVIDENCE))
+        for name, value in ((RestoredAuthContract.BUILD, build_receipt(snapshot, image, self.recipe["version"])),
+                            (RestoredAuthContract.BEHAVIOR, behavior_receipt(image, self.pins["NEBULALOG_IMAGE"]))):
+            (self.evidence / name).write_bytes(payload.encoded(value))
+
+    def test_restored_auth_source_and_behavior_are_signed_without_native_acceptance_claim(self):
+        self.restored_auth()
+        self.assemble()
+        result = self.verify()
+        manifest = result["manifest"]
+        self.assertEqual(manifest["restore_auth"], RestoredAuthContract.declaration())
+        self.assertTrue({RestoredAuthContract.SOURCE, *RestoredAuthContract.EVIDENCE} <= {item["name"] for item in manifest["artifacts"]})
+        self.assertFalse(result["native_qualified"])
+        self.assertFalse(RestoredAuthContract.verify(manifest, self.output)["execution_verified_by_tool"])
+
+    def test_restored_auth_failed_behavior_and_unbound_build_refuse_before_signature(self):
+        self.restored_auth()
+        path = self.evidence / RestoredAuthContract.BEHAVIOR
+        value = json.loads(path.read_bytes())
+        value["cases"]["before_cutoff"]["http_status"] = 200
+        path.write_bytes(payload.encoded(value))
+        with self.assertRaisesRegex(Refused, "boundary case"): self.assemble()
+        self.assertFalse(self.output.exists())
+        self.restored_auth()
+        path = self.evidence / RestoredAuthContract.BUILD
+        value = json.loads(path.read_bytes()); value["local_image_id"] = "sha256:" + "f" * 64
+        path.write_bytes(payload.encoded(value))
+        with self.assertRaisesRegex(Refused, "build receipt"): self.assemble()
+        self.assertFalse(self.output.exists())
 
     def test_unsigned_package_cannot_pass_publication_verification(self):
         result = self.assemble(signed=False)

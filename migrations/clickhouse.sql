@@ -22,5 +22,4 @@ CREATE TABLE IF NOT EXISTS nebulalog.events
 ENGINE=MergeTree
 PARTITION BY (log_type, toDate(ingested_at))
 ORDER BY (log_type, received_at, serial, id)
-TTL expires_at DELETE
 SETTINGS index_granularity=8192;

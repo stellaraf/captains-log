@@ -11,13 +11,25 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
 type ClickHouse struct {
 	URL, User, Password string
 	Client              *http.Client
+	// Only the fixed storage initializer reads metadata before nebulalog exists.
+	initializationMetadata bool
+	pageProbeMu            sync.Mutex
+	pageProbe              *pageCapabilityProbe
 }
+
+type pageCapabilityProbe struct {
+	done      chan struct{}
+	supported bool
+}
+
+type clickHouseQueryIDKey struct{}
 
 type queryProfile uint8
 
@@ -25,10 +37,20 @@ const (
 	queryDefault queryProfile = iota
 	queryEventRead
 	queryExport
+	queryEventPage
+	queryEventPageLazy
+	queryPageCapabilities
 )
 
+const pageCapabilitiesSQL = "SELECT name FROM system.settings WHERE name IN ('query_plan_optimize_lazy_materialization','query_plan_max_limit_for_lazy_materialization') ORDER BY name LIMIT 3 FORMAT TabSeparatedRaw"
+const pageCapabilitiesResponse = "query_plan_max_limit_for_lazy_materialization\nquery_plan_optimize_lazy_materialization\n"
+
 func NewClickHouse(endpoint, user, password string) *ClickHouse {
-	return &ClickHouse{endpoint, user, password, &http.Client{Timeout: 45 * time.Second}}
+	return &ClickHouse{URL: endpoint, User: user, Password: password, Client: &http.Client{Timeout: 45 * time.Second}}
+}
+
+func (c *ClickHouse) storageInitializationClient() *ClickHouse {
+	return &ClickHouse{URL: c.URL, User: c.User, Password: c.Password, Client: c.Client, initializationMetadata: true}
 }
 
 // Query binds all literals independently from the trusted SQL program.
@@ -42,6 +64,12 @@ func (c *ClickHouse) request(ctx context.Context, sql string, params map[string]
 	}
 	q := u.Query()
 	q.Set("database", "nebulalog")
+	if c.initializationMetadata {
+		q.Set("database", "default")
+	}
+	if id, ok := ctx.Value(clickHouseQueryIDKey{}).(string); ok {
+		q.Set("query_id", id)
+	}
 	if strings.HasPrefix(strings.TrimSpace(sql), "CREATE DATABASE") {
 		q.Set("database", "default")
 	}
@@ -53,12 +81,37 @@ func (c *ClickHouse) request(ctx context.Context, sql string, params map[string]
 	q.Set("wait_end_of_query", "1")
 	q.Set("buffer_size", "1048576")
 	stream := profile == queryExport
-	if profile == queryEventRead || stream {
+	page := profile == queryEventPage || profile == queryEventPageLazy
+	if profile == queryEventRead || page || stream {
 		// Wide event maps can exhaust the query budget while reading blocks,
 		// even when the final page is small. Bound those readers without
 		// changing analytics or ingestion defaults or raising the memory cap.
 		q.Set("max_threads", "2")
 		q.Set("max_block_size", "8192")
+	}
+	if page {
+		// Keep only the leading page rows before retained sort blocks approach
+		// the query cap. Wide sort keys cannot benefit from deferred payload
+		// reads; the default 1 GB remerge threshold exceeds our 512 MiB budget.
+		q.Set("max_bytes_before_remerge_sort", "67108864")
+		// Ordered reads may buffer chunks from many parts even with two reader
+		// threads. Avoid that extra buffering within the page memory budget.
+		q.Set("read_in_order_use_buffering", "0")
+	}
+	if profile == queryEventPageLazy {
+		// ClickHouse 25.8 otherwise only defers wide columns for LIMIT <= 10.
+		// Include the largest 1000-record page plus its cursor lookahead row;
+		// keep the existing query memory, concurrency and response limits.
+		q.Set("query_plan_optimize_lazy_materialization", "1")
+		q.Set("query_plan_max_limit_for_lazy_materialization", "1001")
+	}
+	if profile == queryPageCapabilities {
+		// The probe must work on builds without either optional setting.
+		q.Del("query_plan_optimize_lazy_materialization")
+		q.Del("query_plan_max_limit_for_lazy_materialization")
+		q.Del("query_id") // let the server assign the probe its own diagnostic ID
+		q.Set("max_execution_time", "1")
+		q.Set("max_threads", "1")
 	}
 	if stream {
 		// Exports are bounded by their context and disk quota, not the interactive
@@ -113,14 +166,85 @@ func (c *ClickHouse) Exec(ctx context.Context, sql string, params map[string]str
 	_, e = io.Copy(io.Discard, r)
 	return e
 }
+
+// An ambiguous response must never be retried as the same destructive action.
+// query_id is diagnostic identity, not a server-side idempotency key.
+func (c *ClickHouse) ExecWithQueryID(ctx context.Context, sql string, params map[string]string, id string) error {
+	if !emergencyUUID.MatchString(id) {
+		return errors.New("invalid query identity")
+	}
+	return c.Exec(context.WithValue(ctx, clickHouseQueryIDKey{}, id), sql, params)
+}
+func (c *ClickHouse) InsertRowsWithQueryID(ctx context.Context, rows []map[string]any, id string) error {
+	if !emergencyUUID.MatchString(id) {
+		return errors.New("invalid query identity")
+	}
+	return c.InsertRows(context.WithValue(ctx, clickHouseQueryIDKey{}, id), rows)
+}
+
 func (c *ClickHouse) Rows(ctx context.Context, sql string, params map[string]string) ([]map[string]any, error) {
 	return c.rows(ctx, sql, params, queryDefault)
 }
 
-// EventRows bounds wide reads for paginated logs and individual event details.
+// EventRows bounds wide reads for individual event details.
 // It preserves every selected field and the ordinary complete-response budget.
 func (c *ClickHouse) EventRows(ctx context.Context, sql string, params map[string]string) ([]map[string]any, error) {
 	return c.rows(ctx, sql, params, queryEventRead)
+}
+
+// EventPageRows bounds retained sort blocks and enables deferred payload reads
+// only when both optional settings exist. Filters, ordering, duplicate rows and
+// cursor lookahead remain in the same query on all supported database builds.
+func (c *ClickHouse) EventPageRows(ctx context.Context, sql string, params map[string]string) ([]map[string]any, error) {
+	profile := queryEventPage
+	if c.pageCapabilities(ctx) {
+		profile = queryEventPageLazy
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return c.rows(ctx, sql, params, profile)
+}
+
+// Only concurrent probes are shared: retaining support across requests could
+// send unsupported settings after a database replacement or downgrade. Probe
+// failures are optional-optimization failures, never a reason to suppress a page.
+func (c *ClickHouse) pageCapabilities(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	c.pageProbeMu.Lock()
+	probe := c.pageProbe
+	if probe != nil {
+		c.pageProbeMu.Unlock()
+		select {
+		case <-probe.done:
+			return probe.supported
+		case <-ctx.Done():
+			return false
+		}
+	}
+	probe = &pageCapabilityProbe{done: make(chan struct{})}
+	c.pageProbe = probe
+	c.pageProbeMu.Unlock()
+	probe.supported = c.probePageCapabilities(ctx)
+	c.pageProbeMu.Lock()
+	c.pageProbe = nil
+	close(probe.done)
+	c.pageProbeMu.Unlock()
+	return probe.supported
+}
+
+func (c *ClickHouse) probePageCapabilities(ctx context.Context) bool {
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	r, err := c.request(ctx, pageCapabilitiesSQL, nil, nil, queryPageCapabilities)
+	if err != nil {
+		return false
+	}
+	defer r.Close()
+	body, err := io.ReadAll(io.LimitReader(r, 4097))
+	return err == nil && string(body) == pageCapabilitiesResponse
 }
 
 func (c *ClickHouse) rows(ctx context.Context, sql string, params map[string]string, profile queryProfile) ([]map[string]any, error) {

@@ -1,5 +1,17 @@
 # Appliance implementation evidence — 2026-09-09
 
+## Native AHV update — October 20, 2026
+
+A private Rocky 9.8 x86_64 diagnostic guest now has verified Image Service
+import and native boot on AHV 11.2.0.2. Secure Boot, FIPS enablement, SELinux,
+vendor kernel integrity and assigned networking were observed in the guest.
+Kernel `5.14.0-687.58.1.el9_8` failed the same HKDF self-test seen on VMware;
+enrollment correctly refused. The diagnostic VM is powered off with its NIC
+disconnected. See [the native evidence and scope](validation/AHV_KERNEL_20261020.md).
+The latest application bundle and final OVA remain unqualified.
+
+## Historical September build checkpoint
+
 **No completed, imported and end-to-end validated OVA release is available.** The clean4 Rocky 9.8 x86_64 build completed, and both disks passed offline integrity checks. An isolated installed-guest observation boot completed and shut down with the original disk hashes unchanged. The base is deliberately unsealed; sealing, OVA packaging, VMware/Nutanix imports and full runtime acceptance remain pending. See the [clean4 evidence](validation/ROCKY_CLEAN4.md). A completed build is distinct from a deployable release.
 
 ## Implemented and locally checked

@@ -53,6 +53,9 @@ def resume_runtime(manager, config):
         ready = _private_json(ready_path)
         state_path = identity.root / "configuration/bootstrap/runtime-state.json"
         state = _private_json(state_path, device=identity.device)
+        from .restore_runtime import RESTORE_STAGES, valid_restored_state
+        restored = state.get("kind") == "configuration-restore" if type(state) is dict else False
+        stages = RESTORE_STAGES if restored else RUNTIME_STAGES
         setup = _private_json(identity.root / "configuration/bootstrap/setup.json", device=identity.device)
         if (type(journal) is not dict or journal.get("installation_id") != installation
                 or journal.get("config_sha256") != _digest(config)
@@ -61,13 +64,15 @@ def resume_runtime(manager, config):
                 or type(ready.get("checks")) is not dict or not all(ready["checks"].get(key) is True for key in RUNTIME_CHECKS)
                 or type(state) is not dict or type(state.get("schema")) is not int or state["schema"] != 1
                 or state.get("installation_id") != installation or type(state.get("completed")) is not list
-                or any(type(stage) is not str or stage not in RUNTIME_STAGES for stage in state["completed"])
+                or any(type(stage) is not str or stage not in stages for stage in state["completed"])
                 or len(state["completed"]) != len(set(state["completed"]))
-                or state.get("active_stage") not in RUNTIME_STAGES | {None}
+                or state.get("active_stage") not in stages | {None}
                 or type(setup) is not dict or setup.get("installation_id") != installation
                 or setup.get("hostname") != config["hostname"] or setup.get("baseline") != config["baseline"]):
             raise Refused("Saved runtime evidence does not match the current installation and settings")
-        if (state.get("active_stage") is not None or set(state["completed"]) != RUNTIME_STAGES
+        if restored and not valid_restored_state(state, manager.paths):
+            raise Refused("Restored runtime has no matching activation receipt; use restore recovery")
+        if (state.get("active_stage") is not None or set(state["completed"]) != stages
                 or state.get("identity_initialized") is not True):
             if _integrity_state_exists(manager):
                 raise Refused("Runtime provisioning is incomplete while file-integrity state exists; automatic reprovisioning is refused")

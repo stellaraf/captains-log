@@ -1,0 +1,12 @@
+[Unit]
+Description=Reconcile qualified boot flags and interrupted boot verification
+RequiresMountsFor=/var/lib/nebulalog
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=15min
+AccuracySec=15s
+Unit=nebulalog-reboot-verify.service
+
+[Install]
+WantedBy=timers.target

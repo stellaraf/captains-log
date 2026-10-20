@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3.14
 """Build and enroll the initial host generation in a guarded disposable image.
 
 Never called during customer boot or updates. Fixed public trust stays outside
@@ -21,7 +21,8 @@ ETC = Path("/etc/nebulalog")
 SHARE = Path("/usr/share/nebulalog")
 DATA = Path("/var/lib/nebulalog")
 FIXED = {"appliance/host_boot.py": Path("/usr/libexec/nebulalog/host-boot"),
-         "appliance/factory_host.py": Path("/usr/libexec/nebulalog/factory-host")}
+         "appliance/factory_host.py": Path("/usr/libexec/nebulalog/factory-host"),
+         "appliance/factory_kernel.py": Path("/usr/libexec/nebulalog/factory-kernel")}
 
 
 def guard():

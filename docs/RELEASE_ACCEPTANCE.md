@@ -2,6 +2,84 @@
 
 This is the release contract for the full request in [SPECIFICATION.md](SPECIFICATION.md), including the later Stellar branding/UI standards, Okta/Entra defaults with in-app instructions, and adjustable/pauseable refresh. It does not replace or narrow that request. Snapshot: **2026-09-07 local date, source checkpoint `44e2eb1`**. Concurrent Rocky image and first-boot implementation work is not accepted here until its actual results are recorded. **Version 1 is not complete; user sign-off has not occurred.**
 
+## Native AHV diagnostic update — October 20, 2026
+
+A separately prepared private Rocky 9.8 x86_64 guest imported and booted on
+AHV 11.2.0.2 with Secure Boot and FIPS enabled. Pinned SSH identity, guest/VM
+UUID binding, networking, vendor kernel integrity and independent disk
+identities were verified. The public `5.14.0-687.58.1.el9_8` kernel failed its
+HKDF self-test, reproducing the VMware result; firstboot refused enrollment.
+The VM is retained powered off with its NIC disconnected.
+
+The [diagnostic report](validation/AHV_KERNEL_20261020.md) records the actual
+scope and the two resolved API request failures. This does not qualify the
+latest application bundle, sealed OVA, full platform lifecycle or final
+sign-off. The complete acceptance matrix below remains in force.
+
+## Query qualification update — October 16, 2026
+
+The isolated database contains 100,000,000 synthetic full-payload Traffic
+records. The page-only ordered-read buffering correction completed **33 case
+pairs, 66 modes and 660 samples**, all meeting their declared median targets.
+This combines 31 accepted pairs from a supervisor-budget interruption with a
+separate two-pair continuation. An intervening independent ID-control query
+failed before any page sample; that failed attempt remains preserved. The final
+continuation verified the exact 100M dataset before and after execution.
+
+The tests used the actual Go store on the shared ARM64 development host, with
+unchanged 512 MiB page-query limits. They establish the stated local query
+matrix, not native x86 appliance, cold-cache or production-load acceptance.
+
+A separate **nine-query Altinity 25.3.8.30001 compatibility check passed**,
+including three ordered full-payload fallback pages. Its first attempt stopped
+before any page because a synthetic UInt64 expression produced signed values;
+the corrected fixture retained the same literal oracle. This confirms setting
+and fallback compatibility, not lazy-materialization support or performance on
+that engine. The [continuation report](validation/QUERY_100M_CONTINUATION.md)
+records both attempts, the earlier page-memory failure and platform limits.
+
+A separate all-family ingestion run stopped on **ClickHouse total-server-memory
+exception 241** after 60,642 sends. After retry and drain, the collector reported
+60,642 logically acknowledged events and an empty queue. Reconciliation found
+all 60,642 unique IDs and matching original payload checksums, with **61,071 stored
+rows: 429 IDs had two identical copies** after the partial INSERT and retry.
+No unique-event loss was detected. These replay copies are permitted by the
+documented [at-least-once delivery contract](SYSLOG.md#durable-buffering);
+the inserted-event counter does not measure physical rows or promise uniqueness.
+The total-memory failure still leaves the two-hour sustained and five-minute
+burst requirements unpassed. Resource sizing and a fresh complete workload
+remain acceptance gates; this result establishes neither sustained capacity
+nor exactly-once delivery.
+
+These results do not close the full performance, mixed-log ingestion, native
+appliance, OVA, hypervisor or final sign-off requirements. The source and native
+checkpoints below remain historical evidence with their original scope.
+
+## Source and native evidence — October 15, 2026
+
+Source checkpoint `b4e40401a44b240b2c157eb9357189502ef5906a` and public
+checkpoint `82772678992e443e66cfec1f2ae0e66865c12437` have the same Git tree,
+`191c57c287cfb91682f331789ace4d80990ade70`. The frozen Rocky x86_64 suites
+passed **1,315 appliance tests and 129 lifecycle-adapter tests**, with no
+skips. The source is published in [draft PR 1](https://github.com/stellaraf/captains-log/pull/1);
+it is not a merged or released appliance.
+
+This checkpoint adds ordinary-boot integrity reconciliation, immutable initial
+boot snapshots, recovery after interrupted integrity verification, and a
+periodic boot-verification timer. It also includes the preceding kernel update,
+boot promotion and interrupted-retention implementation. See
+[OS update qualification](OS_UPDATE_QUALIFICATION.md) for the transaction
+boundaries and remaining native tests. The source suite controls some host,
+scanner and runtime inputs; passing it does not establish a healthy guest.
+
+A separate read-only measurement of the Rocky qualification guest captured
+456 installed package identities and 6,253 protected boot/module artifacts,
+with matching repeated observations. It did not enroll production AIDE or
+accept a boot or update. The signed vendor kernel still fails the required
+FIPS crypto self-test. A sealed OVA, native VMware/Nutanix acceptance and final
+sign-off remain outstanding. **No requirement row is closed by this source
+checkpoint.** Earlier counts and results below are historical evidence.
+
 ## Subsequent implementation checkpoint — September 8, 2026
 
 The working tree now implements split collector status, a bounded read-only appliance status feed, first-boot console/bootstrap, offline OCI loading, lifecycle adapters, baseline review, initial release/source enrollment, publisher-key trust and measured inventory/storage windows. These changes are still uncommitted; `44e2eb1` identifies their base, not the built candidate's complete source. Exact source snapshots and OCI configuration labels are being captured for appliance images.
@@ -48,7 +126,7 @@ Existing evidence references used below:
 | [PALO_REAL](validation/PALO_REAL.md) | PA-1410 PAN-OS 12.1.4-h8 forwarding and sampled XML-vs-Syslog checks; does not certify every PAN-OS release or all native families. |
 | [SYSLOG](SYSLOG.md), [PANOS research](research/PANOS.md) | Documented layouts, raw preservation and known schema limits. |
 | [INGEST_BENCHMARK](INGEST_BENCHMARK.md) | 265 EPS for 60 seconds and 2,650 EPS for 10 seconds through TCP/parser/WAL/database; not a production soak. |
-| [BENCHMARKS](BENCHMARKS.md) | 10M full-payload synthetic query dataset; 100M and 1B not run. |
+| [BENCHMARKS](BENCHMARKS.md) | Historical 10M results; October 16 local 100M final profile completed 33 pairs/660 samples across retained run and continuation. 1B not run. |
 | [APPLIANCE_VALIDATION](APPLIANCE_VALIDATION.md) | Development-host unit/algorithm/packaging checks; no installed/booted Rocky guest acceptance. |
 | [HOST_READ_ONLY_PLANS](HOST_READ_ONLY_PLANS.md) | Post-v7 read-only protocol/API/admission source, full local Python checks and real Linux peer/plan round trip with synthetic storage; installation and all execution/guest gates remain open. |
 | [FIPS](FIPS.md), [COMPLIANCE](COMPLIANCE.md), [APPLIANCE research](research/APPLIANCE.md) | Required crypto/content boundaries and qualification obligations; no certification or completed guest baseline claim. |
@@ -87,7 +165,7 @@ Existing evidence references used below:
 | ID | Requested requirement | Current result | Evidence required and remaining work |
 | --- | --- | --- | --- |
 | I01 | Configurable UDP **514**, TCP **514**, TLS **6514**; IPv4 and IPv6 where practical | DEV: real socket tests; development UDP/TCP 5514 mapping. | Guest listeners on configured addresses/ports, firewall exposure, IPv4 and applicable IPv6 sender tests; PAN TLS certificate/hostname/trust/rotation checks. |
-| I02 | Asynchronous burst ingestion, buffering, batching, bounded queues, backpressure, disk-backed buffering, retries and graceful database outages | DEV: bounded fsynced WAL and outage/restart checks. | Long overload/outage/restart/power-failure tests in production split topology; verify durable IDs, recoverability, resource bounds and explicit refusal/drop accounting. |
+| I02 | Asynchronous burst ingestion, buffering, batching, bounded queues, backpressure, disk-backed buffering, retries and graceful database outages | PARTIAL: WAL and earlier outage checks exist; October 16 at-least-once retry preserved all 60,642 unique events with 429 identical replay copies after a total-memory failure. | Long overload/outage/restart/power-failure tests in production split topology; verify durable IDs, recoverability, resource bounds and explicit refusal/drop accounting. |
 | I03 | Never silently discard; expose Messages Received, Parsed, Parse Failures, Inserted, Queue Depth, Spool Usage, Dropped, Events/sec, Bytes/sec, Last Event Received | DEV only in combined role. | Reconcile generated/sent/accepted/stored IDs under all transports/failures; connect collector metrics to separate API, UI and Prometheus; document upstream UDP loss limits. |
 | I04 | Research current official PAN-OS Syslog Field Descriptions before parser changes; versioned per-family registry, no fixed global count/version/schema | DEV: registry/source record and extension-tolerant parsing. | Version/source/fixture audit per supported release and family; preserve unknown suffixes; current official reference checks for changes. |
 | I05 | Each record keeps ingestion/generated/receive timestamps, sender IP, serial, hostname, VSYS, log type/subtype, determinable PAN-OS schema/version, parser version/status and original raw | DEV: normalized fields, original CSV, time assumptions and real sample checks. | Verify complete fields against independent native captures; mixed-device timezone/version configuration; missing values must remain explicitly unknown, never guessed. |
@@ -252,12 +330,12 @@ Existing evidence references used below:
 
 | ID | Requested requirement | Current result | Evidence required and remaining work |
 | --- | --- | --- | --- |
-| B01 | Reference **265 average EPS**, ~**22.9M/day** with realistic sanitized PAN-OS; sustained workload and materially higher bursts | DEV: 60s at 265; 10s at 2,650, all sent IDs stored in those runs. | Longer representative sustained soak with explicit duration and all-family mix; resource/disk/queue/end-to-end ID accounting, graceful overload/outage and postburst drain. Short tests do not establish daily capacity. |
+| B01 | Reference **265 average EPS**, ~**22.9M/day** with realistic sanitized PAN-OS; sustained workload and materially higher bursts | PARTIAL: sustained all-family run stopped on total-server-memory exception 241; all 60,642 unique events preserved, with 429 permitted replay copies. No two-hour or burst pass. | Longer representative sustained soak with explicit duration and all-family mix; resource/disk/queue/end-to-end ID accounting, graceful overload/outage and postburst drain. Short tests do not establish daily capacity. |
 | B02 | Measure ingestion CPU/RAM/disk writes, CH compression/bytes per event/index overhead, query latency, retention, CSV, DNS and burst handling | PARTIAL: several measured components; complete production profile absent. | Unified benchmark report with measured metric definitions and sampling, resource/hardware limits, success/failure runs and no projected value called measured. |
-| B03 | Required **10M** and **100M** records; preferred **1B** | DEV 10M; OPEN 100M; OPTIONAL 1B. | Complete real 100M insertion/storage/query tests on adequate scratch hardware with realistic raw/field payload and cleanup receipts. Record 1B applicability and capacity if not run. |
+| B03 | Required **10M** and **100M** records; preferred **1B** | LOCAL 100M synthetic full-payload dataset and 33-pair query matrix completed; release acceptance OPEN. OPTIONAL 1B not run. | Preserve the interrupted-run/continuation and exact final dataset evidence; retain storage/cleanup evidence and qualify the release platform. Record 1B applicability and capacity if not run. |
 | B04 | Requested **30-day** and **90-day equivalent** workloads where practical | OPTIONAL/practical scope untested. | At 265 EPS, document 686,880,000 and 2,060,640,000 event equivalents; actual imported/generated counts/time distribution or explicit practical limitation. Do not relabel sparse timestamps as full equivalent volume. |
-| B05 | Query source IP, destination IP, CIDR, app, rule, action, firewall, port, source+destination, time range, denied Traffic | DEV 10M subset/report; complete release profile open. | Every named query, cold/warm methodology, selected columns/result size/cursors/concurrency and exact hardware/dataset; realistic selective and broad filters. |
-| B06 | Appropriate-hardware targets: recent common typically **<1s**; **24h <2s**; common **7-day filtered <5s** | DEV limited 10M query results; required 100M/production targets open. | Predeclare “typically” statistic and repetitions (e.g. median/p95) and evaluate all target windows on declared hardware; include failures and export limits. |
+| B05 | Query source IP, destination IP, CIDR, app, rule, action, firewall, port, source+destination, time range, denied Traffic | LOCAL 100M final profile: all 33 pairs and 660 samples completed across the retained run and continuation. Complete release profile OPEN. | Every named query, cold/warm methodology, selected columns/result size/cursors/concurrency and exact hardware/dataset; realistic selective and broad filters. |
+| B06 | Appropriate-hardware targets: recent common typically **<1s**; **24h <2s**; common **7-day filtered <5s** | LOCAL 100M: all 66 final-profile modes met median targets; production-platform and controlled cold/concurrent-load targets OPEN. | Predeclare “typically” statistic and repetitions (e.g. median/p95) and evaluate all target windows on declared hardware; include failures and export limits. |
 | B07 | Parser/framing/UDP/TCP/TLS/lexer/parser/AST/compiler/IPv4/IPv6/CIDR/DNS/retention/CSV unit tests | DEV existing suites. | Required source tests pass for exact candidate; inspect meaningful boundary/failure coverage, not just test counts or implementation-mirroring mocks. |
 | B08 | End-to-end firewall-like event → listener → parser → CH → API → query → UI | DEV combined stack/native PA. | Run exact released appliance split topology for supported categories/transports, filtered/exported raw parity, restart and auth/DB outage recovery. |
 | B09 | Auth tests local/MFA/AD environment/SAML-OIDC providers where practical | PARTIAL: real local/MFA; external matrix open. | Rows A03–A11 and L07 with recorded actual provider/server behavior, including rejection and recovery paths. |
@@ -301,7 +379,7 @@ The original checklist remains mandatory. “DEV” elsewhere does not check the
 | PAN filter parser; CIDR; nested Boolean; Add Filter; click filter; saved filters | Q01–Q09 | Development evidence; candidate workflow acceptance required |
 | Hostname resolution; CSV | D01–D02, E01–E02 | Development/partial; production acceptance open |
 | Retention/per-type; disk warnings; emergency policy | R01–R03, Z06–Z07 | Partial; emergency policy open |
-| 265 EPS sustained; higher bursts; 100M; query report | B01–B06 | Short dev evidence; sustained/100M open |
+| 265 EPS sustained; higher bursts; 100M; query report | B01–B06 | Local 100M/33-pair query matrix completed; sustained workload stopped on total-memory pressure; release acceptance open |
 | Automatic Rocky; kernel/reboot; Captain’s Log; CH; KC upgrades; signatures; postupdate security | L01–L12 | Open beyond lower-level verifier/engine tests |
 | Backup; restore | K01–K03 | Staged/algorithm implementation; live recovery open |
 | Documentation complete; firewall instructions validated | H01–H05, V01–V11 | Partial; final artifact/platform/provider procedures open |

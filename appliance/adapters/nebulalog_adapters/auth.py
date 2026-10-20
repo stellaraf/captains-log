@@ -10,6 +10,8 @@ from html.parser import HTMLParser
 from http.cookiejar import CookieJar
 from http.client import HTTPSConnection
 import json
+from pathlib import Path
+import re
 import secrets
 import socket
 import ssl
@@ -18,7 +20,8 @@ import time
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from urllib.request import build_opener, HTTPCookieProcessor, HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request
-from nebulalog_manager.common import Refused
+from nebulalog_manager.common import Refused, trusted_file
+from nebulalog_manager.host_payload import strict_json
 
 
 def origin(url):
@@ -43,6 +46,167 @@ class LocalHTTPSHandler(HTTPSHandler):
                     plain.close()
                     raise
         return self.do_open(LocalConnection, request, context=context)
+
+
+class IdentityHTTPFailure(Refused):
+    """A bounded HTTP outcome, with no response body or credentials in diagnostics."""
+
+    def __init__(self, status, oauth_error=None, *, json_object=False):
+        super().__init__(f"Local identity maintenance returned HTTP {status}")
+        self.status = status
+        self.oauth_error = oauth_error
+        self.json_object = json_object
+
+
+class NoIdentityRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise Refused("Identity maintenance redirects are forbidden")
+
+
+class MaintenanceIdentityAPI:
+    """Verified local Keycloak TLS while the external edge remains stopped.
+
+    The issuer supplies the certificate identity, not a network destination.
+    Connections always use the fixed Quadlet listener at 127.0.0.1:8443.
+    The caller must positively verify its operation-owned maintenance fence on
+    every request. This transport does not establish that fence, create recovery
+    accounts, change bootstrap credentials, or authorize maintenance release.
+    """
+
+    def __init__(self, config, fence):
+        issuer = config.get("issuer")
+        if not isinstance(issuer, str) or any(c.isspace() or ord(c) < 32 for c in issuer):
+            raise Refused("Identity maintenance requires the configured HTTPS issuer")
+        try:
+            parsed = urlsplit(issuer)
+            port = parsed.port
+        except ValueError as exc:
+            raise Refused("Invalid identity maintenance issuer") from exc
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
+                or parsed.password is not None or parsed.query or parsed.fragment
+                or parsed.path not in ("/realms/nebulalog", "/realms/nebulalog/")
+                or port == 0 or "%" in parsed.netloc or "\\" in issuer
+                or not callable(fence)):
+            raise Refused("Identity maintenance requires the configured HTTPS issuer and fence")
+        ca = config.get("ca_file")
+        if not isinstance(ca, str) or not Path(ca).is_absolute():
+            raise Refused("Identity maintenance requires an explicit appliance CA")
+        trusted_file(Path(ca))
+        context = ssl.create_default_context(cafile=ca)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        host = "[" + parsed.hostname + "]" if ":" in parsed.hostname else parsed.hostname
+        self.base = "https://" + host + ":8443"
+        self.issuer = issuer.rstrip("/")
+        self.fence = fence
+        self.opener = build_opener(ProxyHandler({}), LocalHTTPSHandler(context=context), NoIdentityRedirect())
+
+    @staticmethod
+    def _token(token):
+        if (not isinstance(token, str) or len(token) > 32768
+                or not re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", token)):
+            raise Refused("Invalid temporary identity token")
+
+    @staticmethod
+    def _credentials(name, secret):
+        if (not isinstance(name, str) or not re.fullmatch(r"cl-maint-[a-f0-9]{32}", name)
+                or not isinstance(secret, str) or not re.fullmatch(r"[a-f0-9]{64}", secret)):
+            raise Refused("Invalid temporary identity credentials")
+
+    def _request(self, path, method="GET", body=None, token=None, *, form=False):
+        if self.fence() is not True:
+            raise Refused("Local identity maintenance requires its owned fence")
+        headers = {"Accept": "application/json"}
+        if token is not None:
+            self._token(token)
+            headers["Authorization"] = "Bearer " + token
+        data = None
+        if body is not None:
+            data = (urlencode(body).encode() if form else
+                    json.dumps(body, allow_nan=False, separators=(",", ":")).encode())
+            if len(data) > 1024 * 1024:
+                raise Refused("Oversized identity maintenance request")
+            headers["Content-Type"] = "application/x-www-form-urlencoded" if form else "application/json"
+        request = Request(self.base + path, data=data, headers=headers, method=method)
+        try:
+            with self.opener.open(request, timeout=20) as response:
+                raw = response_bytes(response)
+                if not raw and (response.status == 204 or response.status == 201 and method == "POST"):
+                    return None
+                if (not 200 <= response.status < 300
+                        or response.headers.get_content_type() != "application/json"):
+                    raise Refused("Unexpected identity maintenance response")
+                return strict_json(raw)
+        except HTTPError as error:
+            # Never return a body to an error logger or classify a transport,
+            # certificate, HTML proxy response or malformed JSON as revocation.
+            with error:
+                raw = response_bytes(error)
+                denial = None
+                json_object = False
+                if error.headers.get_content_type() == "application/json":
+                    value = strict_json(raw)
+                    json_object = isinstance(value, dict)
+                    if isinstance(value, dict) and value.get("error") in ("invalid_client", "unauthorized_client"):
+                        denial = value["error"]
+                raise IdentityHTTPFailure(error.code, denial, json_object=json_object) from None
+
+    def call(self, token, path="", method="GET", body=None):
+        # Only the product realm. No encoded separators, dot segments, fragments,
+        # arbitrary query keys, remote URLs, or master-realm mutation through
+        # the scope/session helper callback.
+        if (not isinstance(path, str) or len(path) > 2048 or method not in ("GET", "PUT", "POST", "DELETE")
+                or not re.fullmatch(r"(?:[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*)?(?:\?clientId=[A-Za-z0-9_-]+)?", path)
+                or "?" in path and (method != "GET" or not path.startswith("clients?clientId="))):
+            raise Refused("Invalid product-realm maintenance request")
+        self._token(token)
+        return self._request("/admin/realms/nebulalog" + ("/" + path if path else ""), method, body, token)
+
+    def authenticate(self, name, secret):
+        self._credentials(name, secret)
+        result = self._request("/realms/master/protocol/openid-connect/token", "POST",
+                               {"grant_type": "client_credentials", "client_id": name, "client_secret": secret}, form=True)
+        if (not isinstance(result, dict) or not isinstance(result.get("token_type"), str)
+                or result["token_type"].lower() != "bearer"):
+            raise Refused("Temporary identity returned an invalid grant")
+        token = result.get("access_token")
+        self._token(token)
+        return token
+
+    def probe(self, token, installation_id, realm_id):
+        value = self.call(token)
+        return (isinstance(value, dict) and value.get("realm") == "nebulalog"
+                and value.get("id") == realm_id and isinstance(value.get("attributes"), dict)
+                and value["attributes"].get("nebulalog.installation-id") == installation_id)
+
+    def ready(self):
+        value = self._request("/realms/nebulalog/.well-known/openid-configuration")
+        if not isinstance(value, dict) or value.get("issuer") != self.issuer:
+            raise Refused("Local identity discovery belongs to another issuer")
+        return True
+
+    def delete(self, token, client_id):
+        if not isinstance(client_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", client_id):
+            raise Refused("Invalid bound temporary client identity")
+        self._token(token)
+        return self._request("/admin/realms/master/clients/" + client_id, "DELETE", token=token)
+
+    def credentials_refused(self, name, secret):
+        try:
+            self.authenticate(name, secret)
+        except IdentityHTTPFailure as error:
+            if error.status in (400, 401) and error.oauth_error in ("invalid_client", "unauthorized_client"):
+                return True
+            raise
+        return False
+
+    def token_refused(self, token):
+        try:
+            self.call(token)
+        except IdentityHTTPFailure as error:
+            if error.status == 401 and error.json_object:
+                return True
+            raise
+        return False
 
 
 def totp(secret, algorithm="SHA256", digits=6, period=30, now=None):

@@ -10,7 +10,11 @@ Obtain pinned Rocky Linux 9 x86_64 media from Rocky and independently verify the
 
 Build all four exact Linux/amd64 archives with [the offline bundle helper](IMAGE_BUNDLE.md). Final bundle and initial-release metadata must identify the same source snapshot and manifests. A private unsealed base may omit runtime images while candidates are qualified; never distribute it.
 
-From the repository root:
+Run the following phases from the repository root under a build supervisor
+that enforces [development storage and post-run cleanup](DEVELOPMENT.md).
+Allocate unique scratch/cache paths on the build volume, require at least
+150 GiB free before dispatch, and keep output disks, recovery links and logs
+outside those paths. These raw Packer commands do not provide that supervision:
 
 ```sh
 packer init appliance/packer/nebulalog.pkr.hcl
@@ -52,7 +56,7 @@ The wizard and guards are implemented and unit-tested. Complete behavior in the 
 | Platform | Packaging route | Current evidence |
 |---|---|---|
 | VMware vSphere | OVF/OVA import; paravirtual SCSI VMDK | Packager implementation; final import/boot/growth unverified |
-| Nutanix AHV | Supported image format through Image Service | Unverified; do not assume direct OVA support |
+| Nutanix AHV | QCOW2 through Image Service | [Private diagnostic import/boot verified](validation/AHV_KERNEL_20261020.md); kernel crypto gate failed. Final appliance deployment/growth and direct OVA import remain unqualified. |
 | Proxmox / KVM | QCOW2 import, preserving both disks | Recipe and limited installer-kernel probe; final deployment/growth unverified |
 | Hyper-V | Appropriate VHDX and supported generation | Unvalidated; not advertised as supported |
 

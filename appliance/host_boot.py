@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3.14
 """Fixed host boot ABI 1. Standard library only until generation verification.
 
 This file is outside updatable generations. Changing its ABI requires a separately
@@ -19,7 +19,8 @@ SHARE = Path("/usr/share/nebulalog")
 GENERATIONS = Path("/usr/lib/nebulalog/generations")
 STATE = Path("/var/lib/nebulalog/manager/updates")
 FIXED = {"appliance/host_boot.py": Path("/usr/libexec/nebulalog/host-boot"),
-         "appliance/factory_host.py": Path("/usr/libexec/nebulalog/factory-host")}
+         "appliance/factory_host.py": Path("/usr/libexec/nebulalog/factory-host"),
+         "appliance/factory_kernel.py": Path("/usr/libexec/nebulalog/factory-kernel")}
 SHA = re.compile(r"[a-f0-9]{64}")
 COMMANDS = {"nebulalog": ("cli", ()), "bootstrap-runtime": ("bootstrap", ()),
             "github-updates": ("github_updates", ()), "os-updates": ("os_updates", ()),
@@ -31,7 +32,8 @@ COMMANDS = {"nebulalog": ("cli", ()), "bootstrap-runtime": ("bootstrap", ()),
 STAGED = {"update-preflight", "update-backup", "update-prepare", "update-activate", "update-health",
           "update-rollback", "update-finalize"}
 ADAPTERS = STAGED | {"update-os-preflight", "update-os-postcheck", "update-os-recover", "update-reboot-prepare",
-                     "update-reboot-abort", "update-boot-gate", "update-reboot-complete"}
+                     "update-reboot-abort", "update-boot-gate", "update-reboot-complete",
+                     "update-kernel-retry", "update-kernel-rollback"}
 PHASES = {"preflight", "preflight_failed", "preparing", "activating", "checking", "committed",
           "rolling_back", "rolled_back", "recovery_required"}
 PROBES = {"verify-selected", "probe-selected"}
@@ -115,7 +117,7 @@ def factory():
     initial, source = decode(initial_raw), decode(source_raw)
     initial_fields = {"schema", "product", "sequence", "schema_revision", "source_commit", "source_dirty", "source_snapshot_sha256",
                       "bundle_manifest_sha256", "qualification_status", "publisher"}
-    if (not isinstance(initial, dict) or set(initial) != initial_fields or type(initial["schema"]) is not int or initial["schema"] != 1
+    if (not isinstance(initial, dict) or not initial_fields <= set(initial) or set(initial) - initial_fields - {"restore_auth", "private_qualification"} or type(initial["schema"]) is not int or initial["schema"] != 1
             or initial["product"] != "nebulalog" or initial["qualification_status"] != "pending"
             or not isinstance(initial["schema_revision"], str) or not re.fullmatch(r"[1-9][0-9]{0,8}", initial["schema_revision"])
             or not isinstance(initial["source_commit"], str) or not re.fullmatch(r"[a-f0-9]{40}", initial["source_commit"])
@@ -127,6 +129,25 @@ def factory():
             or source.get("schema") != 1 or not isinstance(source.get("files"), dict) or not 1 <= len(source["files"]) <= 10000
             or not isinstance(record["fixed_files"], dict) or set(record["fixed_files"]) != set(FIXED)):
         raise Refused("Factory dispatch provenance changed")
+    private_qualification = initial.get("private_qualification") is True
+    if "private_qualification" in initial and (not private_qualification or initial["schema_revision"] != "4" or "restore_auth" not in initial):
+        raise Refused("Private qualification descriptor is invalid")
+    if "restore_auth" in initial:
+        proof = initial["restore_auth"]
+        if (initial["schema_revision"] != "3" and not private_qualification or not isinstance(proof, dict)
+                or set(proof) != {"schema", "contract", "version", "artifacts"}
+                or type(proof["schema"]) is not int or proof["schema"] != 1 or proof["contract"] != "restored-jwt-issued-at-v1"
+                or not isinstance(proof["version"], str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9][A-Za-z0-9.-]{0,100})?", proof["version"])
+                or not isinstance(proof["artifacts"], dict) or set(proof["artifacts"]) != {"application-build.json", "restore-auth-behavior.json"}):
+            raise Refused("Factory restored authentication descriptor is invalid")
+        for name, expected in proof["artifacts"].items():
+            if (not isinstance(expected, dict) or set(expected) != {"bytes", "sha256"}
+                    or type(expected["bytes"]) is not int or not 0 < expected["bytes"] <= 8 * 1024**2
+                    or not digest(expected["sha256"])):
+                raise Refused("Factory restored authentication artifact identity is invalid")
+            raw = read(SHARE / "restore-auth" / name, 8 * 1024**2)
+            if len(raw) != expected["bytes"] or sha(raw) != expected["sha256"]:
+                raise Refused("Factory restored authentication evidence changed")
     paths, sources = set(), {}
     for item in record["catalog"]:
         if (not isinstance(item, dict) or set(item) != {"source", "path", "mode"}

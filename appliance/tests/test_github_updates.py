@@ -210,7 +210,7 @@ class PolicyTests(unittest.TestCase):
 
     def test_unknown_fields_and_wrong_types_or_cadence_refused(self):
         for fields in ({"schema": True}, {"poll_interval_seconds": 900.0}, {"poll_interval_seconds": 86400},
-                       {"automatic_updates": 1}, {"download_url": "https://evil.invalid"},
+                       {"automatic_updates": 1}, {"automatic_livepatch": 1}, {"download_url": "https://evil.invalid"},
                        {"repository": "stellaraf/captains-log.git"}, {"repository": "stellaraf/../private"},
                        {"repository": "https://github.com/stellaraf/captains-log"}):
             with self.subTest(fields=fields), self.assertRaises(Refused):
@@ -378,6 +378,20 @@ class PollTests(unittest.TestCase):
         self.assertEqual(len(self.transport_calls.requests), 3)
         self.assertEqual(self.calls, [])
 
+    def test_restored_target_polls_metadata_without_downloading_or_installing_components(self):
+        marker = self.manager.state.parent / "restore.json"
+        marker.write_text("retained restore evidence")
+        current = (self.manager.state / "current.json").read_bytes()
+        for _ in range(2):
+            result = self.poll()
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["reason"], "restored_appliance_compatibility_pending")
+            self.assertEqual(result["next_check_at"], "2026-09-09T20:15:00+00:00")
+            self.assertEqual(len(self.transport_calls.requests), 3)
+            self.assertEqual(self.calls, [])
+            self.assertEqual((self.manager.state / "current.json").read_bytes(), current)
+            self.assertEqual(list((self.manager.state / "downloads").iterdir()), [])
+
     def test_tag_conflict_or_invalid_tag_type_never_installs(self):
         for tag in ("v0.1.2", "v0.1.1-rc1", None, 123):
             with self.subTest(tag=tag):
@@ -402,7 +416,13 @@ class PollTests(unittest.TestCase):
             nonlocal once
             if Path(argv[0]).name == "update-health" and once:
                 once = False
-                return '{"ok":true,"checks":{"ingestion":false}}'
+                self.calls.append("update-health")
+                from nebulalog_manager.host_dispatch import HookJournal
+                journal = HookJournal(Path(argv[1]), self.manager.status()["transaction"])
+                ticket = journal.enter("update-health")
+                result = {"ok": True, "checks": {"ingestion": False}}
+                journal.finish(ticket, "success", result=result)
+                return json.dumps(result)
             return original(argv, **kwargs)
         self.manager.runner = runner
         self.assertEqual(self.poll()["status"], "blocked")
@@ -450,7 +470,14 @@ class PollTests(unittest.TestCase):
 
     def test_pending_recovery_or_os_reboot_does_not_download(self):
         for target, value in ((self.manager.state / "transaction.json", {"state": "committed", "finalization": "failed"}),
-                              (self.manager.state.parent / "os-transaction.json", {"state": "reboot_requested"})):
+                              (self.manager.state.parent / "os-transaction.json", {"state": "reboot_requested"}),
+                              (self.manager.state.parent / "os-transaction.json",
+                               {"state": "complete", "finalization": "complete", "storage_maintenance": "held"}),
+                              (self.manager.state.parent / "os-transaction.json",
+                               {"state": "complete", "finalization": "complete", "storage_maintenance": "release_pending"}),
+                              *((self.manager.state.parent / "os-transaction.json",
+                                 {"state": "complete", "finalization": "complete", field: "recovery_required"})
+                                for field in ("kernel_finalization", "kernel_retention", "kernel_rollback"))):
             atomic_json(target, value)
             self.assertEqual(self.poll()["reason"], "recovery_pending")
             self.assertEqual(len(self.transport_calls.requests), 1)
@@ -466,9 +493,18 @@ class PollTests(unittest.TestCase):
 
 
 class ScheduleTests(unittest.TestCase):
+    def test_livepatch_schedule_uses_versioned_cli_and_enrollment_gate(self):
+        timer = unit(APPLIANCE / 'systemd/nebulalog-livepatch.timer')
+        self.assertEqual(timer[('Timer', 'OnBootSec')], ['2min'])
+        self.assertEqual(timer[('Timer', 'OnCalendar')], ['*-*-* *:07/15:00'])
+        service = unit(APPLIANCE / 'systemd/nebulalog-livepatch.service')
+        self.assertEqual(service[('Service', 'ExecStart')], ['/usr/bin/python3.14 -I -B /usr/libexec/nebulalog/host-boot nebulalog update livepatch-poll'])
+        self.assertIn('/etc/nebulalog/configured', words(service, 'Unit', 'ConditionPathExists'))
+        self.assertIn('nebulalog-reboot-verify.service', words(service, 'Unit', 'After'))
+
     def test_installed_policy_and_timer_check_every_quarter_hour(self):
         policy = json.loads((APPLIANCE / "security/github-updates.json").read_text())
-        self.assertEqual(policy, {"schema": 1, "repository": "stellaraf/captains-log", "automatic_updates": True, "poll_interval_seconds": 900})
+        self.assertEqual(policy, {"schema": 1, "repository": "stellaraf/captains-log", "automatic_updates": True, "automatic_livepatch": False, "poll_interval_seconds": 900})
         timer = unit(APPLIANCE / "systemd/nebulalog-app-update.timer")
         self.assertEqual(timer[("Timer", "OnCalendar")], ["*-*-* *:00/15:00"])
         self.assertEqual(timer[("Timer", "Persistent")], ["true"])

@@ -24,7 +24,7 @@ class BindingTests(HostFixture):
                 self.save_transaction(state)
                 if state in allowed:
                     command = dispatch.hook_command(pin, hook, self.stage)
-                    self.assertEqual(command[:5], ["/usr/bin/python3", "-I", "-B", "-c", dispatch.DISPATCH_CODE])
+                    self.assertEqual(command[:5], ["/usr/bin/python3.14", "-I", "-B", "-c", dispatch.DISPATCH_CODE])
                     self.assertEqual(command[-3:], [str(self.generations / self.old["generation"]), hook, str(self.stage)])
                 else:
                     with self.subTest(hook=hook, state=state), self.assertRaises(Refused):

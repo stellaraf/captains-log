@@ -104,4 +104,42 @@ describe("opaque authentication session generation", () => {
     expect(listener).not.toHaveBeenCalled();
     expect(JSON.stringify(api.authSessionSnapshot())).not.toContain("private-");
   });
+
+  it.each(["session", "roles"])("does not dispatch a confirmed PUT when token refresh changes %s", async (change) => {
+    const api = await import("./api"); await api.initializeAuth();
+    const expectedSession = api.authSessionSnapshot();
+    vi.mocked(fetch).mockClear();
+    auth.instance.updateToken.mockImplementation(async () => {
+      if (change === "session") auth.instance.tokenParsed.sid = "another-session";
+      else auth.instance.tokenParsed.resource_access.nebulalog.roles = ["VIEWER"];
+      return true;
+    });
+    await expect(api.authenticatedFetch("/api/storage/emergency", {
+      method: "PUT", body: "{}", expectedSession,
+    })).rejects.toMatchObject({ status: 409 });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(auth.instance.login).not.toHaveBeenCalled();
+  });
+
+  it("rejects an already invalidated confirmation before refreshing a token", async () => {
+    const api = await import("./api"); await api.initializeAuth();
+    const expectedSession = api.authSessionSnapshot(); auth.instance.onAuthLogout();
+    vi.mocked(fetch).mockClear();
+    await expect(api.authenticatedFetch("/api/storage/emergency", {
+      method: "PUT", expectedSession,
+    })).rejects.toMatchObject({ status: 409 });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(auth.instance.updateToken).not.toHaveBeenCalled();
+  });
+
+  it("permits same-session token renewal without sending the local generation to the server", async () => {
+    const api = await import("./api"); await api.initializeAuth();
+    const expectedSession = api.authSessionSnapshot();
+    vi.mocked(fetch).mockClear();
+    auth.instance.updateToken.mockImplementation(async () => { auth.instance.token = "renewed"; auth.instance.tokenParsed.exp++; return true; });
+    await api.authenticatedFetch("/api/storage/emergency", { method: "PUT", body: "{}", expectedSession });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(fetch).mock.calls[0][1]).not.toHaveProperty("expectedSession");
+    expect(new Headers(vi.mocked(fetch).mock.calls[0][1]?.headers).get("Authorization")).toBe("Bearer renewed");
+  });
 });

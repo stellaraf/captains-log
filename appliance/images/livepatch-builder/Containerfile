@@ -1,0 +1,26 @@
+# Build toolchain only. This image is never included in the customer appliance.
+FROM docker.io/rockylinux/rockylinux:9.8@sha256:ed654c694190a670bb5c33f68995b862214fc96ffbdca95e07a8935ba0a3717d
+RUN test "$(uname -m)" = x86_64 \
+ && dnf -y --setopt=install_weak_deps=False install \
+      git gcc gcc-c++ make elfutils elfutils-devel rpm-build rpm-sign \
+      dnf-plugins-core kmod patch patchutils diffutils findutils gawk \
+      bison flex openssl openssl-devel python3 perl bc cpio xz zstd \
+      dwarves pesign ncurses-devel rsync wget \
+ && dnf clean all
+RUN git init /opt/kpatch \
+ && git -C /opt/kpatch remote add origin https://github.com/dynup/kpatch.git \
+ && git -C /opt/kpatch fetch --depth 1 origin 74ac9ffe96df2704eb6f141bc7e680a7f449503e \
+ && git -C /opt/kpatch checkout --detach FETCH_HEAD \
+ && test "$(git -C /opt/kpatch rev-parse HEAD)" = 74ac9ffe96df2704eb6f141bc7e680a7f449503e \
+ && make -C /opt/kpatch -j2 \
+ && make -C /opt/kpatch install \
+ && kpatch-build --version \
+ && mkdir -p /usr/share/captains-log-build \
+ && rpm -qa --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort > /usr/share/captains-log-build/toolchain-rpms.txt
+LABEL io.captainslog.purpose="kernel-livepatch-build-only" \
+      io.captainslog.kpatch-commit="74ac9ffe96df2704eb6f141bc7e680a7f449503e"
+WORKDIR /build
+# Mounted build storage owns every mutable build/cache path. No kernel modules
+# are loaded by this image; native guest qualification is a separate step.
+ENV CACHEDIR=/build/cache/kpatch XDG_CACHE_HOME=/build/cache
+ENTRYPOINT ["python3"]

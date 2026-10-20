@@ -19,7 +19,7 @@ class NetworkSealingTests(unittest.TestCase):
                      "run/NetworkManager/system-connections", "var/lib/NetworkManager", "var/lib/dhclient"):
             (self.root / name).mkdir(parents=True, mode=0o755)
         self.profile = self.root / "etc/NetworkManager/system-connections/build.nmconnection"
-        self.profile.write_text("address1=198.51.100.95/24,198.51.100.1\ndns=198.51.100.11;\nmac-address=00:50:56:00:00:01\n")
+        self.profile.write_text("address1=10.4.6.95/24,10.4.6.1\ndns=10.4.6.11;\nmac-address=00:50:56:00:00:01\n")
         self.profile.chmod(0o600)
         for name in ("etc/hostname", "etc/hosts", "etc/resolv.conf", "etc/sysconfig/network",
                      "etc/sysconfig/network-scripts/ifcfg-ens192", "etc/sysconfig/network-scripts/route-ens192",
@@ -43,18 +43,18 @@ class NetworkSealingTests(unittest.TestCase):
         self.assertEqual((self.root / "etc/hostname").read_text(), "captains-log\n")
         self.assertEqual(self.loopback.read_text(), "DEVICE=lo\n")
         all_content = b"".join(p.read_bytes() for p in self.root.rglob("*") if p.is_file())
-        for absent in (b"198.51.100.95", b"198.51.100.1", b"198.51.100.11", b"00:50:56", b"private-build", b"interface-name="):
+        for absent in (b"10.4.6.95", b"10.4.6.1", b"10.4.6.11", b"00:50:56", b"private-build", b"interface-name="):
             self.assertNotIn(absent, all_content)
 
     def test_resolver_link_replaced_without_following_target(self):
         target = self.root / "run/NetworkManager/resolv.conf"
-        target.write_text("nameserver 198.51.100.11\n")
+        target.write_text("nameserver 10.4.6.11\n")
         resolver = self.root / "etc/resolv.conf"
         resolver.unlink()
         resolver.symlink_to("../run/NetworkManager/resolv.conf")
         self.apply()
         self.assertFalse(resolver.is_symlink())
-        self.assertEqual(target.read_text(), "nameserver 198.51.100.11\n")
+        self.assertEqual(target.read_text(), "nameserver 10.4.6.11\n")
 
     def test_unknown_symlink_preserves_all_profile_state(self):
         foreign = self.root / "foreign"
@@ -92,8 +92,8 @@ class NetworkSealingTests(unittest.TestCase):
         sealer = Path(__file__).resolve().parents[1] / "bin/nebulalog-seal"
         text = sealer.read_text()
         self.assertLess(text.index("systemctl stop sshd"), text.index("systemctl stop NetworkManager.service"))
-        self.assertLess(text.index("systemctl stop NetworkManager.service"), text.index("python3 -m nebulalog_manager.image_seal_network"))
-        self.assertLess(text.index("python3 -m nebulalog_manager.image_seal_network"), text.index("dracut --force --no-hostonly"))
+        self.assertLess(text.index("systemctl stop NetworkManager.service"), text.index("python3.14 -m nebulalog_manager.image_seal_network"))
+        self.assertLess(text.index("python3.14 -m nebulalog_manager.image_seal_network"), text.index("dracut --force --no-hostonly"))
         self.assertNotIn("disable NetworkManager", text)
         self.assertNotIn("mask NetworkManager", text)
         self.assertEqual(subprocess.run(["/bin/bash", "-n", str(sealer)], capture_output=True).returncode, 0)

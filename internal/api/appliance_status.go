@@ -314,7 +314,7 @@ func validHostObservation(value applianceStatus, now time.Time) bool {
 			!slices.Contains([]string{"none", "pending", "failed", "complete"}, updates.Finalization) ||
 			!slices.Contains([]string{"none", "pending", "failed", "complete"}, updates.OSFinalization) ||
 			!slices.Contains([]string{"enabled", "disabled", "masked", "static", "unavailable"}, updates.OSTimerStatus) ||
-			!slices.Contains([]string{"", "nebulalog update finalize", "nebulalog update reboot-complete", "nebulalog update os-recover", "nebulalog update recover"}, updates.RecoveryAction) {
+			!slices.Contains([]string{"", "nebulalog update finalize", "nebulalog update reboot-complete", "nebulalog update os-recover", "nebulalog update recover", "nebulalog update kernel-retry", "nebulalog update kernel-rollback"}, updates.RecoveryAction) {
 			return false
 		}
 		if refusal := updates.HostRefusal; refusal != nil {

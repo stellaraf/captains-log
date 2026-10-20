@@ -1,0 +1,9 @@
+[Unit]
+Description=Check Captain's Log kernel live patches after boot and every 15 minutes
+[Timer]
+OnBootSec=2min
+OnCalendar=*-*-* *:07/15:00
+Persistent=true
+AccuracySec=1s
+[Install]
+WantedBy=timers.target

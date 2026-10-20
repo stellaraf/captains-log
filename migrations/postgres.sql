@@ -29,3 +29,29 @@ CREATE TABLE IF NOT EXISTS user_preferences (
  rail_collapsed boolean NOT NULL DEFAULT false,
  updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- Emergency retention is separate from expiry assigned to future arrivals.
+INSERT INTO settings(key,value) VALUES('storage_emergency','{"revision":1,"enabled":true,"trigger_percent":95,"recover_percent":90,"minimum_days":{"traffic":1,"url":7,"threat":30,"wildfire":30,"dns":30,"data":30,"hip":30,"globalprotect":30,"iptag":30,"userid":30,"decryption":30,"tunnel":30,"configuration":30,"system":30,"authentication":30}}') ON CONFLICT DO NOTHING;
+INSERT INTO settings(key,value) VALUES('storage_emergency_maintenance','{"schema":1,"held":false,"delivery_held":false,"operation":null}') ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS storage_emergency_state (
+ singleton boolean PRIMARY KEY CHECK(singleton), value jsonb NOT NULL
+);
+INSERT INTO storage_emergency_state(singleton,value) VALUES(true,'{"state":"not_observed","observed_at":null,"message":"Waiting for the first verified ClickHouse disk observation","emergency_active":false,"insert_exclusions":0}') ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS storage_emergency_actions (
+ id uuid PRIMARY KEY, state text NOT NULL CHECK(state IN ('prepared','executing','uncertain','awaiting_cleanup','completed','cancelled')),
+ plan jsonb NOT NULL, message text NOT NULL DEFAULT '', created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), completed_at timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS storage_emergency_one_pending ON storage_emergency_actions((true)) WHERE completed_at IS NULL;
+CREATE TABLE IF NOT EXISTS storage_emergency_inserts (
+ id uuid PRIMARY KEY, table_uuid uuid NOT NULL, partitions jsonb NOT NULL, query_id uuid NOT NULL UNIQUE, created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- The engine remains unavailable until the explicit migration verifies the
+-- events table identity and absence of legacy TTL. No event rows are rewritten.
+INSERT INTO settings(key,value) VALUES('retention_engine','{"schema":1,"mode":"uninitialized"}') ON CONFLICT DO NOTHING;
+INSERT INTO settings(key,value) VALUES('retention_status','{"state":"not_observed","message":"Waiting for retention engine verification"}') ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS retention_actions (
+ id uuid PRIMARY KEY, state text NOT NULL CHECK(state IN ('prepared','executing','uncertain','awaiting_cleanup','completed','cancelled')),
+ plan jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), completed_at timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS retention_one_pending ON retention_actions((true)) WHERE completed_at IS NULL;

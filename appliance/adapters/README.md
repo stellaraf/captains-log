@@ -29,6 +29,14 @@ database passwords. PostgreSQL is addressed over its container Unix socket as
 uid999/role `postgres`; the two databases are `nebulalog` and `keycloak`. ClickHouse
 uid101 reads `/etc/nebulalog/clickhouse-client.xml` inside its container.
 
+The fixed additive application migration uses a separately identified Podman
+client supervised by systemd. It shares the PostgreSQL container's network,
+authenticates over loopback SCRAM using the existing `nebulalog-pg-password`
+secret mounted uid999/mode0400, and uses the exact image ID resolved from the
+protected PostgreSQL Quadlet. The password is read inside that client and never
+appears in host arguments or receipts. Native execution of this path is still
+under qualification.
+
 ## Runtime configuration
 
 First boot writes `/var/lib/nebulalog/configuration/lifecycle.json` as root0600.
@@ -39,7 +47,7 @@ an image, source repository, unencrypted `/etc`, command line or status receipt.
 ```json
 {
   "schema": 1,
-  "schema_revision": "1",
+  "schema_revision": "2",
   "api_url": "http://127.0.0.1:8080",
   "issuer": "https://logs.example.test/realms/nebulalog",
   "ca_file": "/var/lib/nebulalog/configuration/tls/ca.crt",
@@ -83,16 +91,28 @@ All seven component hooks accept exactly one argument: a direct child of
 `/var/lib/nebulalog/manager/updates/releases`. The staged manifest hash must match
 the durable verified transaction. Success writes a root0600 JSON receipt in that
 directory and emits JSON with `ok:true`; failure returns nonzero with a sanitized
-error type. Inspect protected receipts for details.
+error type. Inspect protected receipts for details. New component invocations
+require protocol-1 dispatch evidence. The CLI enters exactly one unresolved hook
+once, records native command acknowledgement, then publishes a terminal receipt
+outside the method's cleanup paths. Direct preflight/backup/recovery/finalize
+methods also reject unresolved prior work. Unknown hook or native outcomes remain
+held even after client exit; a process lock is supplementary only. The exact
+PostgreSQL readiness SELECT 1 may acknowledge a normally returned nonzero probe,
+and fixed OpenSCAP eval exit 2 requires exact retained inputs and completed
+profile/report evidence. Findings still require the existing health review;
+signals, timeouts, malformed reports and mutation failures remain held. Direct
+host AIDE operations require a durable compound dispatch and full authorized
+success. See the component lifetime
+contract in [UPDATES.md](../../docs/UPDATES.md).
 
 | Hook | Required effect and evidence |
 | --- | --- |
 | `update-preflight` | Verify encrypted paths, immutable previous pins, host controls, running services, real local MFA, supported versions and reserve. |
-| `update-backup` | Publish maintenance; stop API/Keycloak writers; dump and validate both PostgreSQL databases; preserve canonical config permissions/ownership and original Quadlets; hash the inventory. Ingest remains running. On failure restore writers or retain maintenance with an explicit failed recovery receipt. |
+| `update-backup` | Publish host/database storage holds; stop API/Keycloak writers; dump and validate both PostgreSQL databases; preserve schema provenance, config permissions/ownership and original Quadlets; hash the inventory. Keep ingest receiving into WAL only if its running image is bound to the gate-aware release; otherwise stop it. On failure restore writers or retain maintenance with an explicit failed recovery receipt. |
 | `update-prepare` | Import signed OCI archives with `skopeo copy --preserve-digests`; require exact inspected RepoDigest; stage only changed `Image=` lines. |
-| `update-activate` | Stop known services gracefully, sync encrypted data, atomically replace prepared Quadlets, reload/start and retain maintenance. |
+| `update-activate` | Stop known writers, verify the live schema, sync encrypted data and replace prepared Quadlets. Run only the reviewed schema transition if declared and required; verify its committed receipt before starting candidate writers. Resume delivery for health checks while destructive cleanup remains held. |
 | `update-health` | Require API, HTTPS UI, PostgreSQL, ClickHouse, fresh local password+OTP, Keycloak, FIPS signals, SELinux, LUKS, firewall and policy SCAP checks; send a unique TCP514 canary and prove it persisted in ClickHouse. |
-| `update-rollback` | Failed activation: validate backups, restore original configuration/pins and both PostgreSQL databases after bounded readiness. Later operator rollback of a committed same-schema release: restore changed image pins only, preserving subsequent users, metadata and config. ClickHouse log data and WAL are never rewound from a metadata backup. |
+| `update-rollback` | Before activation: require a durable preactivation journal, original unchanged-runtime backup intent and a settled storage barrier; restart old services without restoring partial dumps. Failed activation: fence the retained migration executor, validate backups and record restore intent before restoring configuration/pins and both PostgreSQL databases. Reconcile actual schema provenance before publishing restore completion and resuming writers. A completed restore cannot replay. Later operator rollback preserves the current additive schema, users, metadata and config while restoring changed image pins. ClickHouse log data and WAL are never rewound from a metadata backup. |
 | `update-finalize` | Require durable `committed`/`rolled_back` and complete health receipt, then release maintenance. |
 
 The shared manager transaction lock serializes storage, OS and component work;
@@ -104,14 +124,20 @@ updates. Retained metadata must still pass signature and exact transaction hash
 checks. Its installation expiry may have elapsed for this access-recovery action;
 expiry still blocks new installs and operator rollback activation.
 
-Supported automatic changes are explicitly reversible, same-schema OCI releases
-with `database_migration:"none"` and the installed `schema_revision`. PostgreSQL
-must stay within its major version; ClickHouse must stay within its declared
-major/minor family. Baseline/SCAP artifacts and schema/major database migrations
-require separate qualified adapters and are refused here. Bounded database dump
-and restore commands allow 600 seconds per database; archive validation allows
-120 seconds, service operations 180 seconds, and each health SCAP command at most
-900 seconds. An outer hook timeout remains a failure requiring journal recovery.
+Supported changes include explicitly reversible, same-schema OCI releases with
+`database_migration:"none"` and the installed `schema_revision`. Development source
+also implements the fixed schema-1-to-2 transition described in
+[UPDATES.md](../../docs/UPDATES.md#transaction-mechanism-and-current-gate); its
+combined native installation and recovery qualification remains incomplete.
+PostgreSQL must stay within its major version; ClickHouse must stay within its
+declared major/minor family. Other schema changes, database major upgrades and
+baseline/SCAP content changes are refused. Bounded database dump and restore
+commands allow 600 seconds per database; archive validation allows 120 seconds,
+service operations 180 seconds, and each health SCAP command at most 900 seconds.
+An outer hook timeout or missing native completion acknowledgement retains the
+operation hold. Recovery cannot proceed until the exact hook and every delegated
+native operation have durable terminal evidence; elapsed time or an available
+process lock does not settle an unknown outcome.
 
 ## External identity release evidence
 

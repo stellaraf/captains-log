@@ -24,7 +24,7 @@ The verifier runs the actual local image without network access, credentials, wr
 
 | Input | Pinned input |
 |---|---|
-| Go builder | Go 1.27.1, amd64 manifest `6860a573025fcd35aba4f1b23e858b1c1dcd425d53fa73562e169a6ab1c2339a` |
+| Go builder | Go 1.27.2, amd64 manifest `55395706e9703db746cc507abfc4eb2aea75918f8a8024e4848e2cb81004f5ad` |
 | Go cryptographic module | `GOFIPS140=v1.0.0`, build reports `v1.0.0-c2097c7c` |
 | Web builder | Node 24 bookworm-slim, amd64 manifest `6642ef280aebc09c4541bee0b15c9f89f0f3f3c247ddee79ae1d37eddfdcbbaa` |
 | Runtime | RESF Rocky Linux 9.8, amd64 manifest `ed654c694190a670bb5c33f68995b862214fc96ffbdca95e07a8935ba0a3717d` |
@@ -37,7 +37,7 @@ The runtime binary is built with `CGO_ENABLED=0`, so its TLS and application cry
 
 Go identifies frozen module v1.0.0 with CMVP certificate 5247. The exact binary, operating environment, algorithms used, entropy path and surrounding application must still be assessed against the module security policy. This image does not assert whole-product certification. [Go FIPS documentation](https://go.dev/doc/security/fips140).
 
-Go 1.27.1 is selected under the current two-major-release support policy; the previous Go 1.25 builder is outside that window. Base digests are immutable inputs, not an automatic update mechanism. Review and rebuild supported inputs through the signed appliance release process. [Go release history and support policy](https://go.dev/doc/devel/release).
+Go 1.27.2 is selected under the current two-major-release support policy; the previous Go 1.25 builder is outside that window. Base digests are immutable inputs, not an automatic update mechanism. Review and rebuild supported inputs through the signed appliance release process. [Go release history and support policy](https://go.dev/doc/devel/release).
 
 ## Remaining release evidence
 

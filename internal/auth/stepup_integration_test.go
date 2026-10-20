@@ -119,7 +119,7 @@ func TestStepUpTLSPostgresIntegration(t *testing.T) {
 	defer client.client.CloseIdleConnections()
 	now := time.Now().UTC()
 	policy := AssurancePolicy{Reviewed: true, ReviewID: "synthetic-test-only", ReviewExpiresAt: now.Add(time.Hour), Issuer: issuer, Audience: HostControlClient, ClientID: HostControlClient, TokenType: "Bearer", AcceptedACR: []string{HostControlACR}, MaxAuthenticationAge: 120 * time.Second, MaxTokenAge: 120 * time.Second, MaxTokenLifetime: 120 * time.Second}
-	coordinator, err := NewStepUp(StepUpConfig{Policy: policy, ApplicationClientID: "nebulalog", RedirectURI: "https://appliance.example.test/api/host/step-up/callback"}, NewPostgresStepUpStore(pool), client)
+	coordinator, err := NewStepUp(StepUpConfig{Policy: policy, PolicyGenerationSHA: strings.Repeat("c", 64), ApplicationClientID: "nebulalog", RedirectURI: "https://appliance.example.test/api/host/step-up/callback"}, NewPostgresStepUpStore(pool), client)
 	if err != nil {
 		t.Fatal("coordinator constructor failed")
 	}
@@ -136,6 +136,7 @@ func TestStepUpTLSPostgresIntegration(t *testing.T) {
 		t.Fatal("signed original administrator middleware failed")
 	}
 	binding := StepUpBinding{InstallationID: "11111111-2222-3333-4444-555555555555", PlanID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", Operation: "storage.grow", PlanDigest: strings.Repeat("a", 64), ResourceRevision: strings.Repeat("b", 64), ExpiresAt: now.Add(3 * time.Minute)}
+	binding.Challenge = syntheticStepUpChallenge(binding, issuer, "nebulalog", "synthetic-admin", "original-app-session", now)
 	start, err := coordinator.Begin(originalContext, binding)
 	if err != nil || start.AuthorizationURL == "" {
 		t.Fatal("real PAR and PostgreSQL begin failed")
@@ -144,7 +145,7 @@ func TestStepUpTLSPostgresIntegration(t *testing.T) {
 	state := pushed.Get("state")
 	mu.Unlock()
 	evidence, err := coordinator.Complete(originalContext, state, "synthetic-code", binding)
-	if err != nil || evidence.session.sid != "new-mfa-session" || evidence.original.SessionDigest != digestStepUp("original-app-session") {
+	if err != nil || evidence.session.sid != "new-mfa-session" || evidence.original.SessionDigest != binding.Challenge.SessionDigest || evidence.idToken == "" || evidence.accessToken == "" {
 		t.Fatal("real TLS/JWKS/PostgreSQL completion failed")
 	}
 	if _, err := coordinator.Complete(originalContext, state, "synthetic-code", binding); !errors.Is(err, ErrStepUpTransaction) {
@@ -154,7 +155,7 @@ func TestStepUpTLSPostgresIntegration(t *testing.T) {
 		t.Fatal("unexpected exchange or JWK request count")
 	}
 	var remaining int
-	if pool.QueryRow(context.Background(), "SELECT count(*) FROM host_stepup_pending").Scan(&remaining) != nil || remaining != 0 {
+	if pool.QueryRow(context.Background(), "SELECT count(*) FROM host_stepup_pending_v2").Scan(&remaining) != nil || remaining != 0 {
 		t.Fatal("consumed transaction persisted")
 	}
 }

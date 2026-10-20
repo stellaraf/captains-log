@@ -3,6 +3,8 @@ package api
 import (
 	"crypto/rand"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"github.com/jackc/pgx/v5"
 	"github.com/stellaraf/captains-log/internal/auth"
 	"github.com/stellaraf/captains-log/internal/query"
@@ -268,9 +270,24 @@ func (s *Server) layout(w http.ResponseWriter, r *http.Request) {
 	}
 	respond(w, 200, l)
 }
+
+type retentionUpdate struct {
+	ExpectedRevision int64          `json:"expected_revision"`
+	GlobalDays       int            `json:"global_days"`
+	PerType          map[string]int `json:"per_type"`
+	ApplyExisting    bool           `json:"apply_existing"`
+}
+
+func (v retentionUpdate) policy() (store.Retention, error) {
+	if !v.ApplyExisting || v.ExpectedRevision < 1 {
+		return store.Retention{}, fmt.Errorf("Confirm application to existing retained events and supply expected_revision")
+	}
+	return store.CanonicalRetention(store.Retention{Revision: v.ExpectedRevision, GlobalDays: v.GlobalDays, PerType: v.PerType})
+}
+
 func (s *Server) retention(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
-		v, e := s.Store.Retention(r.Context())
+		v, e := s.Store.RetentionView(r.Context())
 		if e != nil {
 			databaseError(w, e)
 			return
@@ -278,37 +295,23 @@ func (s *Server) retention(w http.ResponseWriter, r *http.Request) {
 		respond(w, 200, v)
 		return
 	}
-	var v store.Retention
+	var v retentionUpdate
 	if !decode(w, r, &v) {
 		return
 	}
-	if v.GlobalDays < 1 || v.GlobalDays > 3650 {
-		problem(w, 400, "Retention must be 1–3650 days")
-		return
-	}
-	for kind, days := range v.PerType {
-		if !categories[kind] || kind == "unified" || kind == "parsing" || days < 1 || days > 3650 {
-			problem(w, 400, "Invalid per-category retention policy")
-			return
-		}
-	}
-	b, _ := json.Marshal(v)
-	tx, e := s.Store.PG.Begin(r.Context())
+	policy, e := v.policy()
 	if e != nil {
-		databaseError(w, e)
+		problem(w, 400, e.Error())
 		return
 	}
-	defer tx.Rollback(r.Context())
-	_, e = tx.Exec(r.Context(), "UPDATE settings SET value=$1 WHERE key='retention'", b)
-	if e == nil {
-		_, e = tx.Exec(r.Context(), "INSERT INTO audit_events(actor,action,target,detail) VALUES($1,'retention.update','future-arrivals',$2)", auth.Current(r.Context()).ID, b)
-	}
-	if e == nil {
-		e = tx.Commit(r.Context())
+	policy, e = s.Store.UpdateRetention(r.Context(), auth.Current(r.Context()).ID, v.ExpectedRevision, policy)
+	if errors.Is(e, store.ErrRetentionRevision) || errors.Is(e, store.ErrRetentionHeld) {
+		problem(w, 409, e.Error())
+		return
 	}
 	if e != nil {
 		databaseError(w, e)
 		return
 	}
-	respond(w, 200, v)
+	respond(w, 200, policy)
 }

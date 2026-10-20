@@ -27,12 +27,17 @@ def main():
     info = json.loads(checked(["docker", "image", "inspect", args.image]))[0]
     assert info["Architecture"] == "amd64"
     assert info["Config"]["User"] == "999:999"
+    assert info["Config"]["Entrypoint"] == ["/usr/bin/python3.14", "/opt/nebulalog/entrypoint.py"]
     prefix = ["docker", "run", "--rm", "--platform", "linux/amd64", "--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges"]
     version = checked(prefix + [args.image, "--version"])
     assert version == "postgres (PostgreSQL) 17.11"
-    script = r'''import json, pathlib, subprocess
+    script = r'''import json, pathlib, subprocess, sys, ssl, _ssl
 def command(*args): return subprocess.check_output(args, text=True).strip()
 print(json.dumps({
+"input_bom": json.loads(pathlib.Path("/opt/nebulalog/BOM.json").read_text()),
+"python": {"executable": sys.executable, "version": list(sys.version_info[:3]),
+           "packages": command("rpm", "-q", "python3.14", "python3.14-libs"),
+           "openssl": ssl.OPENSSL_VERSION, "ssl_libraries": command("ldd", _ssl.__file__)},
 "tools": {name: command(name, "--version") for name in ("psql", "pg_dump", "pg_restore", "initdb", "pg_isready")},
 "packages": command("rpm", "-q", "postgresql17", "postgresql17-libs", "postgresql17-server", "openssl", "openssl-libs", "openssl-fips-provider"),
 "openssl": command("openssl", "version"),
@@ -47,15 +52,26 @@ print(json.dumps({
 "crypto_files": command("sha256sum", "/usr/lib64/libcrypto.so.3", "/usr/lib64/libssl.so.3", "/usr/lib64/ossl-modules/fips.so"),
 "rpm_bom": pathlib.Path("/opt/nebulalog/rpm-bom.tsv").read_text()
 }, sort_keys=True))'''
-    observed = json.loads(checked(prefix + ["--entrypoint", "/usr/bin/python3", args.image, "-c", script]))
+    observed = json.loads(checked(prefix + ["--entrypoint", "/usr/bin/python3.14", args.image, "-c", script]))
+    expected_bom = json.loads((Path(__file__).parent / "BOM.json").read_text())
+    assert observed["input_bom"] == expected_bom
+    assert observed["python"]["executable"] == expected_bom["python_executable"]
+    assert observed["python"]["version"] == [3, 14, 8]
+    assert observed["python"]["packages"].splitlines() == [
+        "python3.14-" + expected_bom["python_version"] + ".x86_64",
+        "python3.14-libs-" + expected_bom["python_version"] + ".x86_64"]
     assert all("17.11" in value for value in observed["tools"].values())
     assert observed["system_policy"] == "FIPS" and observed["data_empty"] and observed["machine_id_empty"]
     assert observed["socket_mode"] == "0o700"
-    assert len(observed["signatures"]) == 20 and all(line.endswith("digests signatures OK") for line in observed["signatures"])
-    for key in ("postgres_libraries", "libpq_libraries"):
-        assert "not found" not in observed[key]
+    expected_names = {item["name"] for item in expected_bom["rpms"]}
+    assert len(observed["signatures"]) == len(expected_names)
+    assert {line.partition(":")[0].rsplit("/", 1)[-1] for line in observed["signatures"]} == expected_names
+    assert all(line.endswith("digests signatures OK") for line in observed["signatures"])
+    for linked in (observed["postgres_libraries"], observed["libpq_libraries"],
+                   observed["python"]["ssl_libraries"]):
+        assert "not found" not in linked
         for library in ("libcrypto.so.3", "libssl.so.3"):
-            assert library + " => /lib64/" + library in observed[key]
+            assert library + " => /lib64/" + library in linked
     refusal = "not_run_on_fips_host"
     if observed["host_kernel_fips"] != "1":
         created = checked(["docker", "create", "--platform", "linux/amd64", "--network", "none", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", args.image])

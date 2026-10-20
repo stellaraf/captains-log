@@ -1,0 +1,145 @@
+{
+  "schema": 1,
+  "datastream": "/usr/share/xml/scap/ssg/content/ssg-rl9-ds.xml",
+  "sha256": "769e4de0ee8ee67334745f97088043591d97694f3f494d07d9d0fa44fed02a51",
+  "content_revision": "scap-security-guide-0.1.82-2.el9_8.rocky.1.1",
+  "source_url": "https://dl.rockylinux.org/pub/rocky/9/AppStream/x86_64/os/Packages/s/scap-security-guide-0.1.82-2.el9_8.rocky.1.1.noarch.rpm",
+  "platform_basis": "Vendor Rocky 9 datastream declares native cpe:/o:rocky:rocky:9. Native assessment and deployment-specific applicability remain required.",
+  "license_basis": "ComplianceAsCode content distributed under BSD-3-Clause; installed package retains license. No separately licensed CIS build kit is redistributed.",
+  "profiles": {
+    "cis-level2": {
+      "kind": "cis",
+      "base_profile_id": "xccdf_org.ssgproject.content_profile_cis",
+      "profile_id": "xccdf_com.captainslog_profile_cis_appliance",
+      "tailoring_file": "baseline-cis.xml",
+      "tailoring_sha256": "91a83ff0f25df5e43cfa6bf54612503f0dcbd918fc0a49dc1b4e2c650129e161",
+      "tailoring_decisions": [
+        {
+          "rule_id": "xccdf_org.ssgproject.content_rule_aide_build_database",
+          "selected": false,
+          "rationale": "Distribution AIDE remediation would bypass installation-bound enrollment or change its protected configuration.",
+          "effective_control": "Use the appliance AIDE policy, encrypted database, explicit enrollment, scheduled checks and retained integrity evidence; independently review benchmark coverage."
+        },
+        {
+          "rule_id": "xccdf_org.ssgproject.content_rule_aide_check_audit_tools",
+          "selected": false,
+          "rationale": "Distribution AIDE remediation would bypass installation-bound enrollment or change its protected configuration.",
+          "effective_control": "Use the appliance AIDE policy, encrypted database, explicit enrollment, scheduled checks and retained integrity evidence; independently review benchmark coverage."
+        },
+        {
+          "rule_id": "xccdf_org.ssgproject.content_rule_aide_periodic_cron_checking",
+          "selected": false,
+          "rationale": "Distribution AIDE remediation would bypass installation-bound enrollment or change its protected configuration.",
+          "effective_control": "Use the appliance AIDE policy, encrypted database, explicit enrollment, scheduled checks and retained integrity evidence; independently review benchmark coverage."
+        },
+        {
+          "rule_id": "xccdf_org.ssgproject.content_rule_configure_custom_crypto_policy_cis",
+          "selected": false,
+          "rationale": "This remediation switches the system from FIPS to a DEFAULT-based crypto policy.",
+          "effective_control": "Retain vendor FIPS policy and independently verify kernel FIPS, providers, algorithms and service TLS."
+        },
+        {
+          "rule_id": "xccdf_org.ssgproject.content_rule_package_httpd_removed",
+          "selected": false,
+          "rationale": "The appliance requires httpd for its HTTPS management endpoint.",
+          "effective_control": "Dedicated HTTPS-only service configuration, SELinux enforcement and firewall restrictions; validate the live endpoint."
+        },
+        {
+          "rule_id": "xccdf_org.ssgproject.content_rule_sysctl_net_ipv4_ip_forward",
+          "selected": false,
+          "rationale": "The appliance uses a rootful Podman IPv4 bridge with published ingestion ports; disabling host IPv4 forwarding conflicts with this network path.",
+          "effective_control": "Retain container bridge forwarding and firewall restrictions. Before release, verify permitted ingestion and management paths, denied transit and unpublished database ports, and persistence after reboot. Record this benchmark exception explicitly; live network isolation remains unverified."
+        }
+      ],
+      "benchmark_basis": "Packaged CIS RHEL 9 v2.0.0 Level 2 Server profile; this is not a claim of full CIS Rocky Linux 9 v3.0.0 coverage."
+    },
+    "stig": {
+      "kind": "stig",
+      "base_profile_id": "xccdf_org.ssgproject.content_profile_stig",
+      "profile_id": "xccdf_com.captainslog_profile_stig_appliance",
+      "tailoring_file": "baseline-stig.xml",
+      "tailoring_sha256": "51212903f4a48aba7bd6c5d01425b6a1c78360761770e13bd2c27f6fbe1214a8",
+      "tailoring_decisions": [
+        {
+          "rule_id": "xccdf_org.ssgproject.content_rule_aide_build_database",
+          "selected": false,
+          "rationale": "Distribution AIDE remediation would bypass installation-bound enrollment or change its protected configuration.",
+          "effective_control": "Use the appliance AIDE policy, encrypted database, explicit enrollment, scheduled checks and retained integrity evidence; independently review benchmark coverage."
+        },
+        {
+          "rule_id": "xccdf_org.ssgproject.content_rule_aide_check_audit_tools",
+          "selected": false,
+          "rationale": "Distribution AIDE remediation would bypass installation-bound enrollment or change its protected configuration.",
+          "effective_control": "Use the appliance AIDE policy, encrypted database, explicit enrollment, scheduled checks and retained integrity evidence; independently review benchmark coverage."
+        },
+        {
+          "rule_id": "xccdf_org.ssgproject.content_rule_aide_scan_notification",
+          "selected": false,
+          "rationale": "Distribution AIDE remediation would bypass installation-bound enrollment or change its protected configuration.",
+          "effective_control": "Use the appliance AIDE policy, encrypted database, explicit enrollment, scheduled checks and retained integrity evidence; independently review benchmark coverage."
+        },
+        {
+          "rule_id": "xccdf_org.ssgproject.content_rule_aide_use_fips_hashes",
+          "selected": false,
+          "rationale": "Distribution AIDE remediation would bypass installation-bound enrollment or change its protected configuration.",
+          "effective_control": "Use the appliance AIDE policy, encrypted database, explicit enrollment, scheduled checks and retained integrity evidence; independently review benchmark coverage."
+        },
+        {
+          "rule_id": "xccdf_org.ssgproject.content_rule_aide_verify_acls",
+          "selected": false,
+          "rationale": "Distribution AIDE remediation would bypass installation-bound enrollment or change its protected configuration.",
+          "effective_control": "Use the appliance AIDE policy, encrypted database, explicit enrollment, scheduled checks and retained integrity evidence; independently review benchmark coverage."
+        },
+        {
+          "rule_id": "xccdf_org.ssgproject.content_rule_aide_verify_ext_attributes",
+          "selected": false,
+          "rationale": "Distribution AIDE remediation would bypass installation-bound enrollment or change its protected configuration.",
+          "effective_control": "Use the appliance AIDE policy, encrypted database, explicit enrollment, scheduled checks and retained integrity evidence; independently review benchmark coverage."
+        },
+        {
+          "rule_id": "xccdf_org.ssgproject.content_rule_configure_crypto_policy",
+          "selected": false,
+          "rationale": "The appliance pins the vendor FIPS policy; changing it requires separate crypto qualification.",
+          "effective_control": "Retain vendor FIPS policy; assess any additional STIG algorithm restrictions as explicit findings."
+        },
+        {
+          "rule_id": "xccdf_org.ssgproject.content_rule_fips_crypto_subpolicy",
+          "selected": false,
+          "rationale": "The appliance pins the vendor FIPS policy without an unqualified custom subpolicy.",
+          "effective_control": "Retain vendor FIPS policy and document additional STIG algorithm constraints in the assessment."
+        },
+        {
+          "rule_id": "xccdf_org.ssgproject.content_rule_fips_custom_stig_sub_policy",
+          "selected": false,
+          "rationale": "The FIPS:STIG custom subpolicy is outside the currently qualified appliance crypto policy.",
+          "effective_control": "Retain vendor FIPS policy; track additional STIG SSH constraints separately while SSH is disabled."
+        },
+        {
+          "rule_id": "xccdf_org.ssgproject.content_rule_firewalld_sshd_port_enabled",
+          "selected": false,
+          "rationale": "Opening SSH conflicts with the sealed appliance management boundary.",
+          "effective_control": "Retain closed SSH port and verify the active firewall and listening sockets."
+        },
+        {
+          "rule_id": "xccdf_org.ssgproject.content_rule_service_sshd_enabled",
+          "selected": false,
+          "rationale": "A sealed appliance disables remote SSH administration.",
+          "effective_control": "Local console setup and HTTPS management with mandatory administrator MFA; verify no SSH listener."
+        },
+        {
+          "rule_id": "xccdf_org.ssgproject.content_rule_crypto_policy_not_overridden",
+          "selected": false,
+          "rationale": "The vendor STIG remediation resets the crypto policy to its FIPS:STIG selection, outside the currently qualified appliance policy.",
+          "effective_control": "Retain vendor FIPS policy and independently check effective provider configuration; record unqualified STIG crypto constraints as findings."
+        },
+        {
+          "rule_id": "xccdf_org.ssgproject.content_rule_sysctl_net_ipv4_conf_all_forwarding",
+          "selected": false,
+          "rationale": "The appliance uses a rootful Podman IPv4 bridge with published ingestion ports; disabling host IPv4 forwarding conflicts with this network path.",
+          "effective_control": "Retain container bridge forwarding and firewall restrictions. Before release, verify permitted ingestion and management paths, denied transit and unpublished database ports, and persistence after reboot. Record this benchmark exception explicitly; live network isolation remains unverified."
+        }
+      ],
+      "benchmark_basis": "Packaged RHEL 9 STIG V2R9 profile adapted for the Rocky appliance; manual and application exceptions require final review."
+    }
+  }
+}

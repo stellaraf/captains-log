@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 
 from .common import Refused, atomic_json, audit, locked, require_linux_root, run, trusted_file
 from .update_enrollment import enrolled_key, _read, _tree
-from .updates import UpdateManager, _unique, verify_release
+from .updates import UpdateManager, _unique, verify_release, os_maintenance_pending
 
 CONFIG = Path("/etc/nebulalog/github-updates.json")
 PUBLIC_KEY = Path("/etc/nebulalog/release-public.pem")
@@ -106,11 +106,12 @@ class GitHubTransport:
 
 def load_policy(path=CONFIG):
     value = json.loads(_read(path, 16384), object_pairs_hook=_unique)
-    if (not isinstance(value, dict) or set(value) - {"schema", "repository", "automatic_updates", "poll_interval_seconds", "token_file"}
+    if (not isinstance(value, dict) or set(value) - {"schema", "repository", "automatic_updates", "automatic_livepatch", "poll_interval_seconds", "token_file"}
             or type(value.get("schema")) is not int or value["schema"] != 1 or not isinstance(value.get("repository"), str)
             or not REPOSITORY.fullmatch(value["repository"]) or value["repository"].endswith(".git")
             or type(value.get("automatic_updates")) is not bool or type(value.get("poll_interval_seconds")) is not int
-            or value["poll_interval_seconds"] != POLL_SECONDS):
+            or value["poll_interval_seconds"] != POLL_SECONDS
+            or type(value.get("automatic_livepatch", False)) is not bool):
         raise Refused("Invalid GitHub update policy")
     token = None
     if value.get("token_file") is not None:
@@ -185,8 +186,7 @@ class GitHubUpdater:
                 os_transaction = manager_status.get("os_transaction") or {}
                 if (manager_status.get("maintenance_release_pending") or
                         transaction.get("state", "committed") not in {"committed", "rolled_back", "preflight_failed"} or
-                        os_transaction and (os_transaction.get("state") not in {"complete", "failed", "reboot_aborted"} or
-                                            os_transaction.get("finalization", "complete") != "complete")):
+                        os_maintenance_pending(os_transaction)):
                     return self.record(policy, "blocked", reason="recovery_pending")
                 current = manager_status["current"]
                 downloads = self.state / "downloads"
@@ -225,6 +225,11 @@ class GitHubUpdater:
                     raise Refused("Host-enrolled appliances require a versioned host bundle for authorized integrity acceptance")
                 if any(not component["rollback_safe"] for component in metadata["components"].values()):
                     raise Refused("Controlled migration release requires a database-specific recovery procedure")
+                try:
+                    self.manager._require_restore_update_compatibility()
+                except Refused:
+                    return self.record(policy, "blocked", reason="restored_appliance_compatibility_pending",
+                                       release_id=release["id"], sequence=metadata["sequence"])
                 if metadata["declared_bytes"] > MAX_BUNDLE or shutil.disk_usage(self.state).free < metadata["declared_bytes"] * 4 + 1024**3:
                     raise Refused("Insufficient download and transaction reserve")
                 for artifact in metadata["artifacts"]:

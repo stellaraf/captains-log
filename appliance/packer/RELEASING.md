@@ -1,5 +1,118 @@
 # Release assembly and guarded prerelease publication
 
+## Application build and owned cache cleanup
+
+The application helper requires an explicit local Docker context, a mounted
+storage root, and an already cached immutable official BuildKit image. Verify
+that Docker's actual backing disk also resides on the approved development
+volume before running; checking the receipt filesystem does not prove that.
+
+```sh
+python3 appliance/packer/build_application.py \
+  --source /Volumes/T9/qualification/source \
+  --tag nebulalog/application:qualification \
+  --receipt /Volumes/T9/qualification/application-build.json \
+  --storage-root /Volumes/T9 --docker-context desktop-linux \
+  --buildkit-image 'moby/buildkit@sha256:<reviewed cached image digest>'
+```
+
+Each invocation creates a private buildx configuration beside the receipt, a
+unique builder and node, and a labelled cache volume. It preserves the captured
+source contract, uses `--builder` and `--load`, and never changes the default
+builder. Buildx bootstrap can contact the registry for that immutable BuildKit
+digest even when its bytes are cached. The application build has a one-hour
+deadline and periodically checks the 150 GiB free-space reserve on the selected
+volume. CLI process groups are reaped on failure or interruption; daemon work is
+separately stopped and inspected before cleanup.
+
+After loading, the helper streams one `docker image save` to verify the exact
+manifest and configuration bytes, without retaining a layer archive. This adds
+one full image read, capped at 8 GiB and five minutes; only bounded JSON metadata
+is retained. The supported export contains OCI blob paths for the single image
+manifest; legacy save formats without that manifest are refused. Buildx config
+digest hints are optional and must agree when present. The unchanged schema-1
+build receipt records the verified OCI config digest in `local_image_id`;
+the daemon's lookup ID and raw build metadata remain in private sidecars.
+
+On success, failure, timeout, Ctrl-C or CLI SIGTERM, cleanup verifies the exact
+BuildKit container/image/nonce/mount and recorded volume identity, stops and
+removes that container, removes its unreferenced cache volume, checks their
+absence, and deletes the private buildx scratch. It retains loaded output images,
+prior receipts and all release/recovery artifacts. No shared cache or image
+prune is used. The successful build receipt is published only after cleanup.
+Private `application-build-evidence-*` sidecars retain intent, ownership and
+separate build/cleanup outcomes; an uncertain identity or failed readback leaves
+resources and configuration for inspection and makes the invocation fail.
+An outcome-write failure is reported without replacing the primary build error.
+Resolve incomplete cleanup before another image build. SIGKILL, power loss and
+daemon unavailability cannot guarantee immediate cleanup; retained identity
+evidence requires explicit reconciliation. Programmatic callers keep their own
+signal policy; only the CLI temporarily installs a SIGTERM handler.
+
+## Restored-token HTTP proof for the first supported factory
+
+The fresh schema-3 factory and same-schema component candidates use
+`restored-jwt-issued-at-v1`. Before packaging that declaration, run the actual
+normal API image with `probe_restore_auth.py`; synthetic unit-test reports are
+not qualification evidence. The binary command is `nebulalog serve`.
+
+```sh
+python3 appliance/packer/probe_restore_auth.py \
+  --archive /Volumes/T9/qualification/nebulalog.oci.tar \
+  --reference 'nebulalog/application@sha256:<actual manifest digest>' \
+  --source-manifest /Volumes/T9/qualification/source-manifest.json \
+  --build-receipt /Volumes/T9/qualification/application-build.json \
+  --output /Volumes/T9/qualification/http-proof-new-run \
+  --storage-root /Volumes/T9
+```
+
+Inputs must describe the same captured source, real build receipt and verified
+Linux/amd64 OCI image, which must already be loaded in a local Unix-socket Docker
+daemon. The application image must include `/usr/bin/python3` for the separate
+public-JWKS fixture container. The probe never builds, imports or pulls an image.
+Classic Docker configuration IDs and containerd manifest IDs are supported only
+when the digest belongs to the verified OCI archive; mutable tags are not used
+to select test containers. Supply absolute paths for the receipt inputs.
+If Docker's default network pools are exhausted, inventory existing subnets and
+pass `--fixture-subnet` with an unused, aligned `/28` or `/29` in `198.18.0.0/15`.
+This range is restricted to the internal test network; Docker rejects overlaps,
+the probe verifies the assigned subnet, and cleanup removes only its owned network.
+Do not remove existing networks or change daemon-wide pools to run this test.
+It refuses before runtime access when the storage volume has less than 150 GiB
+free. This check proves free space on the output volume; it does not discover or
+prove Docker Desktop's backing-disk location. Before an actual run, independently
+verify that the selected local runtime's backing storage is on T9 and retain that
+evidence with the execution receipt. The probe does not relocate runtime storage.
+
+Both temporary containers use that exact OCI configuration. The API retains its
+normal entrypoint, unprivileged user and `REQUIRE_FIPS=true`; a second container
+serves an isolated fixture issuer and creates a root-owned read-only storage
+maintenance gate. A private internal network prevents external egress. The HTTP
+client executes inside the fixture container and receives tokens through stdin;
+neither container publishes a host port. Database addresses point to
+closed ports on container loopback: this probe exercises `/api/me`, not database
+availability, browser login, MFA, native kernel FIPS or appliance health.
+
+The probe sends fresh RSA-signed fixture JWTs before, at and after a fixed issuance
+cutoff, plus missing-iat, wrong-issuer, wrong-audience, wrong-signature and expired
+controls. It records actual HTTP statuses, runtime image/configuration readback,
+source/build hashes and bounded response hashes. Tokens and private keys do not
+enter the report; temporary signing keys are removed. The expected 200 responses
+must identify the fixture viewer. Any unexpected result, timeout, identity change
+or unconfirmed cleanup prevents publication of `restore-auth-behavior.json`.
+`intent.json` and the private `execution.json` preserve failed attempts. Cleanup
+selects only this run's unique resource names, label and exact image identity.
+
+Review that execution before supplying `application-build.json` and
+`restore-auth-behavior.json` to `prepare_provenance.py --restore-auth-evidence` or
+the release assembler's evidence directory. Existing factory provenance and
+release signatures cover these inputs; no new trust key or loose-file adoption
+is introduced. Native restored-baseline login/MFA, A-to-B update, rollback and
+interrupted recovery remain release-promotion gates. The runtime's temporary
+restored-appliance update refusal stays in place until proof ownership, immutable
+restore markers and the running cutoff are integrated and qualified. Earlier
+schema-2/121-entry prototypes do not acquire this capability from a label.
+
 `assemble_release.py` produces local assets compatible with Captain's Log's existing signed updater. It has no network or GitHub operations. An assembled package is always `qualification: not_assessed`, including when its signature and all archives verify. The GitHub workflow is disabled until its explicit repository variable is enabled, and can publish only a prerelease.
 
 ## Inputs and assembly
@@ -17,7 +130,7 @@ The recipe explicitly records the publisher-approved release sequence, timestamp
   "issued_at": "2026-09-09T00:00:00Z",
   "expires_at": "2026-12-09T00:00:00Z",
   "source_commit": "<40-character published source commit>",
-  "schema_revision": "1",
+  "schema_revision": "2",
   "components": {
     "host": {"version": "0.1.1", "from_versions": ["0.1.0"]},
     "nebulalog": {"version": "0.1.1", "from_versions": ["0.1.0"]}
@@ -27,6 +140,8 @@ The recipe explicitly records the publisher-approved release sequence, timestamp
 ```
 
 These values are illustrative, not a current qualified release. Include the actual measured factory host version in `from_versions` when supporting that factory image. Every release includes both host and application assets. The host version must advance, even when only OCI bytes change. Database changes may additionally select `postgresql`, `clickhouse`, and `keycloak`; unselected database images remain installed. PostgreSQL major changes are refused. ClickHouse requires `family`, `tested_minimum`, and `tested_maximum`, with both old and new versions inside that range. Preserve the full measured ClickHouse version, such as `25.3.8.30001.altinityfips`, in `version` and `from_versions`; range bounds are numeric, such as `25.3.8.30001`. Both the publisher and appliance verifier reject family changes, vendor suffix changes and endpoints outside that range. Automatic schema migrations are not accepted.
+
+The legacy example above targets prototype schema 2; the first supported factory targets schema 3. `ApplicationSchema` in `image_bundle.py` binds the entire `migrations/` inventory to reviewed bytes; a schema-1 declaration with schema-2 SQL is rejected before assembly. The same binding is required by provenance capture and installed-release enrollment. The historical schema-1-to-2 additive contract remains distinct from current schema-3 operation. These prototypes do not gain a supported schema-2-to-3 migration or restored-token capability from a declaration. Keep candidates out of stable release publication until their required installed-guest upgrade and rollback checks pass.
 
 Keycloak additionally requires `qualification_artifact` naming a JSON report with the existing lifecycle schema: exact image, source commit, and successful `real_browser` observations for local password/OTP, AD LDAPS/OTP, Okta SAML, Entra SAML, generic SAML and generic OIDC. Every referenced browser evidence artifact must be listed explicitly in `evidence_artifacts` and supplied in `--evidence-directory`. Only the selected, bounded JSON files are copied. Those browser artifacts become public release assets; supply reviewed, sanitized reports containing no tokens, cookies, passwords, private keys or personal data. The assembler checks schema and binding, not the truth of browser assertions or complete content redaction.
 
@@ -86,3 +201,50 @@ Stage these exact paths for a version:
 Supply the independently reviewed manifest SHA256 when dispatching. The workflow checks that every frozen source file matches the checked-out commit, verifies the evidence gate, uploads only the explicit package assets and OVA to a new draft prerelease, and compares GitHub's uploaded asset lengths/SHA256 digests and actual tag commit. It rechecks local evidence before publishing with `prerelease: true` and `latest: false`. Missing GitHub digest evidence, an existing release, upload failure or any mismatch leaves publication unfinished; no overwrite, deletion or automatic partial-draft reuse is attempted.
 
 The appliance's 15-minute stable GitHub poller excludes prereleases. Stable publication and promotion require a separately reviewed process and are deliberately absent here. The workflow source has local fixture validation only until it is installed and run against the configured repository/runner/environment.
+
+## Preserve builder disks independently
+
+The October 12 private build completed provisioning but its manifest
+post-processor failed because the relative output directory was absent. Packer
+then removed the input artifact despite `-on-error=abort`. That flag is not an
+artifact-retention guarantee. The template now returns builder outputs directly,
+without a post-processor. Write receipt files outside Packer after it exits.
+
+A local build supervisor can use `preserve_build.RecoveryLinks` to retain the
+three known disk/firmware files in a separate recovery directory on the same
+filesystem. Call `capture()` throughout the build and after the writer exits;
+replacement inodes receive separate links. These links share live writes and
+must never be treated as crash-consistent snapshots or opened by a second VM
+while the original writer runs. After exit, verify image consistency before use.
+They are recovery evidence and must be preserved independently of Packer output
+cleanup. This does not protect against physical filesystem/drive failure.
+
+## Retain factory kernel provenance
+
+`install-host.sh` invokes the captured `factory_kernel.py` helper during guarded
+private image provisioning. It requires exactly one complete installed Rocky
+9.8 x86_64 kernel set, equal to the running kernel and persistent boot default.
+It downloads the exact installed NEVRAs for `kernel`, `kernel-core`,
+`kernel-modules`, and `kernel-modules-core` from the fixed Rocky BaseOS HTTPS
+repository. This step downloads bytes only: it cannot install an update or
+substitute a newer package when the exact vendor version is unavailable.
+
+The helper checks installed payloads, downloaded payload/script headers, and signatures
+against an isolated keyring containing only the pinned Rocky key. It preserves
+four SHA256-named RPMs, `installed-inventory.xml`, `capture.json`, and the
+completion marker `manifest.json` under
+`/usr/share/nebulalog/kernel-provenance`. Protected files are retained unchanged
+across exact retries; partial or conflicting evidence is never silently replaced.
+The sealer verifies the bundle offline. Initial AIDE enrollment verifies the
+source-measured helper and retains the manifest and installed-inventory digests.
+The existing `/usr` policy covers all seven files; there is no provenance
+exclusion. Later checks preserve the original enrollment facts, including after
+the factory kernel is eventually pruned by an accepted retention transaction.
+
+Missing exact vendor RPMs, extra installed kernel versions, changed signatures
+or payloads, and incomplete provenance stop the build/enrollment. Existing
+appliances whose AIDE enrollment lacks these factory facts require an explicitly
+qualified migration; the helper does not create a replacement baseline. Source
+tests cover capture, refusal, and retry boundaries. The actual download command,
+SELinux labels, offline seal/first-enrollment verification, and later native
+four-to-three retention still require a rebuilt Rocky guest qualification.

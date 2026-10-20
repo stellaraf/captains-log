@@ -23,11 +23,14 @@ class AuthorizedAideTests(unittest.TestCase):
     def setUp(self):
         lifecycle_fixture.AideLifecycleTests.setUp(self)
 
-    def authorized_fixture(self):
+    def authorized_fixture(self, *, api=False):
         self.runtime = self.root / "managed.conf"
         self.selection = self.root / "host-selection.json"
-        self.unrelated = self.root / "unrelated.conf"
-        for path, raw in ((self.runtime, b"old managed\n"), (self.selection, b"old selection\n"), (self.unrelated, b"preserved\n")):
+        self.unrelated = self.root / "configuration/runtime/api.env" if api else self.root / "unrelated.conf"
+        if api:
+            self.unrelated.parent.mkdir(parents=True, mode=0o700)
+        for path, raw in ((self.runtime, b"old managed\n"), (self.selection, b"old selection\n"),
+                          (self.unrelated, b"OIDC_CLIENT_ID=nebulalog\nOIDC_ISSUER=https://fixture.invalid/realms/nebulalog\n" if api else b"preserved\n")):
             self.write_private(path, raw)
         self.monitored = [self.runtime, self.selection, self.unrelated]
         # This macOS Python has no os xattr API. Inject empty Linux metadata
@@ -103,10 +106,12 @@ class AuthorizedAideTests(unittest.TestCase):
         self.scan_calls.append(action)
         current = self.snapshot_files()
         initializing = action == "init"
-        old = {} if initializing else json.loads(gzip.decompress(source.read_bytes()))
+        decode = getattr(self, "decode_snapshot", lambda raw: json.loads(gzip.decompress(raw)))
+        encode = getattr(self, "encode_snapshot", lambda value: gzip.compress(json.dumps(value, sort_keys=True).encode(), mtime=0))
+        old = {} if initializing else decode(source.read_bytes())
         if action in ("init", "update"):
             self.assertFalse(output.exists(), "scan must never overwrite retained output")
-            self.write_private(output, gzip.compress(json.dumps(current, sort_keys=True).encode(), mtime=0))
+            self.write_private(output, encode(current))
         added, removed = set(current) - set(old), set(old) - set(current)
         changed = {path for path in set(current) & set(old) if current[path] != old[path]}
         code = 0 if initializing else int(bool(added)) + 2 * int(bool(removed)) + 4 * int(bool(changed))
@@ -124,6 +129,12 @@ class AuthorizedAideTests(unittest.TestCase):
         if self.scan_hook:
             self.scan_hook(action, source, output)
         return aide.Result(code, json.dumps(report))
+
+    def encode_snapshot(self, value):
+        return gzip.compress(json.dumps(value, sort_keys=True).encode(), mtime=0)
+
+    def decode_snapshot(self, raw):
+        return json.loads(gzip.decompress(raw))
 
     def prepare_update(self):
         return updates.prepare(self.manager, self.stage, self.plan_path)
@@ -148,6 +159,36 @@ class AuthorizedAideTests(unittest.TestCase):
         self.assertEqual(self.scan_calls.count("update"), 0)
         self.assert_original()
 
+    def interrupted_preparation_publication(self, boundary):
+        self.authorized_fixture()
+        original = updates._immutable
+        retained = {}
+        def interrupted(manager, path, value, identity):
+            result = original(manager, path, value, identity)
+            matched = (path.parent == self.state / "authorized/prepared" if boundary == "record"
+                       else path.parent == self.state / "authorized" and path.suffix == ".json")
+            if matched:
+                retained[path] = path.read_bytes()
+                raise OSError("interrupted after prepared " + boundary)
+            return result
+        with patch.object(updates, "_immutable", side_effect=interrupted), self.assertRaises(OSError):
+            self.prepare_update()
+        self.assertTrue(retained)
+        self.assertEqual((self.state / "aide.db.gz").read_bytes(), self.initial_db)
+        self.assertTrue(self.prepare_update()["ok"])
+        self.assertTrue(self.prepare_update()["ok"])
+        for path, raw in retained.items(): self.assertEqual(path.read_bytes(), raw)
+        self.assertEqual((self.state / "aide.db.gz").read_bytes(), self.initial_db)
+        self.assertEqual(self.scan_calls.count("init"), 1)
+        self.assertEqual(self.scan_calls.count("update"), 0)
+        self.assert_original()
+
+    def test_prepare_retry_preserves_orphan_record_after_interrupted_pointer_publication(self):
+        self.interrupted_preparation_publication("record")
+
+    def test_prepare_retry_reuses_existing_pointer_without_baseline_replacement(self):
+        self.interrupted_preparation_publication("pointer")
+
     def test_authorized_forward_and_rollback_preserve_original_and_publish_fresh_checks(self):
         self.authorized_fixture()
         self.prepare_update()
@@ -171,7 +212,9 @@ class AuthorizedAideTests(unittest.TestCase):
         self.authorized_fixture()
         # A same-byte rewrite changes inode/ctime evidence. Preflight must not
         # authorize it merely because that filename is an eventual target.
-        self.runtime.write_bytes(self.runtime.read_bytes())
+        replacement = self.runtime.with_suffix('.replacement')
+        self.write_private(replacement, self.runtime.read_bytes())
+        replacement.replace(self.runtime)
         with self.assertRaisesRegex(Refused, "unrelated_integrity_change"):
             self.prepare_update()
         self.assertEqual((self.state / "aide.db.gz").read_bytes(), self.initial_db)
@@ -262,6 +305,83 @@ class AuthorizedAideTests(unittest.TestCase):
         self.assertEqual(self.scan_calls.count("init"), 1)
         self.assertEqual(self.scan_calls.count("update"), 2)
 
+    def resume_interrupted_boot(self, *, phase='resume', prior_phase='commit'):
+        """Exercise real retained DB/report CAS; boot semantics have their own suite."""
+        checksum = hashlib.sha256(self.plan_path.read_bytes()).hexdigest()
+        pointer, prepared = updates._prepared(self.manager, self.state, self.identity, self.stage, self.plan, checksum)
+        prior = {**self.plan, 'kind': 'kernel-boot-v1', 'phase': prior_phase}
+        resumed = {'kind': 'kernel-boot-v1', 'phase': phase}
+        from nebulalog_manager import kernel_boot
+        with patch.object(kernel_boot, 'integrity_predecessor', return_value=(prior, checksum)), \
+             patch.object(updates, '_prepared', return_value=(pointer, prepared)), \
+             patch.object(updates, '_snapshot', return_value={'fixture': 'validated exact resume bytes'}), \
+             patch.object(updates, '_replace_current') as replace:
+            updates._resume_kernel_pending(self.manager, self.state, self.identity, self.base,
+                                           self.stage, self.plan_path, resumed, 'e' * 64)
+            replace.assert_not_called()
+
+    def test_kernel_resume_preserves_interrupted_scan_without_copying_or_accepting_database(self):
+        self.authorized_fixture()
+        self.prepare_update()
+        self.activate()
+        def crash(action, *_):
+            if action == 'update':
+                raise OSError('interrupted scan before proposed database')
+        self.scan_hook = crash
+        with self.assertRaises(OSError):
+            self.accept_update()
+        self.scan_hook = None
+        calls = list(self.scan_calls)
+        self.resume_interrupted_boot()
+        self.assertEqual((self.state / 'aide.db.gz').read_bytes(), self.initial_db)
+        self.assertEqual(self.scan_calls, calls)
+        pending = json.loads((self.state / 'authorized/pending.json').read_text())
+        self.assertEqual(pending['state'], 'complete')
+        self.assertIsNone(pending['entry'])
+        self.assertEqual(len(list((self.state / 'authorized/artifacts').glob('*.kernel-resume.json'))), 1)
+        self.assert_original()
+
+    def test_kernel_pending_recovery_refuses_unqualified_phase_relationship(self):
+        self.authorized_fixture()
+        self.prepare_update()
+        with self.assertRaisesRegex(Refused, 'commit_required'):
+            self.resume_interrupted_boot(phase='postboot', prior_phase='commit')
+
+    def test_kernel_resume_retains_only_already_copied_verified_historical_database(self):
+        self.authorized_fixture()
+        self.prepare_update()
+        self.activate()
+        replace = updates._replace_current
+        def crash(*args):
+            replace(*args)
+            raise OSError('interrupted after database before head')
+        with patch.object(updates, '_replace_current', side_effect=crash), self.assertRaises(OSError):
+            self.accept_update()
+        database = (self.state / 'aide.db.gz').read_bytes()
+        calls = list(self.scan_calls)
+        self.resume_interrupted_boot()
+        self.assertEqual((self.state / 'aide.db.gz').read_bytes(), database)
+        self.assertEqual(self.scan_calls, calls)
+        self.assertEqual(len(list((self.state / 'authorized/entries').glob('*.json'))), 1)
+        self.assertEqual(json.loads((self.state / 'authorized/pending.json').read_text())['state'], 'complete')
+        self.assert_original()
+
+    def test_kernel_resume_refuses_corrupted_historical_check_report(self):
+        self.authorized_fixture()
+        self.prepare_update()
+        self.activate()
+        with patch.object(updates, '_replace_current', side_effect=OSError('before CAS')), self.assertRaises(OSError):
+            self.accept_update()
+        pending = json.loads((self.state / 'authorized/pending.json').read_text())
+        report = self.state / 'reports' / (pending['proposed_entry']['check_report']['id'] + '.json')
+        value = json.loads(report.read_text())
+        value['stdout'] = 'corrupted evidence'
+        self.write_private(report, json.dumps(value).encode())
+        with self.assertRaisesRegex(Refused, 'retained_record_changed'):
+            self.resume_interrupted_boot()
+        self.assertEqual(json.loads((self.state / 'authorized/pending.json').read_text()), pending)
+        self.assertEqual((self.state / 'aide.db.gz').read_bytes(), self.initial_db)
+
     def test_authorized_chain_corruption_and_current_db_replacement_refuse_monitoring(self):
         self.authorized_fixture()
         self.prepare_update()
@@ -285,7 +405,9 @@ class AuthorizedAideTests(unittest.TestCase):
         self.prepare_update()
         self.activate()
         self.accept_update()
-        self.runtime.write_bytes(self.runtime.read_bytes())
+        replacement = self.runtime.with_suffix('.replacement')
+        self.write_private(replacement, self.runtime.read_bytes())
+        replacement.replace(self.runtime)
         with self.assertRaisesRegex(Refused, "no_longer_clean"):
             self.accept_update()
         self.assertEqual(self.scan_calls.count("update"), 1)
@@ -409,7 +531,7 @@ class AuthorizedAideTests(unittest.TestCase):
             if self.source_changed and path == self.generation / self.source_changed:
                 return b"changed"
             return b"same"
-        for patched in (patch.object(updates.host_dispatch, "transaction_binding", return_value=(transaction, {})),
+        for patched in (patch.object(updates.host_dispatch, "transaction_binding", return_value=(transaction, {"components": {}})),
                         patch.object(updates.host_dispatch, "coordinator_pin", return_value=pin),
                         patch.object(updates.host_dispatch, "generation_info", return_value=candidate),
                         patch.object(updates.host_activation, "_candidate_identity", return_value=(candidate, None)),

@@ -79,7 +79,15 @@ export class APIError extends Error {
     super(message);
   }
 }
-export async function authenticatedFetch(path: string, init: RequestInit = {}) {
+export type AuthenticatedRequestInit = RequestInit & { expectedSession?: number };
+export async function authenticatedFetch(path: string, init: AuthenticatedRequestInit = {}) {
+  const { expectedSession, ...requestInit } = init;
+  function requireExpectedSession() {
+    if (expectedSession !== undefined && expectedSession !== authSessionSnapshot()) {
+      throw new APIError("Your sign-in session changed. Refresh before submitting this action.", 409);
+    }
+  }
+  requireExpectedSession();
   if (!keycloak?.authenticated) {
     invalidateAuthSession();
     throw new APIError("Your session has expired. Sign in again.", 401);
@@ -92,10 +100,13 @@ export async function authenticatedFetch(path: string, init: RequestInit = {}) {
     await keycloak.login();
     throw new APIError("Sign-in required.", 401);
   }
-  const headers = new Headers(init.headers);
+  // Confirmation belongs to the identity that reviewed it. Token refresh may
+  // change that identity synchronously; React cleanup runs too late to fence dispatch.
+  requireExpectedSession();
+  const headers = new Headers(requestInit.headers);
   headers.set("Authorization", `Bearer ${keycloak.token}`);
-  if (init.body) headers.set("Content-Type", "application/json");
-  const response = await fetch(path, { ...init, headers, cache: "no-store" });
+  if (requestInit.body) headers.set("Content-Type", "application/json");
+  const response = await fetch(path, { ...requestInit, headers, cache: "no-store" });
   if (response.status === 401) {
     invalidateAuthSession();
     await keycloak.login();
@@ -113,7 +124,7 @@ export async function authenticatedFetch(path: string, init: RequestInit = {}) {
   }
   return response;
 }
-export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+export async function api<T>(path: string, init: AuthenticatedRequestInit = {}): Promise<T> {
   const r = await authenticatedFetch(path, init);
   if (r.status === 204) return undefined as T;
   return r.json();

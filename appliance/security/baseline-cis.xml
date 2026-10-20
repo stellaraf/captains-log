@@ -1,0 +1,14 @@
+<?xml version='1.0' encoding='utf-8'?>
+<xccdf:Tailoring xmlns:xccdf="http://checklists.nist.gov/xccdf/1.2" id="xccdf_com.captainslog_tailoring_cis">
+  <xccdf:benchmark href="ssg-rl9-ds.xml" />
+  <xccdf:version time="2026-10-12T00:00:00Z">1</xccdf:version>
+  <xccdf:Profile id="xccdf_com.captainslog_profile_cis_appliance" extends="xccdf_org.ssgproject.content_profile_cis">
+    <xccdf:title>Captain’s Log cis-level2 appliance adaptation</xccdf:title>
+    <xccdf:select idref="xccdf_org.ssgproject.content_rule_aide_build_database" selected="false" />
+    <xccdf:select idref="xccdf_org.ssgproject.content_rule_aide_check_audit_tools" selected="false" />
+    <xccdf:select idref="xccdf_org.ssgproject.content_rule_aide_periodic_cron_checking" selected="false" />
+    <xccdf:select idref="xccdf_org.ssgproject.content_rule_configure_custom_crypto_policy_cis" selected="false" />
+    <xccdf:select idref="xccdf_org.ssgproject.content_rule_package_httpd_removed" selected="false" />
+    <xccdf:select idref="xccdf_org.ssgproject.content_rule_sysctl_net_ipv4_ip_forward" selected="false" />
+  </xccdf:Profile>
+</xccdf:Tailoring>

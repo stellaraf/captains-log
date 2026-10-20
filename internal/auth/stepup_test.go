@@ -130,7 +130,7 @@ func newStepUpFixture(t *testing.T) *stepUpFixture {
 	policy.AcceptedACR, policy.RequiredAMR = []string{HostControlACR}, nil
 	policy.MaxAuthenticationAge, policy.MaxTokenAge, policy.MaxTokenLifetime = 120*time.Second, 120*time.Second, 120*time.Second
 	f.s = &StepUp{
-		config: StepUpConfig{Policy: policy, ApplicationClientID: "nebulalog", RedirectURI: "https://app.example.test/api/host/step-up/callback"},
+		config: StepUpConfig{Policy: policy, ApplicationClientID: "nebulalog", RedirectURI: "https://app.example.test/api/host/step-up/callback", PolicyGenerationSHA: strings.Repeat("c", 64)},
 		store:  f.store, provider: f.provider,
 		verifier: oidc.NewVerifier(aIssuer(), &oidc.StaticKeySet{PublicKeys: []crypto.PublicKey{&key.PublicKey}}, &oidc.Config{
 			ClientID: HostControlClient, SupportedSigningAlgs: []string{"ES256"}, Now: func() time.Time { return f.at },
@@ -149,7 +149,103 @@ func newStepUpFixture(t *testing.T) *stepUpFixture {
 		PlanID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", PlanDigest: strings.Repeat("a", 64), ResourceRevision: strings.Repeat("b", 64),
 		ExpiresAt: f.at.Add(3 * time.Minute),
 	}
+	f.binding.Challenge = syntheticStepUpChallenge(f.binding, original.issuer, original.client, original.subject, original.sid, f.at)
 	return f
+}
+
+// Explicit synthetic authority for unit fixtures only. No production policy is
+// loaded, qualified, enabled or inferred by this helper.
+func syntheticStepUpChallenge(b StepUpBinding, issuer, client, subject, sid string, now time.Time) HostChallenge {
+	subjectDigest := hostSubjectDigest(issuer, client, subject)
+	return HostChallenge{Schema: 1, ID: "01234567-89ab-cdef-0123-456789abcdef", Nonce: strings.Repeat("n", 42) + "k",
+		InstallationID: b.InstallationID, SubjectDigest: subjectDigest, SessionDigest: hostSessionDigest(subjectDigest, sid),
+		Operation: b.Operation, OperationSchema: 1, Action: "job.accept", PlanID: b.PlanID, PlanDigest: b.PlanDigest,
+		ResourceRevision: b.ResourceRevision, RequestDigest: strings.Repeat("d", 64), PolicyGeneration: strings.Repeat("c", 64),
+		IssuedAt: now.Unix(), ExpiresAt: now.Add(120 * time.Second).Unix()}
+}
+
+func stepUpChallengeMutations() map[string]func(*HostChallenge) {
+	return map[string]func(*HostChallenge){
+		"schema":            func(c *HostChallenge) { c.Schema++ },
+		"ID":                func(c *HostChallenge) { c.ID = "fedcba98-7654-3210-fedc-ba9876543210" },
+		"nonce":             func(c *HostChallenge) { c.Nonce = strings.Repeat("x", 42) + "w" },
+		"installation":      func(c *HostChallenge) { c.InstallationID = "fedcba98-7654-3210-fedc-ba9876543210" },
+		"subject":           func(c *HostChallenge) { c.SubjectDigest = strings.Repeat("e", 64) },
+		"session":           func(c *HostChallenge) { c.SessionDigest = strings.Repeat("e", 64) },
+		"operation":         func(c *HostChallenge) { c.Operation = "backup.create" },
+		"operation schema":  func(c *HostChallenge) { c.OperationSchema++ },
+		"action":            func(c *HostChallenge) { c.Action = "job.cancel" },
+		"plan":              func(c *HostChallenge) { c.PlanID = "fedcba98-7654-3210-fedc-ba9876543210" },
+		"plan digest":       func(c *HostChallenge) { c.PlanDigest = strings.Repeat("e", 64) },
+		"revision":          func(c *HostChallenge) { c.ResourceRevision = strings.Repeat("e", 64) },
+		"request":           func(c *HostChallenge) { c.RequestDigest = strings.Repeat("e", 64) },
+		"policy generation": func(c *HostChallenge) { c.PolicyGeneration = strings.Repeat("e", 64) },
+		"issued":            func(c *HostChallenge) { c.IssuedAt-- },
+		"expiry":            func(c *HostChallenge) { c.ExpiresAt-- },
+	}
+}
+
+func TestStepUpHostChallengeEveryFieldSurvivesCompletionBinding(t *testing.T) {
+	for name, mutate := range stepUpChallengeMutations() {
+		t.Run(name, func(t *testing.T) {
+			f := newStepUpFixture(t)
+			f.binding.Challenge.ExpiresAt-- // leaves one second for a distinct valid earlier issue time
+			_, state := f.begin(t)
+			changed := f.binding
+			mutate(&changed.Challenge)
+			if _, err := f.s.Complete(f.ctx, state, "code", changed); !errors.Is(err, ErrStepUpTransaction) || f.provider.exchanges != 0 || len(f.store.pending) != 1 {
+				t.Fatal("changed host challenge consumed or exchanged original transaction")
+			}
+			id, access := f.tokenClaims()
+			f.setTokens(id, access)
+			evidence, err := f.s.Complete(f.ctx, state, "code", f.binding)
+			if err != nil || evidence.binding.Challenge != f.binding.Challenge || evidence.idToken != f.provider.tokens.IDToken {
+				t.Fatal("exact host challenge did not retain private token pair")
+			}
+		})
+	}
+}
+
+func TestStepUpHostChallengeMissingActorPolicyOrExpiryRefusesBeforePAR(t *testing.T) {
+	for _, mode := range []string{"missing", "subject", "session", "policy", "unconfigured policy", "expired", "future", "outlasts plan"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newStepUpFixture(t)
+			switch mode {
+			case "missing":
+				f.binding.Challenge = HostChallenge{}
+			case "subject":
+				f.binding.Challenge.SubjectDigest = strings.Repeat("e", 64)
+			case "session":
+				f.binding.Challenge.SessionDigest = strings.Repeat("e", 64)
+			case "policy":
+				f.binding.Challenge.PolicyGeneration = strings.Repeat("e", 64)
+			case "unconfigured policy":
+				f.s.config.PolicyGenerationSHA = ""
+			case "expired":
+				f.binding.Challenge.ExpiresAt = f.at.Unix()
+			case "future":
+				f.binding.Challenge.IssuedAt = f.at.Add(time.Second).Unix()
+			case "outlasts plan":
+				f.binding.ExpiresAt = f.at.Add(10 * time.Second)
+			}
+			if _, err := f.s.Begin(f.ctx, f.binding); err == nil || f.provider.params != nil || len(f.store.pending) != 0 {
+				t.Fatal("unbound host challenge reached PAR or persistence")
+			}
+		})
+	}
+}
+
+func TestStepUpHostActorUsesReadOnlyPlanDomainHashes(t *testing.T) {
+	f := newStepUpFixture(t)
+	original, _ := CurrentSession(f.ctx)
+	subjectJSON, _ := json.Marshal([]string{"nebulalog.host-plan.subject.v1", original.issuer, original.client, original.subject})
+	wantSubject := digestStepUp(string(subjectJSON))
+	sessionJSON, _ := json.Marshal([]string{"nebulalog.host-plan.session.v1", wantSubject, original.sid})
+	wantSession := digestStepUp(string(sessionJSON))
+	actor, _, err := f.s.actor(f.ctx, f.at)
+	if err != nil || actor.SessionDigest != wantSession || f.binding.Challenge.SubjectDigest != wantSubject || actor.SessionDigest == digestStepUp(original.sid) {
+		t.Fatal("host-control actor domain separation changed")
+	}
 }
 
 // Keep the package's context key distinct from the signing-key local variable.
@@ -220,7 +316,7 @@ func TestStepUpBeginCreatesPrivateActionBoundPAR(t *testing.T) {
 		t.Fatal("essential ACR missing")
 	}
 	original, _ := CurrentSession(f.ctx)
-	if p.Actor.SessionDigest != digestStepUp(original.sid) || p.Actor.Subject != original.subject || p.Binding != f.binding || p.PolicyDigest != f.s.policyDigest() {
+	if p.Nonce != f.binding.Challenge.Nonce || p.Actor.SessionDigest != f.binding.Challenge.SessionDigest || p.Actor.Subject != original.subject || p.Binding != f.binding || p.PolicyDigest != f.s.policyDigest() {
 		t.Fatal("stored bindings differ")
 	}
 	if !start.ExpiresAt.Equal(f.at.Add(120 * time.Second)) {
@@ -247,7 +343,8 @@ func TestStepUpCompleteReturnsSeparateSessionsAndRedactsEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	original, _ := CurrentSession(f.ctx)
-	if evidence.original.SessionDigest != digestStepUp(original.sid) || evidence.session.sid != "new-step-up-session" || evidence.session.sid == original.sid || evidence.binding != f.binding {
+	if evidence.original.SessionDigest != f.binding.Challenge.SessionDigest || evidence.session.sid != "new-step-up-session" || evidence.session.sid == original.sid || evidence.binding != f.binding ||
+		evidence.idToken != f.provider.tokens.IDToken || evidence.accessToken != f.provider.tokens.AccessToken {
 		t.Fatal("original and new session binding lost")
 	}
 	if !evidence.expiresAt.Equal(f.at.Add(30 * time.Second)) {
@@ -261,7 +358,7 @@ func TestStepUpCompleteReturnsSeparateSessionsAndRedactsEvidence(t *testing.T) {
 			t.Fatal("private evidence serializes")
 		}
 		text := fmt.Sprintf("%v %+v %#v", private, private, private)
-		for _, secret := range []string{original.sid, original.subject, "new-step-up-session", f.provider.tokens.AccessToken} {
+		for _, secret := range []string{original.sid, original.subject, "new-step-up-session", f.provider.tokens.IDToken, f.provider.tokens.AccessToken} {
 			if strings.Contains(text, secret) {
 				t.Fatal("private evidence appears in formatting")
 			}
@@ -499,7 +596,7 @@ func TestStepUpRejectsSignedTokenSubstitutionAndWeakerAssurance(t *testing.T) {
 }
 
 func TestStepUpBeginCapsExpiryAndRejectsInvalidPAR(t *testing.T) {
-	for _, mode := range []string{"original expiry", "plan expiry", "review expiry", "PAR expiry", "empty PAR", "bare PAR prefix", "short PAR suffix", "invalid PAR suffix", "external PAR", "zero PAR lifetime", "negative PAR lifetime", "excessive PAR lifetime", "push timeout", "push clock rollback", "unreviewed", "invalid plan"} {
+	for _, mode := range []string{"original expiry", "plan expiry", "host challenge expiry", "review expiry", "PAR expiry", "empty PAR", "bare PAR prefix", "short PAR suffix", "invalid PAR suffix", "external PAR", "zero PAR lifetime", "negative PAR lifetime", "excessive PAR lifetime", "push timeout", "push clock rollback", "unreviewed", "invalid plan"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newStepUpFixture(t)
 			want := f.at.Add(17 * time.Second)
@@ -511,6 +608,9 @@ func TestStepUpBeginCapsExpiryAndRejectsInvalidPAR(t *testing.T) {
 				f.ctx = context.WithValue(f.ctx, sessionKey{}, v)
 			case "plan expiry":
 				f.binding.ExpiresAt = want
+				f.binding.Challenge.ExpiresAt = want.Unix()
+			case "host challenge expiry":
+				f.binding.Challenge.ExpiresAt = want.Unix()
 			case "review expiry":
 				f.s.config.Policy.ReviewExpiresAt = want
 			case "PAR expiry":

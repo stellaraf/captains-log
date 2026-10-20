@@ -143,8 +143,9 @@ def inspect(g):
         if root in ("/dev/mapper/system-root", "/dev/system/root"):
             root_options.update(("root=/dev/mapper/system-root", "root=/dev/system/root"))
         if (len(roots) != 1 or roots[0] not in root_options
-                or [token for token in options if token.startswith("fips=")] != ["fips=1"]):
-            raise ValueError("BLS options must bind this root and keep FIPS enabled")
+                or [token for token in options if token.startswith("fips=")] != ["fips=1"]
+                or [token for token in options if token.startswith("module.sig_enforce=")] != ["module.sig_enforce=1"]):
+            raise ValueError("BLS options must bind this root and enforce FIPS and signed modules")
         kernels.append(fields["linux"])
     return {"architecture": "x86_64", "partition_table": "gpt", "esp_type": ESP_TYPE,
             "boot_uuid": boot_uuid, "root_uuid": root_uuid, "efi_file_sha256": digests,

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import ExitStack
 import copy
 import hashlib
 import ipaddress
@@ -16,13 +17,16 @@ from pathlib import Path
 import re
 import secrets
 import ssl
+import stat
 import time
+import uuid
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, quote, urlsplit
 from urllib.request import HTTPSHandler, HTTPRedirectHandler, Request, build_opener
 
 from .common import CommandFailed, Refused, atomic_json, audit, locked, run, trusted_file
 from .firstboot import FirstBoot, Locations, FINAL_CHECKS, RUNTIME_CHECKS, _private_dir, _private_file, _write_bytes
+from .identity_scopes import configure_service_roles
 
 IMAGES = {"NEBULALOG_IMAGE", "POSTGRESQL_IMAGE", "CLICKHOUSE_IMAGE", "KEYCLOAK_FIPS_IMAGE"}
 IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]+@sha256:[0-9a-f]{64}")
@@ -36,7 +40,61 @@ EDGE_TEMPLATE = Path("/usr/share/nebulalog/httpd/nebulalog.conf.in")
 EDGE_CONFIG = Path("/etc/httpd/conf.d/nebulalog.conf")
 INITIAL_RELEASE = Path("/usr/share/nebulalog/initial-release.json")
 ENROLL_RELEASE = Path("/usr/libexec/nebulalog/enroll-installed-release")
+SYSTEMD = Path("/etc/systemd/system")
+LISTENERS = ("keycloak", "api", "ingest", "edge")
 
+
+def _digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+
+def _storage_query_id(operation, phase):
+    raw = bytearray(hashlib.sha256(("captains-log/storage-init/" + operation + "/" + phase).encode()).digest()[:16])
+    raw[6], raw[8] = (raw[6] & 15) | 0x50, (raw[8] & 63) | 0x80
+    return str(uuid.UUID(bytes=bytes(raw)))
+
+
+def valid_fresh_enrollment_state(state, paths, binding, *, complete=False):
+    """Validate protected pre-enrollment authority, not runtime acceptance."""
+    from .aide import RUNTIME_STAGES
+    from .fresh_database import _database
+    from .image_bundle import ApplicationSchema, strict_json
+    try:
+        root = paths.data / "configuration/bootstrap"
+        if strict_json(_private_file(root / "runtime-state.json", maximum=1024**2)) != state:
+            return False
+        operation = state.get("operation")
+        required = RUNTIME_STAGES if complete else RUNTIME_STAGES - {"installed-release"}
+        completed = state.get("completed")
+        if (state.get("kind") != "fresh-schema4" or state.get("factory_binding") != binding
+                or binding.get("schema_revision") != "4" or binding.get("schema_sha256") != ApplicationSchema.schema_digest("4")
+                or state.get("installation_id") != binding.get("installation_id")
+                or not isinstance(operation, str) or not re.fullmatch(r"[a-f0-9]{64}", operation)
+                or not isinstance(completed, list) or len(set(completed)) != len(completed)
+                or not required <= set(completed) or set(completed) - RUNTIME_STAGES
+                or state.get("active_stage") not in ((None,) if complete else (None, "installed-release"))
+                or state.get("identity_initialized") is not True):
+            return False
+        pg, proof, storage = state["fresh_postgres"], state["schema_proof"], state["fresh_storage"]
+        expected_pg = {key: binding[key] for key in ("installation_id", "source_snapshot_sha256", "schema_revision", "schema_sha256")}
+        expected_pg["image"] = binding["images"]["NEBULALOG_IMAGE"]
+        if (pg.get("binding") != expected_pg or pg.get("phase") != "complete" or _database(pg["database"]) != proof.get("database")
+                or proof.get("schema_revision") != "4" or proof.get("schema_sha256") != binding["schema_sha256"]
+                or proof.get("profile") != "host-stepup-v2" or proof.get("markers") != []
+                or proof.get("catalog_sha256") != state["postgres_proof"]["catalog_sha256"]
+                or storage.get("phase") != "released" or storage.get("operation") != operation
+                or storage.get("factory_binding_sha256") != _digest(binding)
+                or proof.get("retention", {}).get("table_uuid") != storage.get("table_uuid")
+                or proof["retention"].get("mode") != "partition" or proof["retention"].get("ttl") is not False):
+            return False
+        for phase in ("identity", "listeners"):
+            expected = {"schema":1,"operation":operation,"phase":phase,"factory_binding_sha256":_digest(binding),"schema_proof_sha256":_digest(proof)}
+            if strict_json(_private_file(root / (phase + "-ready.json"), maximum=4096)) != expected:
+                return False
+        return True
+    except (Refused, OSError, ValueError, KeyError, TypeError):
+        return False
 
 def image_pins(value):
     if not isinstance(value, dict) or set(value) != IMAGES or any(not isinstance(ref, str) or not IMAGE.fullmatch(ref) for ref in value.values()):
@@ -105,6 +163,9 @@ class Bootstrap:
         self.setup = {}
         self.secret = {}
         self.runtime = {}
+        self.factory = None
+        self.systemd = SYSTEMD
+        self.native_commands = runner is run
 
     def _read(self, path):
         return json.loads(_private_file(path, maximum=1024 * 1024))
@@ -136,6 +197,8 @@ class Bootstrap:
             atomic_json(runtime_path, self.runtime)
 
     def _stage(self, name, operation):
+        if self.state.get("kind") == "fresh-schema4" and name in self.state["completed"]:
+            return
         self.state["active_stage"] = name
         atomic_json(self.state_path, self.state)
         result = operation()
@@ -144,6 +207,277 @@ class Bootstrap:
         self.state["active_stage"] = None
         atomic_json(self.state_path, self.state)
         audit(self.paths.bootstrap / "audit.jsonl", "bootstrap.stage", installation_id=self.setup["installation_id"], stage=name)
+        return result
+
+    def _enrollment(self):
+        from .update_enrollment import UpdateEnrollment
+        return UpdateEnrollment(data=self.paths.data, etc=self.paths.etc,
+            share=INITIAL_RELEASE.parent, runner=self.runner, firstboot=self.firstboot)
+
+    def _factory_inputs(self):
+        factory = self._enrollment().verify_initialization_inputs()
+        binding = factory["binding"]
+        if binding["schema_revision"] != "4":
+            raise Refused("Fresh schema4 preparation requires its exact factory profile")
+        if "factory_binding" in self.state:
+            if self.state["factory_binding"] != binding or self.state.get("kind") != "fresh-schema4":
+                raise Refused("Fresh runtime factory identity changed")
+        else:
+            if self.state.get("completed") or self.state.get("active_stage"):
+                raise Refused("Existing runtime cannot be adopted as fresh schema4")
+            if self.firstboot.gate().get("setup_complete") is not False:
+                raise Refused("Completed setup cannot initialize a fresh database")
+            for name in ("postgresql", "clickhouse", "clickhouse-logs", "keycloak", "containers", "spool", "runtime", "exports"):
+                path = self.paths.data / name
+                if path.is_symlink() or path.exists() and (not path.is_dir() or any(path.iterdir())):
+                    raise Refused("Fresh schema4 refuses unowned existing runtime data")
+            self.state.update(kind="fresh-schema4", factory_binding=binding,
+                operation=uuid.uuid4().hex + uuid.uuid4().hex, setup_sha256=_digest(self.setup))
+            atomic_json(self.state_path, self.state)  # Before fences, units or database effects.
+        if (not re.fullmatch(r"[a-f0-9]{64}", str(self.state.get("operation", "")))
+                or self.state.get("setup_sha256") != _digest(self.setup)):
+            raise Refused("Fresh runtime operation or original setup changed")
+        self.factory = factory
+        self.pins = image_pins(binding["images"])
+        return factory
+
+    def _token_proof(self, phase):
+        return {"schema": 1, "operation": self.state["operation"], "phase": phase,
+            "factory_binding_sha256": _digest(self.state["factory_binding"]),
+            "schema_proof_sha256": _digest(self.state.get("schema_proof"))}
+
+    def _listener_fence(self):
+        """Install owned boot-persistent barriers before publishing any Quadlet."""
+        from .update_enrollment import _tree
+        _tree(self.systemd)
+        for name in LISTENERS:
+            phase = "identity" if name == "keycloak" else "listeners"
+            token = self.bootstrap / (phase + "-ready.json")
+            body = ("[Unit]\nConditionPathExists=" + str(token) + "\n").encode()
+            directory = self.systemd / ("nebulalog-" + name + ".service.d")
+            if not os.path.lexists(directory):
+                directory.mkdir(mode=0o755)
+            _tree(directory)
+            target = directory / "80-nebulalog-bootstrap.conf"
+            if os.path.lexists(target):
+                if trusted_file(target).read_bytes() != body:
+                    raise Refused("Fresh listener fence belongs to another operation")
+            else:
+                _write_bytes(target, body, 0o644)
+        self.runner(["systemctl", "daemon-reload"])
+
+    def _hold_listeners(self):
+        self._listener_fence()
+        for phase in ("identity", "listeners"):
+            token = self.bootstrap / (phase + "-ready.json")
+            if os.path.lexists(token):
+                value = self._read(token)
+                expected = self._token_proof(phase)
+                if (not isinstance(value, dict) or set(value) != set(expected)
+                        or any(value[key] != expected[key] for key in ("schema", "operation", "phase", "factory_binding_sha256"))
+                        or not re.fullmatch(r"[a-f0-9]{64}", str(value.get("schema_proof_sha256", "")))):
+                    raise Refused("Fresh listener token differs from retained preparation")
+                token.unlink()
+                fd = os.open(self.bootstrap, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        for name in LISTENERS:
+            service = "nebulalog-" + name + ".service"
+            observed = self.runner(["systemctl", "show", "--property=ActiveState", "--value", service])
+            if observed != "inactive":
+                if name != "edge":
+                    key = "KEYCLOAK_FIPS_IMAGE" if name == "keycloak" else "NEBULALOG_IMAGE"
+                    self._enrollment()._container(name, self.factory["bundle"]["images"][key])
+                self.runner(["systemctl", "stop", service], timeout=180)
+            if self.runner(["systemctl", "show", "--property=ActiveState", "--value", service]) != "inactive":
+                raise Refused("Fresh preparation listeners did not stop")
+
+    def _dependency(self, component):
+        from .log_backup import VERSION as CLICKHOUSE_VERSION
+
+        enrollment = self._enrollment()
+        enrollment.verify_initialization_image(self.factory, component)
+        key = "POSTGRESQL_IMAGE" if component == "postgresql" else "CLICKHOUSE_IMAGE"
+        expected = self.factory["bundle"]["images"][key]
+        before = enrollment._container(component, expected)
+        version = enrollment._version(component)
+        required = "17.11" if component == "postgresql" else CLICKHOUSE_VERSION
+        if version != required or enrollment._container(component, expected) != before:
+            raise Refused("Fresh database server differs from its fixed version and container")
+        return {"container_id": before, "version": version, "image": self.pins[key], "config_digest": expected["config_digest"]}
+
+    def _fresh_pg(self, sql):
+        return self.runner(["podman", "exec", "-i", "--user", "999:999", "nebulalog-postgresql",
+            "psql", "-X", "--no-password", "--host=/var/run/postgresql", "--username=postgres",
+            "--dbname=nebulalog", "--single-transaction", "--quiet", "--tuples-only", "--no-align",
+            "--set=ON_ERROR_STOP=1"], input=sql.encode(), timeout=120)
+
+    def _fresh_ch(self, sql):
+        return self.runner(["podman", "exec", "--user", "101:101", "nebulalog-clickhouse", "clickhouse-client",
+            "--config-file=/etc/nebulalog/clickhouse-client.xml", "--max_execution_time=30", "--query", sql], timeout=45)
+
+    def _storage_hold(self, held):
+        from nebulalog_adapters.lifecycle import STORAGE_LOCK
+        from .image_bundle import strict_json
+        operation = self.state["operation"]
+        idle = {"schema": 1, "held": False, "delivery_held": False, "operation": None}
+        owned = {"schema": 1, "held": True, "delivery_held": True, "operation": operation}
+        path = self.paths.data / "manager/storage-maintenance/gate.json"
+        prior = strict_json(trusted_file(path).read_bytes())
+        if prior not in (idle, owned):
+            raise Refused("Fresh storage hold belongs to another operation")
+        if not held and self.state.get("fresh_storage", {}).get("phase") not in ("initialized", "released"):
+            raise Refused("Uninitialized storage cannot release its fence")
+        _write_bytes(path, (json.dumps(owned) + "\n").encode(), 0o644)
+        desired = owned if held else idle
+        # Only fixed JSON and a generated hex operation enter SQL. This guard
+        # admits the initial idle state or the exact operation's own retry.
+        query = f"""SET LOCAL search_path=pg_catalog; SET LOCAL lock_timeout='15s'; SET LOCAL statement_timeout='60s';
+DO $fresh$ DECLARE gate jsonb; BEGIN
+ PERFORM pg_advisory_xact_lock({STORAGE_LOCK});
+ SELECT value INTO gate FROM public.settings WHERE key='storage_emergency_maintenance' FOR UPDATE;
+ IF gate NOT IN ('{json.dumps(idle)}'::jsonb,'{json.dumps(owned)}'::jsonb) OR gate IS NULL
+ THEN RAISE EXCEPTION 'Foreign initialization hold'; END IF;
+ IF EXISTS(SELECT FROM public.storage_emergency_actions WHERE completed_at IS NULL)
+ OR EXISTS(SELECT FROM public.retention_actions WHERE completed_at IS NULL)
+ OR EXISTS(SELECT FROM public.storage_emergency_inserts)
+ OR (SELECT value->>'mode' FROM public.settings WHERE key='retention_engine') NOT IN ('uninitialized','partition')
+ THEN RAISE EXCEPTION 'Unsettled initialization storage'; END IF;
+ UPDATE public.settings SET value='{json.dumps(desired)}'::jsonb WHERE key='storage_emergency_maintenance';
+END $fresh$;
+SELECT value::text FROM public.settings WHERE key='storage_emergency_maintenance';
+"""
+        if strict_json(self._fresh_pg(query).encode()) != desired:
+            raise Refused("Fresh database storage hold failed readback")
+        _write_bytes(path, (json.dumps(desired) + "\n").encode(), 0o644)
+
+    def _fresh_policy(self):
+        """Apply original setup once, with a transaction marker for lost ACKs."""
+        from nebulalog_adapters.lifecycle import STORAGE_LOCK
+        days = self.setup["retention_days"]
+        if type(days) is not int or not 1 <= days <= 36500:
+            raise Refused("Invalid fresh retention duration")
+        marker = "bootstrap_retention:" + self.state["operation"]
+        value = {"schema": 1, "operation": self.state["operation"], "global_days": days}
+        self.state.setdefault("retention_policy_intent", value)
+        if self.state["retention_policy_intent"] != value:
+            raise Refused("Original retention initialization changed")
+        atomic_json(self.state_path, self.state)
+        # A matching marker proves this one transaction committed. A retry never
+        # rewrites policy, including administrator changes made after activation.
+        query = f"""SET LOCAL search_path=pg_catalog; SET LOCAL lock_timeout='15s'; SET LOCAL statement_timeout='60s';
+DO $policy$ DECLARE prior jsonb; BEGIN
+ PERFORM pg_advisory_xact_lock({STORAGE_LOCK});
+ IF (SELECT value FROM public.settings WHERE key='storage_emergency_maintenance') IS DISTINCT FROM
+ '{json.dumps({"schema":1,"held":True,"delivery_held":True,"operation":self.state["operation"]})}'::jsonb
+ THEN RAISE EXCEPTION 'Missing initialization hold'; END IF;
+ SELECT value INTO prior FROM public.settings WHERE key='{marker}';
+ IF prior IS NULL THEN
+  UPDATE public.settings SET value=jsonb_set(value,'{{global_days}}','{days}'::jsonb) WHERE key='retention';
+  IF NOT FOUND THEN RAISE EXCEPTION 'Missing retention policy'; END IF;
+  INSERT INTO public.settings(key,value) VALUES('{marker}','{json.dumps(value)}'::jsonb);
+ ELSIF prior IS DISTINCT FROM '{json.dumps(value)}'::jsonb THEN RAISE EXCEPTION 'Foreign initialization policy'; END IF;
+END $policy$;
+SELECT 'fresh-policy-bound';
+"""
+        if self._fresh_pg(query) != "fresh-policy-bound":
+            raise Refused("Fresh retention policy initialization failed readback")
+
+    def _fresh_schema(self):
+        from .fresh_database import FreshPostgres
+        from .image_bundle import ApplicationSchema, strict_json
+        from nebulalog_adapters.lifecycle import _observe_ready_application_catalog
+        self._factory_inputs()  # Reauthenticate immutable authority before DDL.
+        self._dependency("postgresql")
+        binding = self.state["factory_binding"]
+        pg_binding = {key: binding[key] for key in ("installation_id", "source_snapshot_sha256", "schema_revision", "schema_sha256")}
+        pg_binding["image"] = self.pins["NEBULALOG_IMAGE"]
+        if "migrations" not in self.state["completed"]:
+            proof = FreshPostgres(self.runner).initialize(pg_binding, self.state, lambda: atomic_json(self.state_path, self.state))
+            self.state["postgres_proof"] = proof
+            atomic_json(self.state_path, self.state)
+        self._clickhouse()
+        instance = self._dependency("clickhouse")
+        # Container identity alone does not survive an unobserved restart.
+        raw = strict_json(self.runner(["podman", "container", "inspect", "nebulalog-clickhouse"]).encode())[0]
+        state = raw.get("State", {})
+        if (state.get("Running") is not True or state.get("Paused") is not False or state.get("Restarting") is not False
+                or not isinstance(state.get("StartedAt"), str) or not state["StartedAt"].endswith("Z")):
+            raise Refused("Fresh ClickHouse process identity is incomplete")
+        instance.update(started_at=state["StartedAt"], restart_count=raw.get("RestartCount"))
+        self._storage_hold(True)
+        self._fresh_policy()
+        sql_sha = ApplicationSchema.SCHEMAS["4"]["migrations/clickhouse.sql"]
+        storage = self.state.get("fresh_storage")
+        if storage is None:
+            if self._fresh_ch("SELECT count() FROM system.tables WHERE database='nebulalog' AND name='events'") != "0":
+                raise Refused("Fresh storage refuses an unowned existing events table")
+            storage = {"schema": 1, "operation": self.state["operation"], "factory_binding_sha256": _digest(binding),
+                "instance": instance, "schema_sql_sha256": sql_sha, "table_uuid": str(uuid.uuid4()), "absent_observed": True, "phase": "intent",
+                "database_query_id": _storage_query_id(self.state["operation"], "database"), "table_query_id": _storage_query_id(self.state["operation"], "table")}
+            self.state["fresh_storage"] = storage
+            atomic_json(self.state_path, self.state)  # UUID and absent observation precede DDL.
+        if (storage.get("operation") != self.state["operation"] or storage.get("factory_binding_sha256") != _digest(binding)
+                or storage.get("instance") != instance or storage.get("schema_sql_sha256") != sql_sha
+                or storage.get("absent_observed") is not True or storage.get("phase") not in ("intent", "initialized", "released")
+                or any(storage.get(phase + "_query_id") != _storage_query_id(self.state["operation"], phase) for phase in ("database", "table"))
+                or str(uuid.UUID(storage["table_uuid"])) != storage["table_uuid"] or uuid.UUID(storage["table_uuid"]).int == 0):
+            raise Refused("Fresh storage server or retained intent changed; recovery is required")
+        if storage["phase"] == "intent":
+            gate = self.paths.data / "manager/storage-maintenance"
+            command = ["podman", "run", "--rm", "--name", "nebulalog-initial-storage", "--network", "nebulalog", "--read-only",
+                "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--volume",
+                str(self.tls / "trust-bundle.pem") + ":/etc/nebulalog/tls/trust-bundle.pem:ro,z", "--volume",
+                str(gate) + ":/run/nebulalog-storage-maintenance:ro,z", "--env-file", str(self.configuration / "runtime/api.env")]
+            for key, value in {"STORAGE_INITIALIZATION_OPERATION": storage["operation"], "STORAGE_INITIALIZATION_TABLE_UUID": storage["table_uuid"],
+                    "STORAGE_INITIALIZATION_SCHEMA_SHA256": sql_sha, "STORAGE_MAINTENANCE_PATH": "/run/nebulalog-storage-maintenance/gate.json"}.items():
+                command += ["--env", key + "=" + value]
+            result = strict_json(self.runner([*command, self.pins["NEBULALOG_IMAGE"], "initialize-storage"], timeout=120).encode())
+            fields = {"schema", "operation", "table_uuid", "schema_sql_sha256", "ddl_sha256", "retention_policy_sha256", "database_query_id", "table_query_id", "state"}
+            if (not isinstance(result, dict) or set(result) != fields or result["schema"] != 1 or result["state"] != "initialized"
+                    or any(result[key] != storage[key] for key in ("operation", "table_uuid", "schema_sql_sha256"))
+                    or any(not re.fullmatch(r"[a-f0-9]{64}", str(result[key])) for key in ("ddl_sha256", "retention_policy_sha256"))
+                    or any(result[phase + "_query_id"] != storage[phase + "_query_id"] for phase in ("database", "table"))):
+                raise Refused("Fresh storage did not return its exact owned completion proof")
+            storage.update(phase="initialized", result=result)
+            atomic_json(self.state_path, self.state)
+        proof = _observe_ready_application_catalog(self.runner, "4", self.state["operation"], data=self.paths.data, configuration=self.configuration)
+        if (proof["database"] != self.state["postgres_proof"]["database"]
+                or proof["catalog_sha256"] != self.state["postgres_proof"]["catalog_sha256"]
+                or proof["retention"]["table_uuid"] != storage["table_uuid"]):
+            raise Refused("Independent fresh database proof differs from initialized storage")
+        engine = strict_json(self._fresh_pg("SELECT value::text FROM public.settings WHERE key='retention_engine';").encode())
+        if engine.get("operation") != storage["operation"] or engine.get("table_uuid") != storage["table_uuid"]:
+            raise Refused("Fresh retention engine lost its initialization owner")
+        if proof["retention"]["ddl_sha256"] != storage["result"]["ddl_sha256"]:
+            raise Refused("Fresh physical DDL differs from the storage command proof")
+        storage["phase"] = "initialized"
+        self.state["schema_proof"] = proof
+        atomic_json(self.state_path, self.state)
+
+    def _verify_prepared(self):
+        from nebulalog_adapters.lifecycle import _observe_fixed_pg_catalog
+        self._factory_inputs()
+        if not valid_fresh_enrollment_state(self.state, self.paths, self.factory["binding"], complete=True):
+            raise Refused("Completed fresh preparation lost its retained authority")
+        for component in ("nebulalog", "postgresql", "clickhouse", "keycloak"):
+            self._enrollment().verify_initialization_image(self.factory, component)
+        proof = _observe_fixed_pg_catalog(self.runner, "4", self.state["operation"])
+        if any(proof[key] != self.state["schema_proof"][key] for key in ("schema_revision", "schema_sha256", "catalog_sha256", "database")):
+            raise Refused("Completed fresh catalog differs from its retained proof")
+        from .image_bundle import strict_json
+        engine = strict_json(self._fresh_pg("SELECT value::text FROM public.settings WHERE key='retention_engine';").encode())
+        physical = strict_json(self._fresh_ch("SELECT toString(uuid) AS uuid,create_table_query FROM system.tables WHERE database='nebulalog' AND name='events' SETTINGS show_table_uuid_in_table_create_query_if_not_nil=0 FORMAT JSONEachRow").encode())
+        retained = self.state["schema_proof"]["retention"]
+        if (engine.get("mode") != "partition" or engine.get("table_uuid") != retained["table_uuid"]
+                or physical.get("uuid") != retained["table_uuid"]
+                or hashlib.sha256(physical.get("create_table_query", "").encode()).hexdigest() != retained["ddl_sha256"]):
+            raise Refused("Completed fresh physical retention identity changed")
+        result = self._evidence()
+        if not all(result["checks"].get(key) is True for key in RUNTIME_CHECKS):
+            raise Refused("Completed runtime failed current readiness verification")
         return result
 
     def _directories(self):
@@ -167,6 +501,86 @@ class Bootstrap:
         info = json.loads(self.runner(["podman", "info", "--format", "json"]))
         if Path(info["store"]["graphRoot"]) != self.paths.data / "containers":
             raise Refused("Podman graphroot must be on the encrypted data mount before creating containers or secrets")
+
+    def _storage_maintenance(self):
+        """Create the fresh host fence once; retained gates are evidence, not defaults."""
+        from .image_bundle import strict_json
+
+        fresh = set(self.state.get("completed", [])) <= {"directories"}
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+        def directory(info, mode=None):
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
+                    or info.st_mode & 0o022 or mode is not None and stat.S_IMODE(info.st_mode) != mode):
+                raise Refused("Storage maintenance directory must be root-owned with safe permissions")
+
+        try:
+            with ExitStack() as stack:
+                def opened(name, flags, **kwargs):
+                    fd = os.open(name, flags, **kwargs)
+                    stack.callback(os.close, fd)
+                    return fd
+
+                data = opened(self.paths.data, directory_flags)
+                directory(os.fstat(data))
+                try:
+                    manager = opened("manager", directory_flags, dir_fd=data)
+                except FileNotFoundError:
+                    if not fresh:
+                        raise Refused("Existing runtime lost its storage maintenance evidence")
+                    os.mkdir("manager", 0o700, dir_fd=data)
+                    os.fsync(data)
+                    manager = opened("manager", directory_flags, dir_fd=data)
+                directory(os.fstat(manager))
+                created = False
+                try:
+                    gate_dir = opened("storage-maintenance", directory_flags, dir_fd=manager)
+                except FileNotFoundError:
+                    if not fresh:
+                        raise Refused("Existing runtime lost its storage maintenance evidence")
+                    os.mkdir("storage-maintenance", 0o755, dir_fd=manager)
+                    gate_dir = opened("storage-maintenance", directory_flags, dir_fd=manager)
+                    os.fchmod(gate_dir, 0o755)
+                    os.fchown(gate_dir, 0, 0)
+                    os.fsync(manager)
+                    created = True
+                directory(os.fstat(gate_dir), 0o755)
+                if created:
+                    gate = {"schema": 1, "held": False, "delivery_held": False, "operation": None}
+                    raw = (json.dumps(gate, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                    output = opened("gate.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                    dir_fd=gate_dir, mode=0o644)
+                    os.fchmod(output, 0o644)
+                    os.fchown(output, 0, 0)
+                    with os.fdopen(os.dup(output), "wb") as stream:
+                        stream.write(raw)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.fsync(gate_dir)
+                source = opened("gate.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=gate_dir)
+                before = os.fstat(source)
+                if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_gid != 0
+                        or stat.S_IMODE(before.st_mode) != 0o644 or before.st_nlink != 1
+                        or not 1 <= before.st_size <= 4096):
+                    raise Refused("Storage maintenance gate must be a bounded root-owned regular file with mode 0644")
+                raw = os.read(source, 4097)
+                after = os.fstat(source)
+                if len(raw) != before.st_size or any(getattr(before, key) != getattr(after, key)
+                        for key in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")):
+                    raise Refused("Storage maintenance gate changed while being read")
+                gate = strict_json(raw)
+                if (not isinstance(gate, dict) or set(gate) != {"schema", "held", "delivery_held", "operation"}
+                        or type(gate["schema"]) is not int or gate["schema"] != 1
+                        or type(gate["held"]) is not bool or type(gate["delivery_held"]) is not bool
+                        or gate["held"] and (not isinstance(gate["operation"], str)
+                            or not re.fullmatch(r"[a-f0-9]{64}", gate["operation"]))
+                        or not gate["held"] and (gate["delivery_held"] or gate["operation"] is not None)):
+                    raise Refused("Storage maintenance gate has an invalid schema or operation owner")
+        except OSError as exc:
+            raise Refused("Storage maintenance evidence is missing or unsafe; bootstrap cannot reset it") from exc
+        if created:
+            self.runner(["restorecon", "-RF", str(self.paths.data / "manager/storage-maintenance")])
+        return gate
 
     def _certificates(self):
         names = {self.setup["hostname"], "localhost", "keycloak", "clickhouse"}
@@ -233,6 +647,8 @@ class Bootstrap:
 
     def _images(self):
         pins = image_pins(json.loads(trusted_file(self.paths.etc / "images.json").read_text()))
+        if self.state.get("kind") == "fresh-schema4" and pins != self.state["factory_binding"]["images"]:
+            raise Refused("Quadlet image selection differs from admitted factory inputs")
         templates = Path("/usr/share/nebulalog/quadlet-templates")
         output = Path("/etc/containers/systemd")
         output.mkdir(parents=True, exist_ok=True)
@@ -258,6 +674,9 @@ class Bootstrap:
                 self.runner(["podman", "pull", reference], timeout=1800)
         self.runner(["systemctl", "daemon-reload"])
         self.pins = pins
+        if self.state.get("kind") == "fresh-schema4":
+            for component in ("nebulalog", "postgresql", "clickhouse", "keycloak"):
+                self._enrollment().verify_initialization_image(self.factory, component)
 
     def _environment(self):
         public = "https://" + self.setup["hostname"]
@@ -269,6 +688,16 @@ class Bootstrap:
             "api": {**shared, "COLLECTOR_TLS_CA_PATH": "/etc/nebulalog/tls/ca.crt", "COLLECTOR_TLS_CERT_PATH": "/etc/nebulalog/tls/server.crt", "OIDC_ISSUER": public + "/realms/nebulalog", "OIDC_BACKCHANNEL_URL": "https://keycloak:8443", "OIDC_URL": public, "OIDC_REALM": "nebulalog", "OIDC_CLIENT_ID": "nebulalog", "IDENTITY_ADMIN_URL": "https://keycloak:8443", "IDENTITY_CLIENT_ID": "nebulalog-identity-manager", "IDENTITY_CLIENT_SECRET": self.secret["identity_service"], "IDENTITY_ENABLE_WRITES": "true"},
             "ingest": {**shared, "SYSLOG_CERT": "/etc/nebulalog/tls/server.crt", "SYSLOG_KEY": "/etc/nebulalog/tls/server.key", "PANOS_TIMEZONE": self.setup["maintenance"]["timezone"]},
         }
+        restore_auth = self.bootstrap / "restore-auth.json"
+        if os.path.lexists(restore_auth):
+            cutoff = self._read(restore_auth)
+            if (not isinstance(cutoff, dict) or set(cutoff) != {"schema", "installation_id", "operation", "token_not_before"}
+                    or type(cutoff["schema"]) is not int or cutoff["schema"] != 1
+                    or cutoff["installation_id"] != self.setup["installation_id"]
+                    or not isinstance(cutoff["operation"], str) or not re.fullmatch(r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}", cutoff["operation"])
+                    or type(cutoff["token_not_before"]) is not int or not 1577836800 <= cutoff["token_not_before"] < 2**31):
+                raise Refused("Restored authentication cutoff differs from this appliance")
+            configs["api"]["OIDC_TOKEN_NOT_BEFORE"] = str(cutoff["token_not_before"])
         directory = self.configuration / "runtime"
         directory.mkdir(mode=0o700, exist_ok=True)
         for name, values in configs.items():
@@ -316,9 +745,13 @@ class Bootstrap:
                 time.sleep(2)
 
     def _postgres(self):
+        if self.state.get("kind") == "fresh-schema4":
+            self._enrollment().verify_initialization_image(self.factory, "postgresql")
         self.runner(["systemctl", "start", "nebulalog-postgresql.service"], timeout=900)
         prefix = ["podman", "exec", "-i", "nebulalog-postgresql", "psql", "--no-psqlrc", "--set", "ON_ERROR_STOP=1", "--username", "postgres", "--dbname", "postgres"]
         self._wait(lambda: self.runner(prefix + ["--tuples-only", "--command", "SELECT 1"]))
+        if self.state.get("kind") == "fresh-schema4":
+            self._dependency("postgresql")
         statements = []
         for role, password_key in (("nebulalog", "postgresql_app"), ("keycloak", "postgresql_keycloak")):
             # Role names are fixed and passwords are validated hex, not arbitrary
@@ -328,12 +761,18 @@ class Bootstrap:
                            f"REVOKE ALL ON DATABASE {role} FROM PUBLIC;",
                            f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{role}' AND rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole) THEN RAISE EXCEPTION 'Unexpected database role privileges'; END IF; END $$;"]
         self.runner(prefix, input=("\n".join(statements) + "\n").encode())
+        if self.state.get("kind") != "fresh-schema4":
+            self._clickhouse()
+
+    def _clickhouse(self):
+        if self.state.get("kind") == "fresh-schema4":
+            self._enrollment().verify_initialization_image(self.factory, "clickhouse")
         self.runner(["systemctl", "start", "nebulalog-clickhouse.service"], timeout=900)
         self._wait(lambda: self.runner(["podman", "exec", "--user", "101:101", "nebulalog-clickhouse", "clickhouse-client", "--config-file", "/etc/nebulalog/clickhouse-client.xml", "--secure", "--port", "9440", "--query", "SELECT 1"]))
 
-    def _migrate(self):
+    def _migrate(self, *, initialize_retention=True):
         self.runner(["podman", "run", "--rm", "--name", "nebulalog-initial-migrate", "--network", "nebulalog", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--volume", str(self.tls / "trust-bundle.pem") + ":/etc/nebulalog/tls/trust-bundle.pem:ro,z", "--env-file", str(self.configuration / "runtime/api.env"), self.pins["NEBULALOG_IMAGE"], "migrate"], timeout=900)
-        if "migrations" not in self.state["completed"]:
+        if initialize_retention and "migrations" not in self.state["completed"]:
             sql = "UPDATE settings SET value=jsonb_set(value, '{global_days}', '" + str(self.setup["retention_days"]) + "'::jsonb) WHERE key='retention';"
             self.runner(["podman", "exec", "-i", "nebulalog-postgresql", "psql", "--no-psqlrc", "--set", "ON_ERROR_STOP=1", "--username", "postgres", "--dbname", "nebulalog"], input=sql.encode())
 
@@ -360,20 +799,22 @@ class Bootstrap:
 
     def _service_identity(self, token, name, secret, allowed):
         clients = self._kc("clients?clientId=" + name, token)
+        if len(clients) > 1:
+            raise Refused("Service identity is ambiguous")
         if clients and clients[0].get("attributes", {}).get("nebulalog-installation") != self.setup["installation_id"]:
             raise Refused("Existing service client is not owned by this installation")
+        configuration = {"clientId": name, "enabled": False, "protocol": "openid-connect", "publicClient": False, "secret": secret, "serviceAccountsEnabled": True, "standardFlowEnabled": False, "implicitFlowEnabled": False, "directAccessGrantsEnabled": False, "defaultClientScopes": ["roles"], "optionalClientScopes": [], "fullScopeAllowed": False, "attributes": {"nebulalog-installation": self.setup["installation_id"], "nebulalog-managed": "true"}}
         if not clients:
-            self._kc("clients", token, "POST", {"clientId": name, "enabled": True, "protocol": "openid-connect", "publicClient": False, "secret": secret, "serviceAccountsEnabled": True, "standardFlowEnabled": False, "directAccessGrantsEnabled": False, "defaultClientScopes": ["roles"], "fullScopeAllowed": True, "attributes": {"nebulalog-installation": self.setup["installation_id"], "nebulalog-managed": "true"}})
+            self._kc("clients", token, "POST", configuration)
             clients = self._kc("clients?clientId=" + name, token)
         if len(clients) != 1:
             raise Refused("Service identity is ambiguous")
-        user = self._kc("clients/" + clients[0]["id"] + "/service-account-user", token)
-        management = self._kc("clients?clientId=realm-management", token)[0]
-        path = "users/" + user["id"] + "/role-mappings/clients/" + management["id"]
-        existing = self._kc(path, token)
-        if {role["name"] for role in existing} - allowed:
-            raise Refused("Service identity has unexpected administration privileges")
-        self._kc(path, token, "POST", [self._kc("clients/" + management["id"] + "/roles/" + name, token) for name in sorted(allowed)])
+        path = "clients/" + clients[0]["id"]
+        self._kc(path, token, "PUT", configuration)
+        configure_service_roles(lambda path, method="GET", body=None: self._kc(path, token, method, body), clients[0]["id"], allowed)
+        self._kc(path, token, "PUT", {"enabled": True})
+        if self._kc(path, token).get("enabled") is not True:
+            raise Refused("Service identity was not enabled")
 
     def _identity(self):
         self.runner(["systemctl", "start", "nebulalog-keycloak.service"], timeout=900)
@@ -471,6 +912,17 @@ class Bootstrap:
         self.runner(["systemctl", "restart", "nebulalog-edge.service"], timeout=180)
         self._wait(lambda: self._request("https://localhost/api/health"), timeout=180)
 
+    def _schema_revision(self, *, initializing=False):
+        if initializing or "factory_binding" in self.state:
+            factory = self._enrollment().verify_initialization_inputs()
+            if not initializing:
+                retained = self._read(self.state_path)
+                if retained.get("factory_binding") != factory["binding"] or self.state.get("factory_binding") != factory["binding"]:
+                    raise Refused("Runtime schema lacks its protected factory binding")
+            self.factory = factory
+            return factory["binding"]["schema_revision"]
+        return self._enrollment()._descriptor()[0]["schema_revision"]
+
     def _lifecycle(self):
         path = self.configuration / "lifecycle.json"
         from .image_bundle import strict_json
@@ -492,12 +944,14 @@ class Bootstrap:
         package_key = trusted_file(ROCKY_PACKAGE_KEY)
         if not 1 <= package_key.stat().st_size <= 65536 or hashlib.sha256(package_key.read_bytes()).hexdigest() != trust["rocky_key_sha256"]:
             raise Refused("Rocky package key differs from the trust verified at image installation")
-        value = {"schema": 1, "api_url": "http://127.0.0.1:8080", "issuer": "https://" + self.setup["hostname"] + "/realms/nebulalog", "ca_file": str(self.tls / "ca.crt"), "schema_revision": "1", "compliance_policy": str(self.configuration / "security-policy.json"), "auth_probe": {"client_id": "nebulalog", "redirect_uri": "https://" + self.setup["hostname"] + "/health-oidc", "username": "nebulalog-health", "password": self.runtime["health_password"], "totp_secret": self.runtime["health_totp"], "totp_algorithm": "SHA256", "totp_digits": 6, "totp_period": 30}}
+        value = {"schema": 1, "api_url": "http://127.0.0.1:8080", "issuer": "https://" + self.setup["hostname"] + "/realms/nebulalog", "ca_file": str(self.tls / "ca.crt"), "schema_revision": self._schema_revision(), "compliance_policy": str(self.configuration / "security-policy.json"), "auth_probe": {"client_id": "nebulalog", "redirect_uri": "https://" + self.setup["hostname"] + "/health-oidc", "username": "nebulalog-health", "password": self.runtime["health_password"], "totp_secret": self.runtime["health_totp"], "totp_algorithm": "SHA256", "totp_digits": 6, "totp_period": 30}}
         value["rocky_key_sha256"] = trust["rocky_key_sha256"]
         if path.exists():
             current = self._read(path)
             if current.get("auth_probe") != value["auth_probe"]:
                 raise Refused("Lifecycle identity configuration changed")
+            if current.get("schema_revision") != value["schema_revision"]:
+                raise Refused("Existing lifecycle schema differs; firstboot cannot perform an application upgrade")
             if current.get("rocky_key_sha256") not in (None, trust["rocky_key_sha256"]):
                 raise Refused("Existing lifecycle package trust differs; firstboot cannot rotate or reset trust")
             # Preserve installed adapter settings and operator policy on retries.
@@ -540,6 +994,8 @@ class Bootstrap:
             raise Refused("Installed-release sequence differs from the protected build descriptor")
         expected = {"nebulalog": "NEBULALOG_IMAGE", "postgresql": "POSTGRESQL_IMAGE", "clickhouse": "CLICKHOUSE_IMAGE", "keycloak": "KEYCLOAK_FIPS_IMAGE"}
         components = current.get("components")
+        # Initial runtime setup precedes reviewed policy selection. Content is
+        # enrolled by the later typed bridge, never fabricated in this receipt.
         if not isinstance(components, dict) or set(components) != set(expected) | {"host"}:
             raise Refused("Installed-release component inventory is incomplete")
         from .update_enrollment import UpdateEnrollment
@@ -549,7 +1005,7 @@ class Bootstrap:
             raise Refused("Installed-release host generation differs from measured factory code")
         for name, image in expected.items():
             component = components[name]
-            if not isinstance(component, dict) or component.get("image") != self.pins[image] or component.get("schema_revision") != "1" or not isinstance(component.get("version"), str) or not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,79}", component["version"]):
+            if not isinstance(component, dict) or component.get("image") != self.pins[image] or component.get("schema_revision") != self._schema_revision() or not isinstance(component.get("version"), str) or not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,79}", component["version"]):
                 raise Refused("Installed-release component evidence differs from the runtime candidate")
         if current.get("version") != components["nebulalog"]["version"]:
             raise Refused("Installed-release application version is inconsistent")
@@ -605,20 +1061,87 @@ class Bootstrap:
         return {"schema": 1, "installation_id": self.setup["installation_id"], "state": "setup-complete" if final and all(checks.values()) else "runtime-ready" if all(checks.values()) else "verification-pending", "checks": checks, "https_url": "https://" + self.setup["hostname"], **fingerprints}
 
     def prepare(self, setup_path, secrets_path):
+        from .restore_runtime import refuse_normal_provision
+        from .aide import RUNTIME_STAGES
+        refuse_normal_provision(self.paths)
         self.firstboot.gate()
-        with locked(self.bootstrap / "runtime.lock"):
+        with ExitStack() as stack:
+            lock_path = self.bootstrap / "runtime.lock"
+            descriptor = stack.enter_context(locked(lock_path))
+            if self.native_commands:
+                from nebulalog_adapters.commands import Commands
+                original = self.runner
+                self.runner = Commands(inherited_locks=((descriptor, lock_path),))
+                stack.callback(setattr, self, "runner", original)
+            refuse_normal_provision(self.paths)
             self._load(setup_path, secrets_path)
-            for name, operation in (("directories", self._directories), ("certificates", self._certificates), ("images", self._images), ("environment", self._environment), ("realm", self._realm), ("postgresql", self._postgres), ("migrations", self._migrate), ("identity", self._identity), ("lifecycle", self._lifecycle), ("edge", self._edge), ("installed-release", self._installed_release)):
-                self._stage(name, operation)
-            result = self._evidence()
-            if not all(result["checks"].get(key) is True for key in RUNTIME_CHECKS):
-                raise Refused("Runtime preparation did not pass its live dependency/authentication checks")
-            return result
+            revision = self._schema_revision(initializing=True)
+            if revision == "4":
+                self._factory_inputs()
+                if set(self.state["completed"]) == RUNTIME_STAGES and self.state.get("active_stage") is None:
+                    return self._verify_prepared()
+            try:
+                if revision == "4":
+                    self._hold_listeners()
+                for name, operation in (("directories", self._directories), ("storage-maintenance", self._storage_maintenance),
+                        ("certificates", self._certificates), ("images", self._images), ("environment", self._environment),
+                        ("realm", self._realm), ("postgresql", self._postgres)):
+                    self._stage(name, operation)
+                if revision == "4":
+                    # Dependency services may have stopped during a reboot. Starting
+                    # their already bound containers does not rerun application SQL.
+                    self.runner(["systemctl", "start", "nebulalog-postgresql.service"], timeout=900)
+                    if "migrations" in self.state["completed"]:
+                        self._fresh_schema()  # Catalog/readback; no FreshPostgres DDL replay.
+                    else:
+                        self._stage("migrations", self._fresh_schema)
+                    atomic_json(self.bootstrap / "identity-ready.json", self._token_proof("identity"))
+                    if "identity" in self.state["completed"]:
+                        self.runner(["systemctl", "start", "nebulalog-keycloak.service"], timeout=900)
+                        self._wait(self._token, timeout=300)
+                    else:
+                        self._stage("identity", self._identity)
+                    self._stage("lifecycle", self._lifecycle)
+                    self._storage_hold(False)
+                    self.state["fresh_storage"]["phase"] = "released"
+                    atomic_json(self.state_path, self.state)
+                    atomic_json(self.bootstrap / "listeners-ready.json", self._token_proof("listeners"))
+                    # A failed edge start may have been stopped by this retry's hold.
+                    if "edge" in self.state["completed"]:
+                        self._edge()
+                    else:
+                        self._stage("edge", self._edge)
+                    self._stage("installed-release", self._installed_release)
+                else:
+                    for name, operation in (("migrations", self._migrate), ("identity", self._identity),
+                            ("lifecycle", self._lifecycle), ("edge", self._edge), ("installed-release", self._installed_release)):
+                        self._stage(name, operation)
+                result = self._evidence()
+                if not all(result["checks"].get(key) is True for key in RUNTIME_CHECKS):
+                    raise Refused("Runtime preparation did not pass its live dependency/authentication checks")
+                return result
+            except BaseException as primary:
+                if revision == "4":
+                    try:
+                        self._hold_listeners()
+                    except BaseException as fence_error:
+                        self.state["failure_fence"] = {"stopped": False, "error": type(fence_error).__name__}
+                    else:
+                        self.state["failure_fence"] = {"stopped": True}
+                    try:
+                        atomic_json(self.state_path, self.state)
+                    except BaseException:
+                        pass  # Preserve the primary; existing durable intent stays held.
+                raise
 
     def verify(self, setup_path):
         self.firstboot.gate()
         with locked(self.bootstrap / "runtime.lock"):
             self._load(setup_path)
+            if self.state.get("kind") == "configuration-restore":
+                from .restore_runtime import valid_restored_state
+                if not valid_restored_state(self.state, self.paths):
+                    raise Refused("Restored runtime activation evidence is incomplete")
             if not self.state.get("identity_initialized"):
                 raise Refused("Application identity has not been initialized")
             return self._evidence(final=True)

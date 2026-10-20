@@ -26,6 +26,402 @@ PINS_PATH = Path("/etc/nebulalog/images.json")
 DATA_DIRECTORY = Path("/var/lib/nebulalog")
 
 
+class ApplicationSchema:
+    """Reviewed source identities; declarations never authorize live SQL.
+
+    Keep this namespace in the existing image-bundle module so a bridge release
+    remains verifiable by the previous generation's fixed host file catalog.
+    """
+
+    LEGACY_REVISION = "1"
+    EMERGENCY_REVISION = "2"
+    CURRENT_REVISION = "3"
+    # Source identities do not qualify factory images, migration or packaging.
+    HOST_CHALLENGE_REVISION = "4"
+    RETENTION_REVISIONS = frozenset(("3", "4"))
+    ADDITIVE_UPGRADE = "postgres-emergency-storage-1-to-2"
+    SCHEMAS = {
+        "1": {
+            "migrations/postgres.sql": "122e2791afa29563db6f80aa248d604f87428e06e70818f2bf467aa58d07eefa",
+            "migrations/clickhouse.sql": "fd84d9a576b8e850e0a33625c13f422901736d23475b8b97c4b71840ef1d91ce",
+            "migrations/host_stepup.sql": "b78e4e65ca8dc35593803fb89cfe1af76521495ca8cabdf9a174c86be6936b56",
+        },
+        "2": {
+            "migrations/postgres.sql": "90af76769233c482f186b6d7827abe0eab84e44192afbf81dfe48aeb71d7c217",
+            "migrations/clickhouse.sql": "fd84d9a576b8e850e0a33625c13f422901736d23475b8b97c4b71840ef1d91ce",
+            "migrations/host_stepup.sql": "b78e4e65ca8dc35593803fb89cfe1af76521495ca8cabdf9a174c86be6936b56",
+        },
+        "3": {
+            "migrations/postgres.sql": "32c37b73769156897a679f0216c7995561963875bfce74775d27abe5defc4de2",
+            "migrations/clickhouse.sql": "f3a6610f55eee8469769f9c9def9a99c76ff64ed8f76fcf3a9b0196091a3628d",
+            "migrations/host_stepup.sql": "b78e4e65ca8dc35593803fb89cfe1af76521495ca8cabdf9a174c86be6936b56",
+        },
+        "4": {
+            "migrations/postgres.sql": "32c37b73769156897a679f0216c7995561963875bfce74775d27abe5defc4de2",
+            "migrations/clickhouse.sql": "f3a6610f55eee8469769f9c9def9a99c76ff64ed8f76fcf3a9b0196091a3628d",
+            "migrations/host_stepup.sql": "b78e4e65ca8dc35593803fb89cfe1af76521495ca8cabdf9a174c86be6936b56",
+            "migrations/host_stepup_v2.sql": "4bc9481081be77b0aeaf26f162a633f3b2c1d5bb26c0bbbd1172df32a6260cfd",
+        },
+    }
+
+    # Fixed host-installed SQL; never load a release-provided SQL path or hook.
+    LEGACY_POSTGRES_SQL = 'CREATE TABLE IF NOT EXISTS saved_filters (\n id uuid PRIMARY KEY, owner_id text NOT NULL, name text NOT NULL CHECK(length(name) BETWEEN 1 AND 128),\n description text NOT NULL DEFAULT \'\', query text NOT NULL, log_type text NOT NULL DEFAULT \'traffic\',\n columns jsonb NOT NULL DEFAULT \'[]\', time_range text NOT NULL DEFAULT \'1h\', sort text NOT NULL DEFAULT \'received_at\',\n favorite boolean NOT NULL DEFAULT false, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()\n);\nCREATE INDEX IF NOT EXISTS saved_filters_owner ON saved_filters(owner_id);\nCREATE TABLE IF NOT EXISTS layouts (owner_id text NOT NULL, log_type text NOT NULL, layout jsonb NOT NULL, PRIMARY KEY(owner_id,log_type));\nCREATE TABLE IF NOT EXISTS firewalls (\n serial text PRIMARY KEY, device_name text NOT NULL DEFAULT \'\', sender_ip text NOT NULL DEFAULT \'\',\n friendly_name text NOT NULL DEFAULT \'\', site text NOT NULL DEFAULT \'\', tags jsonb NOT NULL DEFAULT \'[]\', notes text NOT NULL DEFAULT \'\',\n panos_version text NOT NULL DEFAULT \'\', first_seen timestamptz NOT NULL DEFAULT now(), last_seen timestamptz NOT NULL DEFAULT now()\n);\nCREATE TABLE IF NOT EXISTS settings (key text PRIMARY KEY, value jsonb NOT NULL);\nINSERT INTO settings(key,value) VALUES(\'retention\',\'{"global_days":90,"per_type":{"traffic":60,"threat":365,"url":90,"authentication":365,"configuration":365,"system":365}}\') ON CONFLICT DO NOTHING;\nCREATE TABLE IF NOT EXISTS audit_events(id bigserial PRIMARY KEY, occurred_at timestamptz NOT NULL DEFAULT now(), actor text NOT NULL, action text NOT NULL, target text NOT NULL, detail jsonb NOT NULL DEFAULT \'{}\');\nCREATE TABLE IF NOT EXISTS export_jobs (\n id uuid PRIMARY KEY, owner_id text NOT NULL, status text NOT NULL, rows bigint NOT NULL DEFAULT 0, bytes bigint NOT NULL DEFAULT 0,\n error text NOT NULL DEFAULT \'\', request jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), expires_at timestamptz NOT NULL DEFAULT now()+interval \'24 hours\'\n);\nCREATE TABLE IF NOT EXISTS storage_samples(sampled_at timestamptz NOT NULL DEFAULT now(), database_bytes bigint NOT NULL, events bigint NOT NULL, PRIMARY KEY(sampled_at));\n\nALTER TABLE saved_filters ADD COLUMN IF NOT EXISTS sort_order text NOT NULL DEFAULT \'desc\' CHECK(sort_order IN (\'asc\',\'desc\'));\n\nCREATE TABLE IF NOT EXISTS user_preferences (\n owner_id text PRIMARY KEY,\n theme text NOT NULL DEFAULT \'system\' CHECK(theme IN (\'system\',\'light\',\'dark\')),\n density text NOT NULL DEFAULT \'compact\' CHECK(density IN (\'compact\',\'comfortable\')),\n rail_collapsed boolean NOT NULL DEFAULT false,\n updated_at timestamptz NOT NULL DEFAULT now()\n);\n'
+    ADDITIVE_POSTGRES_SQL = '\n-- Emergency retention is separate from expiry assigned to future arrivals.\nINSERT INTO settings(key,value) VALUES(\'storage_emergency\',\'{"revision":1,"enabled":true,"trigger_percent":95,"recover_percent":90,"minimum_days":{"traffic":1,"url":7,"threat":30,"wildfire":30,"dns":30,"data":30,"hip":30,"globalprotect":30,"iptag":30,"userid":30,"decryption":30,"tunnel":30,"configuration":30,"system":30,"authentication":30}}\') ON CONFLICT DO NOTHING;\nINSERT INTO settings(key,value) VALUES(\'storage_emergency_maintenance\',\'{"schema":1,"held":false,"delivery_held":false,"operation":null}\') ON CONFLICT DO NOTHING;\nCREATE TABLE IF NOT EXISTS storage_emergency_state (\n singleton boolean PRIMARY KEY CHECK(singleton), value jsonb NOT NULL\n);\nINSERT INTO storage_emergency_state(singleton,value) VALUES(true,\'{"state":"not_observed","observed_at":null,"message":"Waiting for the first verified ClickHouse disk observation","emergency_active":false,"insert_exclusions":0}\') ON CONFLICT DO NOTHING;\nCREATE TABLE IF NOT EXISTS storage_emergency_actions (\n id uuid PRIMARY KEY, state text NOT NULL CHECK(state IN (\'prepared\',\'executing\',\'uncertain\',\'awaiting_cleanup\',\'completed\',\'cancelled\')),\n plan jsonb NOT NULL, message text NOT NULL DEFAULT \'\', created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), completed_at timestamptz\n);\nCREATE UNIQUE INDEX IF NOT EXISTS storage_emergency_one_pending ON storage_emergency_actions((true)) WHERE completed_at IS NULL;\nCREATE TABLE IF NOT EXISTS storage_emergency_inserts (\n id uuid PRIMARY KEY, table_uuid uuid NOT NULL, partitions jsonb NOT NULL, query_id uuid NOT NULL UNIQUE, created_at timestamptz NOT NULL DEFAULT now()\n);\n'
+    HOST_STEPUP_SQL = "-- Short-lived server-only OAuth transactions. State is SHA-256 hashed before\n-- insertion; nonce and PKCE verifier are never copied to audit/job records.\nCREATE TABLE IF NOT EXISTS host_stepup_pending (\n state_hash text PRIMARY KEY CHECK (state_hash ~ '^[a-f0-9]{64}$'),\n nonce text NOT NULL CHECK (nonce ~ '^[A-Za-z0-9_-]{43,128}$'),\n pkce_verifier text NOT NULL CHECK (pkce_verifier ~ '^[A-Za-z0-9._~-]{43,128}$'),\n policy_digest text NOT NULL CHECK (policy_digest ~ '^[a-f0-9]{64}$'),\n actor_issuer text NOT NULL CHECK (octet_length(actor_issuer) BETWEEN 1 AND 2048 AND actor_issuer !~ '[[:cntrl:]]'),\n actor_subject text NOT NULL CHECK (octet_length(actor_subject) BETWEEN 1 AND 512 AND actor_subject !~ '[[:cntrl:]]'),\n actor_client_id text NOT NULL CHECK (octet_length(actor_client_id) BETWEEN 1 AND 512 AND actor_client_id !~ '[[:cntrl:]]'),\n actor_session_digest text NOT NULL CHECK (actor_session_digest ~ '^[a-f0-9]{64}$'),\n installation_id text NOT NULL CHECK (installation_id ~ '^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'),\n operation text NOT NULL CHECK (operation ~ '^[a-z][a-z0-9_.]{0,127}$'),\n plan_id text NOT NULL CHECK (plan_id ~ '^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'),\n plan_digest text NOT NULL CHECK (plan_digest ~ '^[a-f0-9]{64}$'),\n resource_revision text NOT NULL CHECK (resource_revision ~ '^[a-f0-9]{64}$'),\n binding_expires_at timestamptz NOT NULL CHECK (isfinite(binding_expires_at)),\n created_at timestamptz NOT NULL CHECK (isfinite(created_at) AND created_at >= '1970-01-01T00:00:00Z'),\n expires_at timestamptz NOT NULL CHECK (isfinite(expires_at)),\n CHECK (expires_at > created_at AND expires_at <= created_at + interval '120 seconds'),\n CHECK (expires_at <= binding_expires_at)\n);\nCREATE INDEX IF NOT EXISTS host_stepup_pending_expiry ON host_stepup_pending (expires_at, state_hash);\n"
+
+    # Separately reviewed identity; never appended to the legacy step-up SQL.
+    HOST_STEPUP_V2_SQL = "-- Explicit version 2 migration, applied separately from immutable application\n-- schema 1/2/3. The existing host_stepup_pending table stays inert; never copy\n-- its rows or infer missing host challenges. Invalidation clears both tables.\n-- Short-lived server-only OAuth transactions with mandatory host authority\n-- bindings. State is hashed; nonce/verifier/tokens never enter audit/job JSON.\n-- No default schema or challenge values can promote legacy inserts.\nCREATE TABLE IF NOT EXISTS host_stepup_pending_v2 (\n record_schema integer NOT NULL CHECK (record_schema = 2),\n state_hash text PRIMARY KEY CHECK (state_hash ~ '^[a-f0-9]{64}$'),\n nonce text NOT NULL CHECK (nonce ~ '^[A-Za-z0-9_-]{43}$'),\n pkce_verifier text NOT NULL CHECK (pkce_verifier ~ '^[A-Za-z0-9._~-]{43,128}$'),\n policy_digest text NOT NULL CHECK (policy_digest ~ '^[a-f0-9]{64}$'),\n actor_issuer text NOT NULL CHECK (octet_length(actor_issuer) BETWEEN 1 AND 2048 AND actor_issuer !~ '[[:cntrl:]]'),\n actor_subject text NOT NULL CHECK (octet_length(actor_subject) BETWEEN 1 AND 512 AND actor_subject !~ '[[:cntrl:]]'),\n actor_client_id text NOT NULL CHECK (octet_length(actor_client_id) BETWEEN 1 AND 512 AND actor_client_id !~ '[[:cntrl:]]'),\n actor_session_digest text NOT NULL CHECK (actor_session_digest ~ '^[a-f0-9]{64}$'),\n installation_id text NOT NULL CHECK (installation_id ~ '^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'),\n operation text NOT NULL CHECK (operation ~ '^[a-z][a-z0-9_.]{0,127}$'),\n plan_id text NOT NULL CHECK (plan_id ~ '^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'),\n plan_digest text NOT NULL CHECK (plan_digest ~ '^[a-f0-9]{64}$'),\n resource_revision text NOT NULL CHECK (resource_revision ~ '^[a-f0-9]{64}$'),\n binding_expires_at timestamptz NOT NULL CHECK (isfinite(binding_expires_at)),\n created_at timestamptz NOT NULL CHECK (isfinite(created_at) AND created_at >= '1970-01-01T00:00:00Z'),\n expires_at timestamptz NOT NULL CHECK (isfinite(expires_at)),\n challenge_schema integer NOT NULL CHECK (challenge_schema = 1),\n challenge_id text NOT NULL CHECK (challenge_id ~ '^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'),\n challenge_subject_digest text NOT NULL CHECK (challenge_subject_digest ~ '^[a-f0-9]{64}$'),\n challenge_operation_schema integer NOT NULL CHECK (challenge_operation_schema = 1),\n challenge_action text NOT NULL CHECK (challenge_action IN ('job.accept', 'job.cancel')),\n challenge_request_digest text NOT NULL CHECK (challenge_request_digest ~ '^[a-f0-9]{64}$'),\n challenge_policy_generation text NOT NULL CHECK (challenge_policy_generation ~ '^[a-f0-9]{64}$'),\n challenge_issued_at bigint NOT NULL CHECK (challenge_issued_at BETWEEN 1 AND 253402300799),\n challenge_expires_at bigint NOT NULL CHECK (challenge_expires_at BETWEEN 1 AND 253402300799),\n CHECK (expires_at > created_at AND expires_at <= created_at + interval '120 seconds'),\n CHECK (expires_at <= binding_expires_at),\n CHECK (challenge_expires_at > challenge_issued_at AND challenge_expires_at <= challenge_issued_at + 120),\n CHECK (created_at >= to_timestamp(challenge_issued_at)),\n CHECK (expires_at <= to_timestamp(challenge_expires_at) AND to_timestamp(challenge_expires_at) <= binding_expires_at)\n);\nCREATE INDEX IF NOT EXISTS host_stepup_pending_v2_expiry ON host_stepup_pending_v2 (expires_at, state_hash);\n"
+
+    # Catalog construction only; this suffix does not authorize a 2-to-3 migration.
+    RETENTION_POSTGRES_SQL = '\n-- The engine remains unavailable until the explicit migration verifies the\n-- events table identity and absence of legacy TTL. No event rows are rewritten.\nINSERT INTO settings(key,value) VALUES(\'retention_engine\',\'{"schema":1,"mode":"uninitialized"}\') ON CONFLICT DO NOTHING;\nINSERT INTO settings(key,value) VALUES(\'retention_status\',\'{"state":"not_observed","message":"Waiting for retention engine verification"}\') ON CONFLICT DO NOTHING;\nCREATE TABLE IF NOT EXISTS retention_actions (\n id uuid PRIMARY KEY, state text NOT NULL CHECK(state IN (\'prepared\',\'executing\',\'uncertain\',\'awaiting_cleanup\',\'completed\',\'cancelled\')),\n plan jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), completed_at timestamptz\n);\nCREATE UNIQUE INDEX IF NOT EXISTS retention_one_pending ON retention_actions((true)) WHERE completed_at IS NULL;\n'
+
+    @staticmethod
+    def reviewed_retention_sql():
+        legacy, additive, _ = ApplicationSchema.reviewed_sql()
+        suffix = ApplicationSchema.RETENTION_POSTGRES_SQL
+        if hashlib.sha256((legacy + additive + suffix).encode()).hexdigest() != ApplicationSchema.SCHEMAS["3"]["migrations/postgres.sql"]:
+            raise Refused("Installed retention SQL differs from its reviewed source identity")
+        return suffix
+
+    @staticmethod
+    def reviewed_host_stepup_v2_sql():
+        """Fixed catalog construction only; never authority for a live upgrade."""
+        body = ApplicationSchema.HOST_STEPUP_V2_SQL
+        expected = ApplicationSchema.SCHEMAS[ApplicationSchema.HOST_CHALLENGE_REVISION]
+        if hashlib.sha256(body.encode()).hexdigest() != expected["migrations/host_stepup_v2.sql"]:
+            raise Refused("Installed host challenge SQL differs from its reviewed source identity")
+        return body
+
+    @staticmethod
+    def reviewed_sql():
+        legacy = ApplicationSchema.LEGACY_POSTGRES_SQL
+        additive = ApplicationSchema.ADDITIVE_POSTGRES_SQL
+        stepup = ApplicationSchema.HOST_STEPUP_SQL
+        expected = ApplicationSchema.SCHEMAS
+        for body, digest in ((legacy, expected["1"]["migrations/postgres.sql"]),
+                             (legacy + additive, expected["2"]["migrations/postgres.sql"]),
+                             (stepup, expected["2"]["migrations/host_stepup.sql"])):
+            if hashlib.sha256(body.encode()).hexdigest() != digest:
+                raise Refused("Installed migration SQL differs from its reviewed source identity")
+        return legacy, additive, stepup
+
+    @staticmethod
+    def schema_digest(revision):
+        if not isinstance(revision, str) or revision not in ApplicationSchema.SCHEMAS:
+            raise Refused("Application schema revision has no reviewed source contract")
+        return hashlib.sha256(json.dumps(ApplicationSchema.SCHEMAS[revision], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    @staticmethod
+    def source_revision(files):
+        if not isinstance(files, dict) or any(not isinstance(name, str) for name in files):
+            raise Refused("Application schema needs a complete source inventory")
+        migrations = {name: value for name, value in files.items() if name.startswith("migrations/")}
+        for revision, expected in ApplicationSchema.SCHEMAS.items():
+            if migrations == expected:
+                return revision
+        raise Refused("Migration source differs from every reviewed application schema; qualify a new revision")
+
+    @staticmethod
+    def bind_source(files, revision):
+        observed = ApplicationSchema.source_revision(files)
+        if revision != observed:
+            raise Refused("Declared application schema revision differs from the actual migration source")
+        return ApplicationSchema.schema_digest(observed)
+
+    @staticmethod
+    def declaration(files, revision, migration="none"):
+        digest = ApplicationSchema.bind_source(files, revision)
+        if migration not in ("none", ApplicationSchema.ADDITIVE_UPGRADE) or migration == ApplicationSchema.ADDITIVE_UPGRADE and revision != ApplicationSchema.EMERGENCY_REVISION:
+            raise Refused("Application migration is not a reviewed fixed transition")
+        return {"schema_revision": revision, "schema_sha256": digest, "database_migration": migration}
+
+    @staticmethod
+    def transition(change, installed_revision):
+        """Validate only the declaration; this does not authorize SQL or activation."""
+        if not isinstance(change, dict):
+            raise Refused("Application schema transition requires an explicit declaration")
+        ApplicationSchema.schema_digest(installed_revision)
+        target = change.get("schema_revision")
+        digest = ApplicationSchema.schema_digest(target)
+        if change.get("schema_sha256") != digest:
+            # Retained schema-1 releases predate the fingerprint field. Their legacy
+            # same-schema path is needed to install the migration-capable coordinator.
+            if not (target == installed_revision == ApplicationSchema.LEGACY_REVISION and "schema_sha256" not in change):
+                raise Refused("Release schema fingerprint differs from its reviewed source contract")
+        migration = change.get("database_migration")
+        if migration == "none" and target == installed_revision:
+            return "none"
+        if target in ApplicationSchema.RETENTION_REVISIONS or installed_revision in ApplicationSchema.RETENTION_REVISIONS:
+            raise Refused("Schemas 3 and 4 support only fresh installation or same-schema updates; a cross-schema compatibility bridge is not qualified")
+        if (migration == ApplicationSchema.ADDITIVE_UPGRADE and installed_revision == ApplicationSchema.LEGACY_REVISION
+                and target == ApplicationSchema.EMERGENCY_REVISION and change.get("rollback_safe") is True):
+            return ApplicationSchema.ADDITIVE_UPGRADE
+        raise Refused("Application schema change requires a supported explicit migration")
+
+
+class RestoredAuthContract:
+    """Source and HTTP behavior binding for the first supported restored runtime.
+
+    The caller must authenticate the enclosing release (or the factory's existing
+    measured provenance). This is not a new trust root and does not execute tests.
+    A publisher must review the original exact-image test run before signing its
+    report. Native restore/update/rollback acceptance remains a promotion gate;
+    requiring that result here would prevent executing the qualification itself.
+    """
+
+    CONTRACT = "restored-jwt-issued-at-v1"
+    SOURCE = "source-manifest.json"
+    BUILD = "application-build.json"
+    BEHAVIOR = "restore-auth-behavior.json"
+    EVIDENCE = frozenset((BUILD, BEHAVIOR))
+    MAX_RECEIPT = 8 * 1024**2
+    REQUIRED_SOURCE = frozenset(("go.mod", "go.sum", "LICENSE", "appliance/images/application/Containerfile",
+                                 "cmd/nebulalog/main.go", "internal/auth/auth.go", "internal/auth/restore.go"))
+    CASES = {"before_cutoff": 401, "at_cutoff": 200, "after_cutoff": 200,
+             "missing_iat": 401, "wrong_issuer": 401, "wrong_audience": 401,
+             "wrong_signature": 401, "expired": 401}
+
+    @classmethod
+    def declaration(cls):
+        return {"schema": 1, "contract": cls.CONTRACT, "source_artifact": cls.SOURCE,
+                "build_artifact": cls.BUILD, "behavior_artifact": cls.BEHAVIOR}
+
+    @staticmethod
+    def application_files(files):
+        return {name: sha for name, sha in files.items()
+                if name in ("go.mod", "go.sum", "LICENSE", "appliance/images/application/Containerfile")
+                or name.startswith(("cmd/", "internal/", "web/", "migrations/"))}
+
+    @classmethod
+    def application_hash(cls, files):
+        return hashlib.sha256(json.dumps(cls.application_files(files), sort_keys=True,
+                                         separators=(",", ":")).encode()).hexdigest()
+
+    @classmethod
+    def factory_descriptor(cls, value):
+        """Validate an optional immutable factory descriptor, never enroll it."""
+        from . import host_payload
+        if (not isinstance(value, dict) or set(value) != {"schema", "contract", "version", "artifacts"}
+                or type(value["schema"]) is not int or value["schema"] != 1 or value["contract"] != cls.CONTRACT
+                or not isinstance(value["version"], str) or not host_payload.VERSION.fullmatch(value["version"])
+                or not isinstance(value["artifacts"], dict) or set(value["artifacts"]) != cls.EVIDENCE):
+            raise Refused("Factory restored authentication lacks its measured proof inventory")
+        for item in value["artifacts"].values():
+            if (not isinstance(item, dict) or set(item) != {"bytes", "sha256"}
+                    or type(item["bytes"]) is not int or not 0 < item["bytes"] <= cls.MAX_RECEIPT
+                    or not isinstance(item["sha256"], str) or not host_payload.SHA256.fullmatch(item["sha256"])):
+                raise Refused("Factory restored authentication artifact identity is invalid")
+        return value
+
+    @classmethod
+    def factory_capture(cls, files, image, build_raw, behavior_raw, *, schema_revision="3"):
+        """Package already reviewed image evidence, with no native acceptance claim."""
+        from . import host_payload
+        if any(not isinstance(raw, bytes) or not 0 < len(raw) <= cls.MAX_RECEIPT for raw in (build_raw, behavior_raw)):
+            raise Refused("Factory restored authentication receipts exceed their bounds")
+        if not isinstance(schema_revision, str) or schema_revision not in ApplicationSchema.RETENTION_REVISIONS:
+            raise Refused("Factory restored authentication requires an explicit fresh schema 3 or 4 profile")
+        build = host_payload.strict_json(build_raw)
+        version = build.get("requested_version") if isinstance(build, dict) else None
+        ApplicationSchema.bind_source(files, schema_revision)
+        cls._build(build, files, {"version": version}, image)
+        cls._behavior(host_payload.strict_json(behavior_raw), {"image": image.get("reference")}, image, cls.application_hash(files))
+        return cls.factory_descriptor({"schema": 1, "contract": cls.CONTRACT, "version": version,
+            "artifacts": {name: {"bytes": len(raw), "sha256": host_payload.digest(raw)}
+                          for name, raw in ((cls.BUILD, build_raw), (cls.BEHAVIOR, behavior_raw))}})
+
+    @classmethod
+    def verify_factory(cls, descriptor, share, host, image, *, root_owned=True):
+        """Use only after the existing measured factory host/image verification.
+
+        The initial-host record hashes initial-release.json, which in turn hashes
+        these two receipts and source-manifest.json. No loose receipt is adopted.
+        """
+        from . import host_payload
+        factory = cls.factory_descriptor(descriptor.get("restore_auth"))
+        schema_revision = descriptor.get("schema_revision")
+        if not isinstance(schema_revision, str) or schema_revision not in ApplicationSchema.RETENTION_REVISIONS:
+            raise Refused("Factory restored authentication requires an explicit fresh schema 3 or 4 profile")
+        share = Path(share)
+        source_raw = host_payload.read_regular(share / cls.SOURCE, cls.MAX_RECEIPT, trusted=root_owned)
+        if host_payload.digest(source_raw) != descriptor.get("source_snapshot_sha256"):
+            raise Refused("Factory restored authentication source no longer matches its descriptor")
+        raw = {}
+        for name, expected in factory["artifacts"].items():
+            raw[name] = host_payload.read_regular(share / "restore-auth" / name, cls.MAX_RECEIPT, trusted=root_owned)
+            if {"bytes": len(raw[name]), "sha256": host_payload.digest(raw[name])} != expected:
+                raise Refused("Factory restored authentication receipt changed")
+        subject = cls._subject(source_raw, raw[cls.BUILD], raw[cls.BEHAVIOR], host, image, factory["version"],
+                               host_version=host.get("metadata", {}).get("version"), schema_revision=schema_revision)
+        return {"schema": 1, "contract": cls.CONTRACT, "subject": subject,
+                "proof_artifacts": factory["artifacts"], "native_qualified": False, "execution_verified_by_tool": False}
+
+    @classmethod
+    def _subject(cls, source_raw, build_raw, behavior_raw, host, image, version, *, schema_revision, host_version=None):
+        from . import host_payload
+        files = host_payload.source_manifest(source_raw)["files"]
+        ApplicationSchema.bind_source(files, schema_revision)
+        metadata = host_payload.validate_metadata(host.get("metadata"))
+        generation = host.get("archive_sha256")
+        if (not isinstance(generation, str) or not host_payload.SHA256.fullmatch(generation)
+                or metadata["version"] != (version if host_version is None else host_version)
+                or metadata["source_snapshot_sha256"] != host_payload.digest(source_raw)
+                or metadata["host_source_sha256"] != host_payload.host_source_hash(files)
+                or {item["source"]: item["sha256"] for item in metadata["files"]}
+                   != {name: files[name] for name in host_payload.CATALOG_BY_SOURCE}):
+            raise Refused("Restored authentication host generation differs from its source snapshot")
+        reference = image.get("reference")
+        if (not isinstance(reference, str) or not REFERENCE.fullmatch(reference)
+                or image.get("manifest_digest") != reference.rsplit("@", 1)[-1]
+                or image.get("architecture") != "amd64" or image.get("os") != "linux"
+                or not isinstance(image.get("config_digest"), str) or not DIGEST.fullmatch(image["config_digest"])):
+            raise Refused("Restored authentication image lacks its verified OCI identity")
+        cls._build(host_payload.strict_json(build_raw), files, {"version": version}, image)
+        source_hash = cls.application_hash(files)
+        cls._behavior(host_payload.strict_json(behavior_raw), {"image": reference}, image, source_hash)
+        return {"source_snapshot_sha256": host_payload.digest(source_raw),
+                "application_source_sha256": source_hash, "host_source_sha256": metadata["host_source_sha256"],
+                "host_generation": generation, "catalog_sha256": metadata["catalog_sha256"],
+                "application_image": reference, "application_config_digest": image["config_digest"],
+                "schema_revision": schema_revision, "schema_sha256": ApplicationSchema.schema_digest(schema_revision)}
+
+    @classmethod
+    def validate_metadata(cls, manifest):
+        """Eligibility only; declaration presence cannot authorize installation."""
+        from . import host_payload
+        declaration = manifest.get("restore_auth")
+        if (declaration != cls.declaration() or type(declaration.get("schema")) is not int):
+            raise Refused("Restored authentication requires the fixed source and behavior contract")
+        components = manifest.get("components", {})
+        if not {"host", "nebulalog"} <= set(components):
+            raise Refused("Restored authentication requires a combined host and application release")
+        application = components["nebulalog"]
+        if (not isinstance(application.get("schema_revision"), str)
+                or application["schema_revision"] not in ApplicationSchema.RETENTION_REVISIONS or application.get("database_migration") != "none"
+                or application.get("schema_sha256") != ApplicationSchema.schema_digest(application["schema_revision"])
+                or any(components[name].get("rollback_safe") is not True for name in ("host", "nebulalog"))):
+            raise Refused("Restored authentication requires an explicit same-profile fresh schema 3 or 4 release")
+        artifacts = {}
+        for item in manifest.get("artifacts", []):
+            if (not isinstance(item, dict) or set(item) != {"name", "sha256", "bytes"}
+                    or not isinstance(item["name"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}", item["name"])
+                    or item["name"] in artifacts or type(item["bytes"]) is not int or item["bytes"] <= 0
+                    or not isinstance(item["sha256"], str) or not host_payload.SHA256.fullmatch(item["sha256"])):
+                raise Refused("Restored authentication artifact inventory is invalid")
+            artifacts[item["name"]] = item
+        if not {cls.SOURCE, cls.BUILD, cls.BEHAVIOR} <= set(artifacts):
+            raise Refused("Restored authentication proof must be covered by signed artifact hashes")
+        if any(artifacts[name]["bytes"] > cls.MAX_RECEIPT for name in (cls.SOURCE, cls.BUILD, cls.BEHAVIOR)):
+            raise Refused("Restored authentication proof exceeds its bounded size")
+        return artifacts
+
+    @classmethod
+    def _build(cls, value, files, manifest, image):
+        from . import host_payload
+        fields = {"schema", "status", "tag", "local_image_id", "platform", "requested_version", "application_source_sha256",
+                  "source_commit", "source_dirty", "application_files", "context_sha256", "context_bytes", "source_bytes",
+                  "source_files", "context_mode", "runtime_executed", "signature_created"}
+        selected = cls.application_files(files)
+        if (not isinstance(value, dict) or set(value) != fields or type(value["schema"]) is not int or value["schema"] != 1
+                or value["status"] != "built" or value["platform"] != "linux/amd64"
+                or value["context_mode"] != "captured_source_tar_stdin"
+                or value["runtime_executed"] is not False or value["signature_created"] is not False
+                or type(value["source_dirty"]) is not bool
+                or not isinstance(value["source_commit"], str) or not re.fullmatch(r"[a-f0-9]{40}", value["source_commit"])
+                or not isinstance(value["tag"], str) or not re.fullmatch(r"nebulalog/[a-z0-9]+(?:[._-][a-z0-9]+)*:[a-z0-9][a-z0-9._-]{0,100}", value["tag"])
+                or value["requested_version"] != manifest["version"]
+                or value["application_files"] != selected or not cls.REQUIRED_SOURCE <= set(selected)
+                or value["application_source_sha256"] != cls.application_hash(files)
+                or image.get("application_source_sha256") != value["application_source_sha256"]
+                or value["local_image_id"] != image.get("config_digest")
+                or type(value["source_files"]) is not int or value["source_files"] != len(selected)
+                or any(type(value[key]) is not int for key in ("context_bytes", "source_bytes"))
+                or not 0 < value["source_bytes"] <= value["context_bytes"] <= 512 * 1024**2
+                or not isinstance(value["context_sha256"], str) or not host_payload.SHA256.fullmatch(value["context_sha256"])):
+            raise Refused("Application build receipt does not bind the exact captured source and OCI configuration")
+
+    @classmethod
+    def _behavior(cls, value, application, image, source_hash):
+        from . import host_payload
+        fields = {"schema", "kind", "method", "application_image", "application_config_digest",
+                  "application_source_sha256", "command", "http_method", "path", "issuer_mode", "cutoff", "observed_cutoff", "cases"}
+        if (not isinstance(value, dict) or set(value) != fields or type(value["schema"]) is not int or value["schema"] != 1
+                or value["kind"] != "captains-log-restored-token-boundary"
+                or value["method"] != "isolated-image-normal-api-http"
+                or value["application_image"] != application["image"]
+                or value["application_config_digest"] != image.get("config_digest")
+                or value["application_source_sha256"] != source_hash or value["command"] != ["serve"]
+                or value["http_method"] != "GET" or value["path"] != "/api/me" or value["issuer_mode"] != "isolated-fixture"
+                or type(value["cutoff"]) is not int or not 1577836800 <= value["cutoff"] < 2**31
+                or type(value["observed_cutoff"]) is not int or value["observed_cutoff"] != value["cutoff"]
+                or not isinstance(value["cases"], dict) or set(value["cases"]) != set(cls.CASES)):
+            raise Refused("Restored authentication behavior must bind the exact normal API image and fixed cutoff")
+        cutoff = value["cutoff"]
+        for name, status in cls.CASES.items():
+            case = value["cases"][name]
+            fields = {"iat", "exp", "observed_at", "issuer_match", "audience_match", "signature_valid", "http_status", "api_role", "token_sha256"}
+            expected_iat = None if name == "missing_iat" else cutoff + (-1 if name == "before_cutoff" else 1 if name == "after_cutoff" else 0)
+            if (not isinstance(case, dict) or set(case) != fields
+                    or (case["iat"] is not None and type(case["iat"]) is not int) or case["iat"] != expected_iat
+                    or any(type(case[key]) is not int for key in ("exp", "observed_at", "http_status"))
+                    or not cutoff + 1 <= case["observed_at"] < 2**31 or case["http_status"] != status
+                    or case["api_role"] != ("VIEWER" if status == 200 else None)
+                    or any(case[key] is not expected for key, expected in (
+                        ("issuer_match", name != "wrong_issuer"), ("audience_match", name != "wrong_audience"),
+                        ("signature_valid", name != "wrong_signature")))
+                    or not isinstance(case["token_sha256"], str) or not host_payload.SHA256.fullmatch(case["token_sha256"])
+                    or not (cutoff <= case["exp"] < case["observed_at"] if name == "expired"
+                            else case["observed_at"] + 30 <= case["exp"] < 2**31)):
+                raise Refused("Restored authentication HTTP boundary case is missing, confounded or unsuccessful: " + name)
+
+    @classmethod
+    def verify(cls, manifest, bundle, *, host=None, image=None, root_owned=False):
+        """Verify bytes under caller-authenticated metadata; no adoption or writes."""
+        from . import host_payload
+        artifacts = cls.validate_metadata(manifest)
+        bundle = Path(bundle)
+        raw = {}
+        for name in (cls.SOURCE, cls.BUILD, cls.BEHAVIOR):
+            raw[name] = host_payload.read_regular(bundle / name, cls.MAX_RECEIPT, trusted=root_owned)
+            if len(raw[name]) != artifacts[name]["bytes"] or host_payload.digest(raw[name]) != artifacts[name]["sha256"]:
+                raise Refused("Restored authentication proof differs from its signed artifact identity")
+        source = host_payload.source_manifest(raw[cls.SOURCE])
+        files = source["files"]
+        application = manifest["components"]["nebulalog"]
+        ApplicationSchema.bind_source(files, application["schema_revision"])
+        host_change = manifest["components"]["host"]
+        if host_change.get("artifact") not in artifacts or application.get("artifact") not in artifacts:
+            raise Refused("Restored authentication component artifacts are absent")
+        host_artifact = artifacts[host_change["artifact"]]
+        if host is None:
+            host = host_payload.verify_archive(bundle / host_change["artifact"], expected_sha256=host_artifact["sha256"],
+                                               expected_host_source_sha256=host_change["host_source_sha256"])
+        metadata = host.get("metadata", {})
+        if (host.get("archive_sha256") != host_artifact["sha256"] or host.get("archive_bytes") != host_artifact["bytes"]
+                or metadata.get("version") != host_change["version"]
+                or metadata.get("source_snapshot_sha256") != host_payload.digest(raw[cls.SOURCE])
+                or metadata.get("host_source_sha256") != host_change["host_source_sha256"]
+                or metadata.get("host_source_sha256") != host_payload.host_source_hash(files)
+                or metadata.get("catalog_sha256") != host_payload.CATALOG_SHA256
+                or {item["source"]: item["sha256"] for item in metadata.get("files", [])}
+                   != {name: files[name] for name in host_payload.CATALOG_BY_SOURCE}):
+            raise Refused("Restored authentication host generation differs from its source snapshot")
+        if image is None:
+            image = verify_oci_archive(bundle / application["artifact"], application["image"])
+        image_artifact = artifacts[application["artifact"]]
+        if (image.get("archive_sha256") != image_artifact["sha256"] or image.get("archive_bytes") != image_artifact["bytes"]
+                or image.get("manifest_digest") != application["image"].rsplit("@", 1)[-1]
+                or image.get("architecture") != "amd64" or image.get("os") != "linux"
+                or not isinstance(image.get("config_digest"), str) or not DIGEST.fullmatch(image["config_digest"])):
+            raise Refused("Restored authentication image differs from its signed OCI identity")
+        subject = cls._subject(raw[cls.SOURCE], raw[cls.BUILD], raw[cls.BEHAVIOR], host,
+                               {**image, "reference": application["image"]}, manifest["version"], schema_revision=application["schema_revision"])
+        return {"schema": 1, "contract": cls.CONTRACT,
+                "subject": subject,
+                "proof_artifacts": {name: artifacts[name] for name in (cls.SOURCE, cls.BUILD, cls.BEHAVIOR)},
+                "native_qualified": False, "execution_verified_by_tool": False}
+
+
 def _object(pairs):
     value = {}
     for key, item in pairs:

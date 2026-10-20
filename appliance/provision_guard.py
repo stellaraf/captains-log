@@ -364,6 +364,8 @@ def main():
         from nebulalog_manager.update_enrollment import UpdateEnrollment
         try:
             UpdateEnrollment().verify_build_inputs(require_factory=True)
+            subprocess.run(['/usr/bin/python3', '-I', '-B', '/usr/libexec/nebulalog/factory-kernel', '--verify'],
+                           check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
         except Exception:
             raise Refused("Measured build inputs and packaged factory publisher trust are required before sealing") from None
     else:

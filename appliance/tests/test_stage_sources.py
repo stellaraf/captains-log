@@ -15,6 +15,8 @@ SPEC = importlib.util.spec_from_file_location("stage_sources", SCRIPTS / "stage_
 staging = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(staging)
 from prepare_provenance import capture
+from nebulalog_manager.image_bundle import RestoredAuthContract
+import hashlib
 
 
 class StagedSourceTests(unittest.TestCase):
@@ -29,6 +31,8 @@ class StagedSourceTests(unittest.TestCase):
         for prefix in staging.PREFIXES:
             if not any(name.startswith(prefix) for name in staging.REQUIRED):
                 self.write(prefix + "fixture", b"fixture payload\n")
+        for name in ("postgres.sql", "clickhouse.sql", "host_stepup.sql"):
+            self.write("migrations/" + name, (SCRIPTS.parents[1] / "migrations" / name).read_bytes())
         self.write("LICENSE", b"fixture license\n")
         self.write("internal/example.go", b"package example\n")
         self.git("init", "--quiet")
@@ -52,7 +56,7 @@ class StagedSourceTests(unittest.TestCase):
         return path
 
     def capture(self):
-        return capture(self.root, self.bundle, self.provenance, sequence=1, schema_revision="1", private_unsealed=True)
+        return capture(self.root, self.bundle, self.provenance, sequence=1, schema_revision="3", private_unsealed=True)
 
     def stage(self):
         return staging.stage(self.root, self.provenance, self.output)
@@ -70,6 +74,37 @@ class StagedSourceTests(unittest.TestCase):
         self.assertEqual(staging.verify(self.output), result)
         self.write("appliance/install-host.sh", b"later edit\n")
         self.assertEqual(staging.verify(self.output), result)
+
+    def factory_auth(self):
+        self.capture()
+        descriptor_path = self.provenance / "initial-release.json"
+        descriptor = json.loads(descriptor_path.read_bytes())
+        artifacts = {}
+        for name in RestoredAuthContract.EVIDENCE:
+            # Transfer-only fixture. The enrollment contract separately tests
+            # real OCI/source binding and refuses this as behavior evidence.
+            raw = b'{"transfer_fixture":true}\n'
+            (self.provenance / "restore-auth" / name).write_bytes(raw)
+            artifacts[name] = {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+        descriptor["restore_auth"] = {"schema": 1, "contract": RestoredAuthContract.CONTRACT,
+                                       "version": "1.0.0", "artifacts": artifacts}
+        descriptor_path.write_text(json.dumps(descriptor))
+
+    def test_factory_auth_receipts_transfer_with_descriptor_hash_and_fixed_modes(self):
+        self.factory_auth()
+        self.stage()
+        for name in RestoredAuthContract.EVIDENCE:
+            path = self.output / "restore-auth" / name
+            self.assertEqual(path.read_bytes(), (self.provenance / "restore-auth" / name).read_bytes())
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o400)
+        path.chmod(0o600); path.write_bytes(b"changed")
+        with self.assertRaises(ValueError): staging.verify(self.output)
+
+    def test_changed_factory_receipt_refuses_before_frozen_output(self):
+        self.factory_auth()
+        (self.provenance / "restore-auth/application-build.json").write_bytes(b"changed")
+        with self.assertRaises(ValueError): self.stage()
+        self.assertFalse(self.output.exists())
 
     def test_new_stages_have_distinct_recorded_disk_ids_stable_on_verification(self):
         self.capture()
@@ -195,6 +230,7 @@ class StagedSourceTests(unittest.TestCase):
         self.assertIn("$${path}", content)
         self.assertIn("%%{if true}", content)
         self.assertTrue(Path(result["variables"]["appliance_source_directory"]).is_absolute())
+        self.assertEqual(result["variables"]["provenance_directory"], str(self.output.resolve()))
 
     def test_omitted_runtime_file_refuses_incomplete_capture(self):
         (self.root / "appliance/bin/nebulalog-aide").unlink()

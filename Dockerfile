@@ -1,10 +1,10 @@
-FROM node:24-bookworm-slim AS web
+FROM docker.io/library/node:24-bookworm-slim@sha256:6642ef280aebc09c4541bee0b15c9f89f0f3f3c247ddee79ae1d37eddfdcbbaa AS web
 WORKDIR /build/web
 COPY web/package*.json ./
 RUN npm ci
 COPY web/ ./
 RUN npm run build
-FROM golang:1.25-bookworm AS go
+FROM docker.io/library/golang:1.27.2-bookworm@sha256:55395706e9703db746cc507abfc4eb2aea75918f8a8024e4848e2cb81004f5ad AS go
 ARG GOFIPS140=v1.0.0
 ARG VERSION=0.1.0-dev
 ENV GOFIPS140=$GOFIPS140

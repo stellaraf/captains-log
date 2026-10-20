@@ -69,6 +69,10 @@ variable "appliance_source_directory" {
   default     = "appliance"
   description = "Captured installer/runtime source directory from stage_sources.py for a reproducible build."
 }
+variable "provenance_directory" {
+  type        = string
+  description = "Frozen stage_sources.py output containing initial-release.json and source-manifest.json; required even for an unsealed qualification appliance."
+}
 variable "keycloak_realm_template" {
   type        = string
   default     = "deploy/keycloak/realm.json"
@@ -220,14 +224,24 @@ UPLOAD
     source      = "${var.image_bundle_directory}/"
     destination = "/tmp/nebulalog-image-bundle"
   }
+  provisioner "file" {
+    source      = "${var.provenance_directory}/initial-release.json"
+    destination = "/tmp/nebulalog-image-bundle/initial-release.json"
+  }
+  provisioner "file" {
+    source      = "${var.provenance_directory}/source-manifest.json"
+    destination = "/tmp/nebulalog-image-bundle/source-manifest.json"
+  }
+  provisioner "file" {
+    source      = "${var.provenance_directory}/restore-auth"
+    destination = "/tmp/nebulalog-image-bundle/restore-auth"
+  }
   provisioner "shell" {
     inline = [
       var.uefi == null ? "test ! -d /sys/firmware/efi" : "test -d /sys/firmware/efi && test \"$(uname -m)\" = x86_64 && mountpoint -q /boot/efi",
       "sudo /bin/bash /tmp/nebulalog-appliance/install-host.sh"
     ]
   }
-  post-processor "manifest" {
-    output     = "output/packer-manifest.json"
-    strip_path = true
-  }
+  # Retain the builder artifact directly. Record receipts outside Packer: a
+  # failed post-processor can destroy its input even with -on-error=abort.
 }

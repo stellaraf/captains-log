@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from nebulalog_manager.common import CommandFailed, Refused, atomic_json
 from nebulalog_manager.firstboot import (FirstBoot, Locations, FINAL_CHECKS, HOST_STAGES,
@@ -303,6 +303,56 @@ class TransactionTests(unittest.TestCase):
             _runtime_console(self.manager, CONFIG, receipt)
         self.assertIn("TLS certificate SHA-256: " + "aa" * 32, output.getvalue())
         self.assertIn("TLS CA certificate SHA-256: " + "bb" * 32, output.getvalue())
+
+
+class WizardRecoveryRoutingTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        base = Path(temporary.name)
+        self.paths = Locations(base / "etc", base / "data", base / "run")
+        self.paths.bootstrap.mkdir(parents=True)
+        (self.paths.data / "manager").mkdir(parents=True)
+        self.manager = FirstBoot(self.paths, runner=Mock())
+        self.manager.journal_path.write_text("{}")
+        self.manager._host = Mock()
+        self.manager.status = Mock(return_value={"state": "host-ready", "setup_complete": False})
+        self.manager.config = Mock(return_value=CONFIG)
+        self.manager.gate = Mock(return_value={"host_ready": True, "setup_complete": False, "installation_id": "11111111-2222-4333-8444-555555555555"})
+        self.manager.plan = self.manager.apply = self.manager.provision = Mock(side_effect=AssertionError("Existing host must not be rewritten"))
+
+    def test_retained_restore_routes_before_runtime_resume_or_apply(self):
+        from nebulalog_manager.firstboot import wizard
+        (self.paths.data / "manager/restore.json").write_text("{}")
+        with patch("nebulalog_manager.console.local_console"), patch("builtins.print"), \
+                patch("nebulalog_manager.setup_integrity.resume_runtime", side_effect=AssertionError("Route retained restore first")), \
+                patch("nebulalog_manager.console.host_ready_console", return_value={"state": "recovery_required"}) as menu:
+            self.assertEqual(wizard(self.manager), {"state": "recovery_required"})
+        menu.assert_called_once_with(self.manager, CONFIG, restore_only=True)
+        self.manager.runner.assert_not_called()
+        self.manager.apply.assert_not_called()
+
+    def test_host_ready_retry_offers_choice_without_recreating_credentials(self):
+        from nebulalog_manager.firstboot import wizard
+        (self.paths.bootstrap / "host-ready.json").write_text("{}")
+        with patch("nebulalog_manager.console.local_console"), patch("builtins.print"), \
+                patch("nebulalog_manager.setup_integrity.resume_runtime", return_value=None), \
+                patch("nebulalog_manager.firstboot._password_file", side_effect=AssertionError("Do not recreate credentials")), \
+                patch("nebulalog_manager.firstboot._console_recovery") as export, \
+                patch("nebulalog_manager.console.host_ready_console", return_value={"state": "host-ready"}) as menu:
+            self.assertEqual(wizard(self.manager), {"state": "host-ready"})
+        export.assert_called_once()
+        menu.assert_called_once_with(self.manager, CONFIG)
+        self.manager.apply.assert_not_called()
+        self.manager.runner.assert_not_called()
+
+    def test_restored_completion_keeps_existing_mfa_language(self):
+        output = io.StringIO()
+        with patch("nebulalog_manager.setup_integrity.pending_console"), \
+                patch("nebulalog_manager.firstboot._answer", return_value="LATER"), patch("sys.stdout", output):
+            _runtime_console(self.manager, CONFIG, {"restored": True})
+        self.assertIn("existing MFA/recovery credentials", output.getvalue())
+        self.assertNotIn("enroll MFA and recovery codes", output.getvalue())
 
 
 if __name__ == "__main__":

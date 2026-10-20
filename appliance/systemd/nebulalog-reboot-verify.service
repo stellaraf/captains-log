@@ -1,5 +1,5 @@
 [Unit]
-Description=Verify Captain’s Log after an operating system maintenance reboot
+Description=Verify Captain’s Log boot integrity and operating system recovery
 After=nebulalog-postgresql.service nebulalog-clickhouse.service nebulalog-keycloak.service nebulalog-api.service nebulalog-ingest.service nebulalog-edge.service
 Wants=nebulalog-postgresql.service nebulalog-clickhouse.service nebulalog-keycloak.service nebulalog-api.service nebulalog-ingest.service nebulalog-edge.service
 RequiresMountsFor=/var/lib/nebulalog

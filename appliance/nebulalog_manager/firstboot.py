@@ -197,7 +197,7 @@ class FirstBoot:
                 raise Refused("Enrollment blocked: the current boot reports a kernel cryptographic self-test failure; inspect nebulalog compliance status and the kernel journal")
             if diagnostic == "unavailable":
                 raise Refused("Enrollment blocked: complete current-boot kernel cryptographic diagnostics are unavailable")
-            raise Refused("FIPS, SELinux Enforcing, firewalld and auditd must be active before enrollment")
+            raise Refused("FIPS, kernel module signature enforcement, SELinux Enforcing, firewalld and auditd must be active before enrollment")
 
     def config(self, path: Path) -> dict:
         return validate_config(json.loads(_private_file(path, maximum=65536)))
@@ -431,6 +431,8 @@ class FirstBoot:
         self.runner(["systemctl", "restart", "chronyd"])
 
     def apply(self, config: dict, confirmation: str) -> dict:
+        from .restore_runtime import refuse_normal_provision
+        refuse_normal_provision(self.paths)
         validate_config(config)
         self._host()
         from .setup_integrity import _integrity_state_exists
@@ -442,6 +444,7 @@ class FirstBoot:
         # Never keep the LUKS unlock key on the unencrypted system disk.
         _private_file(Path(config["unlock_key_file"]), minimum=14)
         with locked(self.paths.bootstrap / "firstboot.lock"):
+            refuse_normal_provision(self.paths)
             if _integrity_state_exists(self):
                 raise Refused("File-integrity state already exists; automatic host reconfiguration is refused")
             plan = self.plan(config)
@@ -512,11 +515,14 @@ class FirstBoot:
         return result
 
     def provision(self):
+        from .restore_runtime import refuse_normal_provision
+        refuse_normal_provision(self.paths)
         gate = self.gate()
         from .setup_integrity import _integrity_state_exists
         if _integrity_state_exists(self):
             raise Refused("File-integrity state already exists; automatic runtime reprovisioning is refused")
         with locked(self.paths.bootstrap / "firstboot.lock"):
+            refuse_normal_provision(self.paths)
             if _integrity_state_exists(self):
                 raise Refused("File-integrity state already exists; automatic runtime reprovisioning is refused")
             receipt = self._runtime_receipt("prepare", gate["installation_id"])
@@ -580,6 +586,70 @@ def _console_recovery(manager, prepared):
     atomic_json(manager.paths.bootstrap / "recovery-export.json", {"installation_id": prepared["installation_id"], "acknowledged_at": datetime.now(timezone.utc).isoformat(), "status": "operator-acknowledged; recovery test still required"})
 
 
+def _bootloader_console(manager, config, installation_id):
+    from .baseline import initial_hardening
+    from .bootloader import enroll
+    from .update_enrollment import _read
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise Refused("GRUB recovery enrollment requires the interactive local console")
+    configuration = manager.paths.data / "configuration"
+    state = configuration / "bootstrap"
+    with initial_hardening(configuration, installation_id, config["baseline"]):
+        journal = state / "bootloader-enrollment.json"
+        password = None
+        if journal.exists() or journal.is_symlink():
+            username = json.loads(_read(journal, 12 * 1024**2))["username"]
+        else:
+            print("Set a separate GRUB recovery credential for editing boot settings. Normal boot remains unattended.")
+            username = _answer("GRUB recovery username (not root, admin, or administrator)", "captainslog-recovery")
+            password = getpass.getpass("GRUB password (14–128 printable non-space ASCII characters): ")
+            if not secrets.compare_digest(password, getpass.getpass("Confirm GRUB password: ")):
+                raise Refused("GRUB passwords do not match")
+            if _answer("Type STORED after saving the GRUB username/password in your off-appliance vault", "CANCEL") != "STORED":
+                raise Refused("GRUB recovery credential export was not acknowledged")
+        return enroll(state, installation_id, username, password, runner=manager.runner)
+
+
+def _hardening_console(manager, config):
+    """Apply the chosen policy before AIDE enrollment, with a local confirmation."""
+    from .baseline import Baseline, _sha, factory_profile, factory_policy, initial_hardening
+    baseline = Baseline(manager.paths.data / "configuration", runner=manager.runner)
+    installation_id = manager.gate()["installation_id"]
+    if not baseline.policy_path.exists():
+        catalog, profile, _ = factory_profile(config["baseline"])
+        print("Bundled baseline: " + profile["benchmark_basis"])
+        print("Content: " + catalog["content_revision"] + " SHA-256 " + catalog["sha256"])
+        print(catalog["platform_basis"])
+        print(catalog["license_basis"])
+        print("Review these explicit appliance adaptations before accepting this content:")
+        for decision in profile["tailoring_decisions"]:
+            print("  " + decision["rule_id"] + ": " + decision["rationale"])
+            print("    Effective control: " + decision["effective_control"])
+        for decision in profile.get("tailoring_groups", []):
+            print("Enable group:", decision["group_id"], "(covers", len(decision["affected_rules"]), "rules)")
+            print("Reason:", decision["rationale"], "Effective control:", decision["effective_control"])
+        for decision in profile.get("tailoring_values", []):
+            print("  " + decision["value_id"] + " -> " + decision["selector"] + ": " + decision["rationale"])
+        print("This accepts the exact content and adaptations for use; it does not approve security findings or certify compliance.")
+        if _answer("Type ACCEPT to select this bundled content", "CANCEL") != "ACCEPT":
+            return {"state": "cancelled", "host_modified": False}
+        reviewer = _answer("Your name for the content-review record")
+        with initial_hardening(baseline.configuration, installation_id, config["baseline"]):
+            policy = factory_policy(config["baseline"], reviewer, runner=manager.runner, expected_catalog=catalog)
+            candidate = baseline.configuration / ("baseline-candidate-" + uuid.uuid4().hex + ".json")
+            atomic_json(candidate, policy)
+            baseline.select(candidate, _sha(candidate), installation_id, config["baseline"])
+    confirmation = _sha(baseline.policy_path)
+    print("Apply " + config["baseline"] + " hardening to this appliance. This changes operating-system settings and may require a reboot.")
+    print("Apply hardening before enrolling file integrity. A fresh assessment and findings review are still required afterward.")
+    if _answer("Type APPLY to apply the selected hardening policy", "CANCEL") != "APPLY":
+        return {"state": "cancelled", "host_modified": False}
+    _bootloader_console(manager, config, installation_id)
+    result = baseline.remediate(installation_id, config["baseline"], confirmation)
+    print("The hardening run finished. Complete file-integrity enrollment, then assess and review the remaining security findings before final setup verification.")
+    return result
+
+
 def _runtime_console(manager, config, receipt):
     """Resume completion actions without rewriting already prepared runtime files."""
     from .setup_integrity import integrity_console, pending_console
@@ -589,18 +659,24 @@ def _runtime_console(manager, config, receipt):
         print("TLS certificate SHA-256: " + receipt["tls_certificate_sha256"])
     if receipt.get("tls_ca_certificate_sha256"):
         print("TLS CA certificate SHA-256: " + receipt["tls_ca_certificate_sha256"])
-    print("Sign in with your local administrator, enroll MFA and recovery codes, and configure PAN-OS forwarding.")
+    if receipt.get("restored") is True:
+        print("Sign in with the restored administrator and existing MFA/recovery credentials. Verify roles, settings and PAN-OS forwarding. Recovery does not reset passwords or MFA.")
+    else:
+        print("Sign in with your local administrator, enroll MFA and recovery codes, and configure PAN-OS forwarding.")
     print("File integrity requires the installation's reviewed security policy. Enroll and check it before final security assessment and findings review.")
     while True:
-        action = _answer("FILE INTEGRITY, VERIFY final setup, or LATER", "LATER").upper()
+        action = _answer("HARDENING, FILE INTEGRITY, VERIFY final setup, or LATER", "LATER").upper()
         pending_console(manager)
         if action == "LATER":
             return {"state": "runtime-ready", "setup_complete": False, "https_url": receipt.get("https_url", "https://" + config["hostname"])}
         if action == "FILE INTEGRITY":
             integrity_console(manager)
             continue
+        if action == "HARDENING":
+            _hardening_console(manager, config)
+            continue
         if action != "VERIFY":
-            print("Choose FILE INTEGRITY, VERIFY, or LATER.")
+            print("Choose HARDENING, FILE INTEGRITY, VERIFY, or LATER.")
             continue
         # No stored-key acknowledgment substitutes for reading the off-appliance
         # recovery material back and testing it against the real LUKS container.
@@ -649,6 +725,8 @@ def wizard(manager=None):
         config = manager.config(config_path)
         print("Resuming the existing installation; disk and configuration selections are locked to its journal.")
     else:
+        print("If recovering a configuration backup, use its hostname, administrator username and baseline. Keep the source offline before reusing its network identity.")
+        print("Host enrollment uses new disk credentials. Its temporary bootstrap administrator password does not replace restored account credentials or MFA.")
         _private_dir(manager.paths.runtime)
         _private_dir(manager.paths.bootstrap)
         candidates, seen = [], set()
@@ -700,10 +778,20 @@ def wizard(manager=None):
                   "retention_days": int(_answer("Initial retention days", "90"))}
         validate_config(config)
         atomic_json(config_path, config)
+    from .console import host_ready_console
+    # A restore owns this target before runtime readiness exists. Never fall
+    # through into apply/provision, including after an interrupted activation.
+    if os.path.lexists(manager.paths.data / "manager/restore.json"):
+        return host_ready_console(manager, config, restore_only=True)
     receipt = resume_runtime(manager, config)
     if receipt is not None:
         print("Verified the existing installation and completed runtime journal. Resuming completion actions without reprovisioning.")
         return _runtime_console(manager, config, receipt)
+    if os.path.lexists(manager.paths.bootstrap / "host-ready.json"):
+        gate = manager.gate()
+        prepared = {**gate, "recovery_key_path": str(manager.paths.runtime / ("luks-recovery-" + gate["installation_id"] + ".key"))}
+        _console_recovery(manager, prepared)
+        return host_ready_console(manager, config)
     _private_dir(manager.paths.runtime)
     _private_dir(manager.paths.bootstrap)
     plan = manager.plan(config)
@@ -717,10 +805,7 @@ def wizard(manager=None):
     print("\nEnrolling the reviewed disk and applying configuration. Interrupted work retains its journal.")
     prepared = manager.apply(config, plan["confirmation"])
     _console_recovery(manager, prepared)
-    print("Encrypted storage and host configuration are ready. Preparing application services...")
-    manager.runner(["systemctl", "start", "nebulalog-firstboot.service"], timeout=180)
-    receipt = manager.provision()
-    return _runtime_console(manager, config, receipt)
+    return host_ready_console(manager, config)
 
 
 def main(argv=None):

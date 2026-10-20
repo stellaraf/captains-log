@@ -6,6 +6,7 @@ set -euo pipefail
 [ "$ID" = rocky ] && [ "${VERSION_ID%%.*}" = 9 ]
 [ "$(cat /proc/sys/crypto/fips_enabled)" = 1 ]
 fips-mode-setup --check
+[ "$(cat /sys/module/module/parameters/sig_enforce)" = Y ]
 [ "$(getenforce)" = Enforcing ]
 APPLIANCE_SOURCE=$(cd "$(dirname "$0")" && pwd)
 # Serialize the complete provisioner and sealer without creating a lock file.
@@ -14,13 +15,14 @@ exec 9</etc
 flock -n 9 || { echo 'Another image provisioner or sealer is active' >&2; exit 78; }
 # This guard durably creates the private receipt before the first payload write.
 # It never resets customer state or adopts a legacy unmarked partial installation.
-python3 "$APPLIANCE_SOURCE/provision_guard.py" begin
+python3.14 "$APPLIANCE_SOURCE/provision_guard.py" begin
 install -d -m 0755 /usr/lib/nebulalog/nebulalog_manager /usr/libexec/nebulalog /usr/share/nebulalog/quadlet-templates /usr/share/nebulalog/httpd /usr/share/nebulalog/keycloak
 install -d -m 0700 /etc/nebulalog
 install -o root -g root -m 0600 "$APPLIANCE_SOURCE/security/github-updates.json" /etc/nebulalog/github-updates.json
 install -m 0755 "$APPLIANCE_SOURCE/provision_guard.py" /usr/libexec/nebulalog/provision-guard
 install -m 0755 "$APPLIANCE_SOURCE/host_boot.py" /usr/libexec/nebulalog/host-boot
 install -m 0755 "$APPLIANCE_SOURCE/factory_host.py" /usr/libexec/nebulalog/factory-host
+install -m 0755 "$APPLIANCE_SOURCE/factory_kernel.py" /usr/libexec/nebulalog/factory-kernel
 install -m 0644 "$APPLIANCE_SOURCE"/nebulalog_manager/*.py /usr/lib/nebulalog/nebulalog_manager/
 install -d -m 0755 /usr/lib/nebulalog/nebulalog_adapters
 install -m 0644 "$APPLIANCE_SOURCE"/adapters/nebulalog_adapters/*.py /usr/lib/nebulalog/nebulalog_adapters/
@@ -54,6 +56,10 @@ fi
 install -m 0644 "$APPLIANCE_SOURCE/security/storage.conf" /etc/containers/storage.conf
 install -d -m 0755 /etc/dracut.conf.d
 install -m 0644 "$APPLIANCE_SOURCE/security/dracut-nebulalog.conf" /etc/dracut.conf.d/90-nebulalog.conf
+install -d -m 0755 /usr/share/nebulalog/baselines
+for baseline_file in baseline-catalog.json baseline-cis.xml baseline-stig.xml; do
+  install -m 0644 "$APPLIANCE_SOURCE/security/$baseline_file" "/usr/share/nebulalog/baselines/$baseline_file"
+done
 install -d -m 0755 /usr/share/nebulalog/aide
 install -m 0644 "$APPLIANCE_SOURCE/security/aide-policy.conf" /usr/share/nebulalog/aide/policy.conf
 install -o root -g root -m 0600 "$APPLIANCE_SOURCE/security/aide.conf" /etc/aide.conf
@@ -62,7 +68,7 @@ for driver in vmw_pvscsi vmxnet3 virtio_blk virtio_scsi virtio_net; do
   modinfo "$driver" >/dev/null
 done
 install -m 0600 "$APPLIANCE_SOURCE/security/trust.json" /etc/nebulalog/trust.json
-python3 - <<'PYTRUST'
+python3.14 - <<'PYTRUST'
 import hashlib, json
 from pathlib import Path
 trust=json.loads(Path('/etc/nebulalog/trust.json').read_text())
@@ -70,13 +76,16 @@ key=Path('/etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9').read_bytes()
 if trust['schema'] != 1 or hashlib.sha256(key).hexdigest() != trust['rocky_key_sha256']:
     raise SystemExit('Installed Rocky release key differs from the independently reviewed key')
 PYTRUST
+# Capture the exact installed vendor kernel before factory provenance is sealed.
+# This downloads signed RPM bytes only; it never replaces an installed kernel.
+PYTHONPATH=/usr/lib/nebulalog python3.14 "$APPLIANCE_SOURCE/factory_kernel.py"
 if [ -f /tmp/nebulalog-image-bundle/manifest.json ]; then
   install -d -m 0755 /usr/share/nebulalog/images
   install -m 0644 /tmp/nebulalog-image-bundle/*.oci.tar /usr/share/nebulalog/images/
   install -m 0644 /tmp/nebulalog-image-bundle/manifest.json /usr/share/nebulalog/images/manifest.json
   install -m 0644 /tmp/nebulalog-image-bundle/images.json /etc/nebulalog/images.json
   # Image loading waits for the encrypted mount; no Podman graph is created now.
-  PYTHONPATH=/usr/lib/nebulalog python3 - <<'PYBUNDLE'
+  PYTHONPATH=/usr/lib/nebulalog python3.14 - <<'PYBUNDLE'
 from pathlib import Path
 import json
 from nebulalog_manager.image_bundle import verify_bundle
@@ -94,17 +103,28 @@ if [ -f /tmp/nebulalog-image-bundle/initial-release.json ] || [ -f /tmp/nebulalo
     fi
   done
   install -m 0600 /tmp/nebulalog-image-bundle/source-manifest.json /usr/share/nebulalog/source-manifest.json
+  # Only the fixed bounded evidence names are copied. Enrollment verifies their
+  # exact hashes against the initial descriptor before granting any capability.
+  install -d -m 0700 /usr/share/nebulalog/restore-auth
+  for proof in application-build.json restore-auth-behavior.json; do
+    if [ -e "/tmp/nebulalog-image-bundle/restore-auth/$proof" ] || [ -L "/tmp/nebulalog-image-bundle/restore-auth/$proof" ]; then
+      [ -f "/tmp/nebulalog-image-bundle/restore-auth/$proof" ] && [ ! -L "/tmp/nebulalog-image-bundle/restore-auth/$proof" ] || exit 1
+      install -m 0600 "/tmp/nebulalog-image-bundle/restore-auth/$proof" "/usr/share/nebulalog/restore-auth/$proof"
+    fi
+  done
   # Build only from the captured installer/realm bytes, before first boot. This
   # helper retains the parent's /etc lock and cannot run on enrolled appliances.
-  PYTHONPATH=/usr/lib/nebulalog python3 "$APPLIANCE_SOURCE/factory_host.py" --source "$APPLIANCE_SOURCE"
-  PYTHONPATH=/usr/lib/nebulalog python3 - <<'PYPROVENANCE'
+  PYTHONPATH=/usr/lib/nebulalog python3.14 "$APPLIANCE_SOURCE/factory_host.py" --source "$APPLIANCE_SOURCE"
+  PYTHONPATH=/usr/lib/nebulalog python3.14 - <<'PYPROVENANCE'
 from nebulalog_manager.update_enrollment import UpdateEnrollment
 UpdateEnrollment().verify_build_inputs()
 PYPROVENANCE
 fi
 # Read the exact policy records first. Matching registrations are no-ops;
 # unexpected local policy or differing fixed expressions are never modified.
-ensure_fcontext() { python3 "$APPLIANCE_SOURCE/provision_guard.py" fcontext "$@"; }
+# Rocky's seobject/libselinux bindings belong to the vendor system Python.
+# Keep appliance code on Python 3.14; use the OS interpreter for this OS policy operation.
+ensure_fcontext() { /usr/bin/python3 "$APPLIANCE_SOURCE/provision_guard.py" fcontext "$@"; }
 ensure_fcontext -a -e /var/lib/containers/storage /var/lib/nebulalog/containers
 ensure_fcontext -a -t httpd_var_run_t '/run/nebulalog-public(/.*)?'
 ensure_fcontext -a -t container_file_t '/run/nebulalog-status(/.*)?'
@@ -119,7 +139,7 @@ setsebool -P httpd_can_network_connect on
 # The generated HTTPS-only profile replaces the distribution example virtual
 # host; there is no plaintext management listener or shared sample certificate.
 rm -f /etc/httpd/conf.d/ssl.conf /etc/httpd/conf.d/welcome.conf
-python3 - <<'PYHTTP'
+python3.14 - <<'PYHTTP'
 from pathlib import Path
 p=Path('/etc/httpd/conf/httpd.conf')
 lines=p.read_text().splitlines()
@@ -132,7 +152,7 @@ install -m 0644 "$APPLIANCE_SOURCE/security/90-nebulalog.conf" /etc/sysctl.d/90-
 # Reserve host persistence for the future encrypted mount, never write logs here.
 install -d -m 0700 /var/lib/nebulalog
 # No universal database/auth/release-signing secrets are embedded in the image.
-python3 - <<'PYCONFIG'
+python3.14 - <<'PYCONFIG'
 from pathlib import Path
 import configparser
 p=Path("/etc/dnf/dnf.conf")
@@ -143,7 +163,7 @@ with p.open("w") as f:c.write(f)
 PYCONFIG
 # The OS timer's service requires enrolled maintenance policy; its adapter then
 # verifies encrypted storage, healthy services/authentication and backups before DNF.
-systemctl enable nebulalog-firstboot.service nebulalog-storage.timer nebulalog-aide.timer nebulalog-os-update.timer nebulalog-app-update.timer nebulalog-reboot-verify.service nebulalog-status.timer
+systemctl enable nebulalog-firstboot.service nebulalog-storage.timer nebulalog-aide.timer nebulalog-os-update.timer nebulalog-app-update.timer nebulalog-reboot-verify.service nebulalog-reboot-verify.timer nebulalog-status.timer
 if [ -f /etc/systemd/system/nebulalog-console.service ]; then
   systemctl enable nebulalog-console.service
 fi
@@ -152,4 +172,4 @@ fi
 # removes this account and deletes host keys before a distributable image exists.
 systemctl enable sshd
 systemctl daemon-reload
-python3 "$APPLIANCE_SOURCE/provision_guard.py" finish
+python3.14 "$APPLIANCE_SOURCE/provision_guard.py" finish

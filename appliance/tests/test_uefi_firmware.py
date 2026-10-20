@@ -49,7 +49,7 @@ class Guest:
                 "\nset prefix=($dev)/grub2\nexport $prefix\nconfigfile $prefix/grub.cfg\n").encode(),
             "/boot/grub2/grub.cfg": b"insmod blscfg\nblscfg\n",
             "/boot/loader/entries/fixture.conf": ("title Rocky Linux\nlinux /vmlinuz-fixture.x86_64\n"
-                "initrd /initramfs-fixture.x86_64.img\noptions root=UUID=" + ROOT_UUID + " ro fips=1\n").encode(),
+                "initrd /initramfs-fixture.x86_64.img\noptions root=UUID=" + ROOT_UUID + " ro fips=1 module.sig_enforce=1\n").encode(),
             "/boot/vmlinuz-fixture.x86_64": b"fixture kernel",
             "/boot/initramfs-fixture.x86_64.img": b"fixture initramfs"})
         self.mounts = {"/": "/dev/system/root", "/boot": "/dev/sda2", "/boot/efi": "/dev/sda1"}
@@ -128,6 +128,9 @@ class StaticFirmwareTests(unittest.TestCase):
                  ("/boot/loader/entries/fixture.conf", b"fips=1", b"fips=0"),
                  ("/boot/loader/entries/fixture.conf", b"fips=1", b"fips=1 fips=0"),
                  ("/boot/loader/entries/fixture.conf", b"/vmlinuz-fixture.x86_64", b"/../vmlinuz"),
+                 ("/boot/loader/entries/fixture.conf", b"module.sig_enforce=1", b""),
+                 ("/boot/loader/entries/fixture.conf", b"module.sig_enforce=1", b"module.sig_enforce=0"),
+                 ("/boot/loader/entries/fixture.conf", b"module.sig_enforce=1", b"module.sig_enforce=1 module.sig_enforce=0"),
                  ("/boot/grub2/grub.cfg", b"blscfg", b"disabled")]
         for path, old, new in cases:
             with self.subTest(path=path, old=old):

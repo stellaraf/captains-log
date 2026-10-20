@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stellaraf/captains-log/internal/store"
 )
@@ -53,6 +55,10 @@ func TestLogPagesUseEventBudgetAndPreserveCursorContract(t *testing.T) {
 			}
 			ch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				body, _ := io.ReadAll(r.Body)
+				if strings.HasPrefix(string(body), "SELECT name FROM system.settings WHERE ") {
+					_, _ = io.WriteString(w, "query_plan_max_limit_for_lazy_materialization\nquery_plan_optimize_lazy_materialization\n")
+					return
+				}
 				params := r.URL.Query()
 				requests <- eventReadRequest{string(body), params}
 				start := 0
@@ -65,7 +71,7 @@ func TestLogPagesUseEventBudgetAndPreserveCursorContract(t *testing.T) {
 				}
 			}))
 			defer ch.Close()
-			server := &Server{Store: &store.Store{CH: store.NewClickHouse(ch.URL, "reader", "password")}}
+			server := &Server{Store: &store.Store{CH: store.NewClickHouse(ch.URL, "reader", "password")}, retentionRead: testRetentionRead}
 			values := url.Values{"type": {"threat"}, "query": {"action eq alert"}, "from": {"2026-09-01T00:00:00Z"}, "to": {"2026-09-08T12:00:00Z"}, "sort": {test.sort}, "order": {test.order}, "limit": {strconv.Itoa(test.limit)}}
 			read := func() (map[string]any, eventReadRequest) {
 				recorder := httptest.NewRecorder()
@@ -81,6 +87,12 @@ func TestLogPagesUseEventBudgetAndPreserveCursorContract(t *testing.T) {
 				}
 				request := <-requests
 				requireEventReadBudget(t, request)
+				if request.Params.Get("max_bytes_before_remerge_sort") != "67108864" {
+					t.Fatal("page sort retention exceeds the bounded query profile")
+				}
+				if request.Params.Get("query_plan_optimize_lazy_materialization") != "1" || request.Params.Get("query_plan_max_limit_for_lazy_materialization") != "1001" {
+					t.Fatal("page payload deferral does not cover the cursor lookahead")
+				}
 				if request.Params.Get("param_limit") != strconv.Itoa(test.limit+1) || request.Params.Get("param_q0") != "alert" {
 					t.Fatal("lookahead limit or bound manual filter changed")
 				}
@@ -146,7 +158,7 @@ func TestEventDetailUsesEventBudgetAndPreservesFullPayload(t *testing.T) {
 		_, _ = io.WriteString(w, `{"id":"11111111111111111111111111111111","raw":"preserved","raw_base64":"AP8=","fields":{"extra":"kept"},"extra_fields":["other"]}`+"\n")
 	}))
 	defer ch.Close()
-	server := &Server{Store: &store.Store{CH: store.NewClickHouse(ch.URL, "reader", "password")}}
+	server := &Server{Store: &store.Store{CH: store.NewClickHouse(ch.URL, "reader", "password")}, retentionRead: testRetentionRead}
 	request := httptest.NewRequest(http.MethodGet, "/api/events/11111111111111111111111111111111?at=2026-09-08T10:00:00.123456Z&type=dns", nil)
 	request.SetPathValue("id", "11111111111111111111111111111111")
 	recorder := httptest.NewRecorder()
@@ -174,10 +186,16 @@ func TestEventReadFailureDoesNotReturnPartialPage(t *testing.T) {
 		_, _ = io.WriteString(w, "{\"id\":\"partial-event\"}\nCode: 241. Memory limit exceeded")
 	}))
 	defer ch.Close()
-	server := &Server{Store: &store.Store{CH: store.NewClickHouse(ch.URL, "reader", "password")}}
+	server := &Server{Store: &store.Store{CH: store.NewClickHouse(ch.URL, "reader", "password")}, retentionRead: testRetentionRead}
 	recorder := httptest.NewRecorder()
 	server.logs(recorder, httptest.NewRequest(http.MethodGet, "/api/logs?type=traffic", nil))
 	if recorder.Code != 503 || strings.Contains(recorder.Body.String(), "partial-event") || strings.Contains(recorder.Body.String(), "241") || strings.Contains(recorder.Body.String(), "events") {
 		t.Fatal("incomplete database response was exposed as a partial successful page")
 	}
+}
+
+func testRetentionRead(_ context.Context, now time.Time) (store.Retention, string, map[string]string, error) {
+	p := store.Retention{Revision: 1, GlobalDays: 3650, PerType: map[string]int{"dns": 90, "system": 365}}
+	sql, params, err := p.Predicate(now)
+	return p, sql, params, err
 }

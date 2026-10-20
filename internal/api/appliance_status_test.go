@@ -122,6 +122,23 @@ func TestInterruptedComponentRecoveryActionIsAllowlisted(t *testing.T) {
 	}
 }
 
+func TestKernelRecoveryActionsAreFixedCommands(t *testing.T) {
+	now := time.Now().UTC()
+	for _, command := range []string{"nebulalog update kernel-retry", "nebulalog update kernel-rollback"} {
+		value := statusFixture(now)
+		value.Updates.RecoveryAction = command
+		if !validHostObservation(value, now) {
+			t.Fatalf("installed kernel recovery command rejected: %s", command)
+		}
+		for _, suffix := range []string{" --force", "; arbitrary-command", "\n"} {
+			value.Updates.RecoveryAction = command + suffix
+			if validHostObservation(value, now) {
+				t.Fatalf("modified recovery command accepted: %q", value.Updates.RecoveryAction)
+			}
+		}
+	}
+}
+
 func TestHostUpdateGenerationAndMigrationRefusalAreValidated(t *testing.T) {
 	now := time.Now().UTC()
 	value := statusFixture(now)

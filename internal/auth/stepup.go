@@ -34,11 +34,15 @@ var (
 type StepUpBinding struct {
 	InstallationID, Operation, PlanID, PlanDigest, ResourceRevision string
 	ExpiresAt                                                       time.Time
+	Challenge                                                       HostChallenge
 }
 
 func (b StepUpBinding) valid(now time.Time) bool {
 	if !stepUpUUID.MatchString(b.InstallationID) || !stepUpUUID.MatchString(b.PlanID) ||
-		!stepUpDigest.MatchString(b.PlanDigest) || !stepUpDigest.MatchString(b.ResourceRevision) || !now.Before(b.ExpiresAt) {
+		!stepUpDigest.MatchString(b.PlanDigest) || !stepUpDigest.MatchString(b.ResourceRevision) || !now.Before(b.ExpiresAt) ||
+		!b.Challenge.valid(now) || b.Challenge.InstallationID != b.InstallationID || b.Challenge.Operation != b.Operation ||
+		b.Challenge.PlanID != b.PlanID || b.Challenge.PlanDigest != b.PlanDigest || b.Challenge.ResourceRevision != b.ResourceRevision ||
+		time.Unix(b.Challenge.ExpiresAt, 0).After(b.ExpiresAt) {
 		return false
 	}
 	switch b.Operation {
@@ -55,6 +59,9 @@ func (b StepUpBinding) valid(now time.Time) bool {
 type StepUpConfig struct {
 	Policy                           AssurancePolicy
 	ApplicationClientID, RedirectURI string
+	// Protected enrollment generation; never supplied by a browser or inferred
+	// from an unqualified issuer read-back. There is no production default.
+	PolicyGenerationSHA string
 }
 
 func (c StepUpConfig) valid(now time.Time) bool {
@@ -62,6 +69,7 @@ func (c StepUpConfig) valid(now time.Time) bool {
 	return err == nil && u.Scheme == "https" && u.Host != "" && u.User == nil && u.RawQuery == "" && !u.ForceQuery && u.Fragment == "" &&
 		u.Path == "/api/host/step-up/callback" && u.RawPath == "" && claimString(c.RedirectURI, 2048) &&
 		claimString(c.ApplicationClientID, 512) && c.ApplicationClientID != HostControlClient && c.Policy.valid(now) &&
+		stepUpDigest.MatchString(c.PolicyGenerationSHA) &&
 		c.Policy.Audience == HostControlClient && c.Policy.ClientID == HostControlClient && c.Policy.TokenType == "Bearer" &&
 		slices.Equal(c.Policy.AcceptedACR, []string{HostControlACR}) && c.Policy.MaxAuthenticationAge <= stepUpLifetime &&
 		c.Policy.MaxTokenAge <= stepUpLifetime && c.Policy.MaxTokenLifetime <= stepUpLifetime
@@ -164,7 +172,13 @@ func (s *StepUp) actor(ctx context.Context, now time.Time) (stepUpActor, time.Ti
 		v.issuedAt.After(now.Add(s.config.Policy.ClockSkew)) || v.notBefore.After(now.Add(s.config.Policy.ClockSkew)) {
 		return stepUpActor{}, time.Time{}, ErrStepUpIdentity
 	}
-	return stepUpActor{v.issuer, v.subject, v.client, digestStepUp(v.sid)}, v.expiresAt, nil
+	subject := hostSubjectDigest(v.issuer, v.client, v.subject)
+	return stepUpActor{v.issuer, v.subject, v.client, hostSessionDigest(subject, v.sid)}, v.expiresAt, nil
+}
+
+func (b StepUpBinding) matchesActor(a stepUpActor) bool {
+	return b.Challenge.SubjectDigest == hostSubjectDigest(a.Issuer, a.ClientID, a.Subject) &&
+		b.Challenge.SessionDigest == a.SessionDigest
 }
 
 func (s *StepUp) ready(now time.Time) bool {
@@ -184,10 +198,12 @@ func (s *StepUp) Begin(ctx context.Context, binding StepUpBinding) (StepUpStart,
 	if err != nil {
 		return StepUpStart{}, err
 	}
-	if !binding.valid(now) {
+	if !binding.valid(now) || !binding.matchesActor(actor) || binding.Challenge.PolicyGeneration != s.config.PolicyGenerationSHA {
 		return StepUpStart{}, ErrStepUpTransaction
 	}
-	state, nonce, verifier := stepUpRandom(), stepUpRandom(), stepUpRandom()
+	policyDigest := s.policyDigest()
+	state, verifier := stepUpRandom(), stepUpRandom()
+	nonce := binding.Challenge.Nonce
 	challenge := sha256.Sum256([]byte(verifier))
 	claims, _ := json.Marshal(map[string]any{"id_token": map[string]any{"acr": map[string]any{"essential": true, "values": []string{HostControlACR}}}})
 	params := url.Values{"client_id": {HostControlClient}, "response_type": {"code"}, "response_mode": {"query"}, "scope": {"openid"},
@@ -198,21 +214,21 @@ func (s *StepUp) Begin(ctx context.Context, binding StepUpBinding) (StepUpStart,
 		return StepUpStart{}, ErrStepUpUnavailable
 	}
 	expires := now.Add(stepUpLifetime)
-	for _, limit := range []time.Time{now.Add(par.Lifetime), actorExpiry, binding.ExpiresAt, s.config.Policy.ReviewExpiresAt} {
+	for _, limit := range []time.Time{now.Add(par.Lifetime), actorExpiry, binding.ExpiresAt, time.Unix(binding.Challenge.ExpiresAt, 0), s.config.Policy.ReviewExpiresAt} {
 		if limit.Before(expires) {
 			expires = limit
 		}
 	}
-	p := stepUpPending{digestStepUp(state), nonce, verifier, s.policyDigest(), actor, binding, now, stepUpTime(expires)}
+	p := stepUpPending{digestStepUp(state), nonce, verifier, policyDigest, actor, binding, now, stepUpTime(expires)}
 	after := stepUpTime(s.now())
-	if after.Before(now) || !after.Before(p.ExpiresAt) || !s.ready(after) || ctx.Err() != nil {
+	if after.Before(now) || !after.Before(p.ExpiresAt) || !s.ready(after) || s.policyDigest() != policyDigest || ctx.Err() != nil {
 		return StepUpStart{}, ErrStepUpTransaction
 	}
 	if err := s.store.Insert(ctx, p); err != nil {
 		return StepUpStart{}, ErrStepUpUnavailable
 	}
 	after = stepUpTime(s.now())
-	if after.Before(now) || !after.Before(p.ExpiresAt) || !s.ready(after) || ctx.Err() != nil {
+	if after.Before(now) || !after.Before(p.ExpiresAt) || !s.ready(after) || s.policyDigest() != policyDigest || ctx.Err() != nil {
 		return StepUpStart{}, ErrStepUpTransaction
 	}
 	return StepUpStart{s.provider.AuthorizationURL(par.URI), p.ExpiresAt}, nil
@@ -226,6 +242,7 @@ type StepUpEvidence struct {
 	binding     StepUpBinding
 	original    stepUpActor
 	session     VerifiedSession
+	idToken     string
 	accessToken string
 	expiresAt   time.Time
 }
@@ -254,7 +271,7 @@ func (s *StepUp) Complete(ctx context.Context, state, code string, binding StepU
 	if err != nil {
 		return StepUpEvidence{}, err
 	}
-	if !binding.valid(now) {
+	if !binding.valid(now) || !binding.matchesActor(actor) || binding.Challenge.PolicyGeneration != s.config.PolicyGenerationSHA {
 		return StepUpEvidence{}, ErrStepUpTransaction
 	}
 	p, err := s.store.Consume(ctx, digestStepUp(state), actor, binding, s.policyDigest(), now)
@@ -265,12 +282,16 @@ func (s *StepUp) Complete(ctx context.Context, state, code string, binding StepU
 		return StepUpEvidence{}, ErrStepUpUnavailable
 	}
 	if p.Actor != actor || p.Binding != binding || p.PolicyDigest != s.policyDigest() || p.StateHash != digestStepUp(state) ||
-		!stepUpOpaque.MatchString(p.Nonce) || !stepUpOpaque.MatchString(p.Verifier) || now.Before(p.CreatedAt) || !now.Before(p.ExpiresAt) || p.ExpiresAt.Sub(p.CreatedAt) > stepUpLifetime {
+		p.Nonce != binding.Challenge.Nonce || !stepUpOpaque.MatchString(p.Nonce) || !stepUpOpaque.MatchString(p.Verifier) ||
+		now.Before(p.CreatedAt) || !now.Before(p.ExpiresAt) || p.ExpiresAt.Sub(p.CreatedAt) > stepUpLifetime ||
+		p.CreatedAt.Before(time.Unix(binding.Challenge.IssuedAt, 0)) ||
+		p.ExpiresAt.After(time.Unix(binding.Challenge.ExpiresAt, 0)) {
 		return StepUpEvidence{}, ErrStepUpTransaction
 	}
 	validAt := func(n time.Time) bool {
 		a, _, e := s.actor(ctx, n)
-		return !n.Before(now) && n.Before(p.ExpiresAt) && s.ready(n) && e == nil && a == actor && binding.valid(n) && ctx.Err() == nil
+		return !n.Before(now) && n.Before(p.ExpiresAt) && s.ready(n) && e == nil && a == actor && binding.valid(n) &&
+			binding.matchesActor(a) && s.policyDigest() == p.PolicyDigest && binding.Challenge.PolicyGeneration == s.config.PolicyGenerationSHA && ctx.Err() == nil
 	}
 	valid := func() bool { return validAt(stepUpTime(s.now())) }
 	if !valid() {
@@ -333,5 +354,6 @@ func (s *StepUp) Complete(ctx context.Context, state, code string, binding StepU
 		idPolicy.Check(idSession, decision) != nil || s.config.Policy.Check(accessSession, decision) != nil {
 		return StepUpEvidence{}, ErrStepUpIdentity
 	}
-	return StepUpEvidence{binding, actor, accessSession, tokens.AccessToken, expiry}, nil
+	return StepUpEvidence{binding: binding, original: actor, session: accessSession,
+		idToken: tokens.IDToken, accessToken: tokens.AccessToken, expiresAt: expiry}, nil
 }

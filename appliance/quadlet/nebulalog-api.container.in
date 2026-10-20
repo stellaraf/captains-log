@@ -13,6 +13,7 @@ User=10001:10001
 ReadOnly=true
 NoNewPrivileges=true
 Environment=REQUIRE_FIPS=true
+Environment=STORAGE_MAINTENANCE_PATH=/run/nebulalog-storage-maintenance/gate.json
 Environment=COLLECTOR_STATUS_PATH=/var/lib/nebulalog/runtime/collector.json
 Environment=COLLECTOR_TLS_CA_PATH=/etc/nebulalog/tls/ca.crt
 Environment=COLLECTOR_TLS_CERT_PATH=/etc/nebulalog/tls/server.crt
@@ -24,6 +25,7 @@ Environment=WEB_DIR=/app/web
 Environment=EXPORT_DIR=/var/lib/nebulalog/exports
 Volume=/var/lib/nebulalog/exports:/var/lib/nebulalog/exports:Z
 Volume=/var/lib/nebulalog/runtime:/var/lib/nebulalog/runtime:ro,z
+Volume=/var/lib/nebulalog/manager/storage-maintenance:/run/nebulalog-storage-maintenance:ro,z
 Volume=/run/nebulalog-status:/run/nebulalog-status:ro,z
 Volume=/var/lib/nebulalog/configuration/tls/ca.crt:/etc/nebulalog/tls/ca.crt:ro,z
 Volume=/var/lib/nebulalog/configuration/tls/server.crt:/etc/nebulalog/tls/server.crt:ro,z

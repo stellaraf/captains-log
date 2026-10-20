@@ -69,8 +69,10 @@ func childCommand(ctx context.Context, mode string, uid uint32) *exec.Cmd {
 func TestLinuxPythonStoragePlanRoundTrip(t *testing.T) {
 	requireIsolatedLinux(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "python3", "/src/appliance/tests/host_plan_linux_fixture.py")
+	// Stop the Python service through SIGTERM before canceling CommandContext;
+	// cancellation kills it before its private journal cleanup can unwind.
+	t.Cleanup(cancel)
+	cmd := exec.CommandContext(ctx, "/usr/bin/python3.14", "/src/appliance/tests/host_plan_linux_fixture.py")
 	cmd.Env = append(os.Environ(), "NEBULALOG_HOST_PLAN_FIXTURE=1", "PYTHONPATH=/src/appliance", "PYTHONDONTWRITEBYTECODE=1")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -81,7 +83,14 @@ func TestLinuxPythonStoragePlanRoundTrip(t *testing.T) {
 	if err = cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = cmd.Process.Signal(syscall.SIGTERM); _ = cmd.Wait() })
+	t.Cleanup(func() {
+		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			t.Error("fixture shutdown signal failed", err)
+		}
+		if err := cmd.Wait(); err != nil {
+			t.Errorf("fixture did not shut down cleanly: %v: %s", err, stderr.String())
+		}
+	})
 	waitReady(t, stdout)
 	// Root owns the service but is not the dedicated API peer. Proving only the
 	// server's UID is insufficient; Python must also enforce the caller's UID.

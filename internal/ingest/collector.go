@@ -299,8 +299,8 @@ func (c *Collector) enqueue(ctx context.Context, m message, wait bool) error {
 			}
 			return nil
 		}
-		if !errors.Is(err, ErrSpoolFull) || !wait {
-			if !errors.Is(err, ErrSpoolFull) && !errors.Is(err, ErrSpoolRecordTooLarge) && !errors.Is(err, ErrClosed) {
+		if !spoolAdmissionHeld(err) || !wait {
+			if !spoolAdmissionHeld(err) && !errors.Is(err, ErrSpoolRecordTooLarge) && !errors.Is(err, ErrClosed) {
 				c.fail(err)
 			} else {
 				c.recordError(err)
@@ -308,7 +308,7 @@ func (c *Collector) enqueue(ctx context.Context, m message, wait bool) error {
 			return err
 		}
 		if !warnedFull {
-			c.recordError(ErrSpoolFull)
+			c.recordError(err)
 			warnedFull = true
 		}
 		timer := time.NewTimer(100 * time.Millisecond)

@@ -35,6 +35,12 @@ class BaselineTests(unittest.TestCase):
         self.source.write_text(CONTENT)
         self.source.chmod(0o600)
         self.now = datetime.now(timezone.utc) + timedelta(seconds=2)
+        # Scanner and review use one fixture clock even on slow/emulated hosts.
+        # This keeps the real "review follows scan" production check exercised.
+        clock = patch("nebulalog_manager.security.datetime", wraps=datetime)
+        frozen = clock.start()
+        frozen.now.side_effect = lambda *args, **kwargs: self.now
+        self.addCleanup(clock.stop)
         self.calls = []
         self.results = {"cis": ["pass", "fail", "notapplicable", "notselected"], "stig": ["pass"]}
         self.fail_scanner = None
@@ -95,10 +101,43 @@ class BaselineTests(unittest.TestCase):
         if intent == "unified":
             mapping = self.root / "mapping.json"
             atomic_json(mapping, {"schema": 1, "baseline": "unified", "coverage_reviewed": True, "review": attestation,
-                "assessments": {p["kind"]: {"sha256": p["sha256"], "profile_id": p["profile_id"]} for p in policy["assessments"]},
-                "controls": [{"control": "fixture", "cis_rule": "xccdf_rule_0", "stig_rule": "xccdf_rule_0", "decision": "same-once", "rationale": "Same fixture requirement", "effective_setting": "Fixture setting"}]})
+                "assessments": {p["kind"]: baseline.assessment_binding(p) for p in policy["assessments"]},
+                "controls": [{"control": "fixture-" + str(i), "cis_rule": "xccdf_rule_" + str(i), "stig_rule": "xccdf_rule_" + str(i), "decision": "same-once", "rationale": "Same fixture requirement", "effective_setting": "Fixture setting"} for i in range(4)]})
             policy["unified_mapping"] = {"path": str(mapping), "sha256": baseline._sha(mapping)}
         return policy
+
+    def test_unified_mapping_rejects_missing_and_repeated_rule_coverage(self):
+        policy = self.policy("unified")
+        path = Path(policy["unified_mapping"]["path"])
+        valid = baseline._json(path)
+        variants = [valid["controls"][:-1], valid["controls"] + [
+            {**valid["controls"][0], "control": "duplicate-cis", "stig_rule": None, "decision": "cis-only"}]]
+        for controls in variants:
+            atomic_json(path, {**valid, "controls": controls})
+            policy["unified_mapping"]["sha256"] = baseline._sha(path)
+            with self.assertRaises(Refused):
+                baseline.validate_policy(policy, self.runner, self.now)
+
+    def test_mapping_inventory_respects_explicit_rule_selection(self):
+        changed = CONTENT.replace(f'<x:Profile id="{CIS}">', f'<x:Profile id="{CIS}"><x:select idref="xccdf_rule_1" selected="false"/>')
+        self.source.write_text(changed)
+        self.assertEqual(baseline._mapping_rules(self.source, CIS), {"xccdf_rule_0", "xccdf_rule_2", "xccdf_rule_3"})
+        for selector in ('<x:select idref="unknown-cluster" selected="true"/>', '<x:select idref="xccdf_rule_1" selected="true"/>'):
+            self.source.write_text(changed.replace(f'<x:Profile id="{CIS}">', f'<x:Profile id="{CIS}">' + selector))
+            with self.assertRaises(Refused):
+                baseline._mapping_rules(self.source, CIS)
+
+    def test_mapping_inventory_honors_containing_group_selection(self):
+        changed = CONTENT.replace('<x:Rule id="xccdf_rule_2"/>', '<x:Group id="group" selected="false"><x:Rule id="xccdf_rule_2"/></x:Group>')
+        self.source.write_text(changed)
+        self.assertNotIn("xccdf_rule_2", baseline._mapping_rules(self.source, CIS))
+        self.source.write_text(changed.replace(f'<x:Profile id="{CIS}">', f'<x:Profile id="{CIS}"><x:select idref="group" selected="true"/>'))
+        self.assertIn("xccdf_rule_2", baseline._mapping_rules(self.source, CIS))
+
+    def test_mapping_inventory_refuses_unresolved_inheritance(self):
+        self.source.write_text(CONTENT.replace(f'<x:Profile id="{CIS}">', f'<x:Profile id="{CIS}" extends="other">'))
+        with self.assertRaisesRegex(Refused, "resolved"):
+            baseline._mapping_rules(self.source, CIS)
 
     def select(self, policy=None):
         policy = policy or self.policy()
@@ -235,10 +274,10 @@ class BaselineTests(unittest.TestCase):
         self.select()
         self.assertFalse(self.manager.checks(INSTALLATION, "cis-level2")["baseline_assessed"])
 
-    def test_tailoring_is_explicitly_unavailable_not_silently_ignored(self):
+    def test_tailoring_without_hash_is_not_silently_ignored(self):
         policy = self.policy()
         policy["assessments"][0]["tailoring"] = str(self.source)
-        with self.assertRaisesRegex(Refused, "unavailable"):
+        with self.assertRaisesRegex(Refused, "hash"):
             self.select(policy)
 
     def test_only_source_declared_manual_controls_accept_hashed_manual_evidence(self):

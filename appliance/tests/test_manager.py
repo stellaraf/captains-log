@@ -273,13 +273,28 @@ class TransactionTests(unittest.TestCase):
     setUp = SignatureTests.setUp
     sign = SignatureTests.sign
     def setup_manager(self,fail=None):
+        # Exercise the signed fixture within its declared validity interval.
+        # Production expiry checks stay enabled; wall-clock drift must not make
+        # transaction/rollback tests stop before reaching their intended gates.
+        clock = patch("nebulalog_manager.updates.datetime", wraps=datetime)
+        frozen = clock.start()
+        frozen.now.return_value = datetime(2026, 9, 7, tzinfo=timezone.utc)
+        self.addCleanup(clock.stop)
         state=self.path/"state";hooks=self.path/"hooks";hooks.mkdir()
         current={"sequence":1,"version":"0.1.0","components":{name:{"version":version} for name,version in
                  (("nebulalog","0.1.0"),("postgresql","17.11"),("clickhouse","25.3.9.100"),("keycloak","26.7.3"))}}
         atomic_json(state/"current.json",current)
         # Temporary filesystem fixtures retain real enrolled-key byte binding;
         # only appliance-root ownership/ancestry is replaced by test ownership.
-        for mocker in (patch("nebulalog_manager.update_enrollment._tree"), patch("nebulalog_manager.update_enrollment.ROOT_UID",os.getuid())):
+        def fixture_file(path):
+            info = path.lstat()
+            if (not path.is_relative_to(self.path) or path.is_symlink() or not path.is_file()
+                    or info.st_uid != os.getuid() or info.st_mode & 0o022):
+                raise Refused("Hook evidence is outside the protected test fixture")
+            return path
+        for mocker in (patch("nebulalog_manager.update_enrollment._tree"), patch("nebulalog_manager.update_enrollment.ROOT_UID",os.getuid()),
+                       patch("nebulalog_manager.host_payload._OWNER_UID", os.getuid()),
+                       patch("nebulalog_manager.host_dispatch.trusted_file", side_effect=fixture_file)):
             mocker.start();self.addCleanup(mocker.stop)
         atomic_json(state/"initial-enrollment.json",{"schema":1,"state":"enrolled","installation_id":"458a08e3-ef3b-4cd1-83e5-b402a2c1e913","current":current})
         atomic_json(state/"publisher-trust.json",{"schema":1,"state":"enrolled","installation_id":"458a08e3-ef3b-4cd1-83e5-b402a2c1e913","algorithm":"RSA-PSS-SHA256","rsa_bits":3072,
@@ -292,14 +307,22 @@ class TransactionTests(unittest.TestCase):
             nonlocal health_count
             if argv[0]=="openssl":return run(argv,**kwargs)
             name=Path(argv[0]).name;calls.append(name)
-            if name==fail:raise Refused("simulated adapter failure")
-            if name=="update-backup":return json.dumps({"ok":True,"postgresql":True,"configuration":True})
+            from nebulalog_manager.host_dispatch import HookJournal
+            journal=HookJournal(Path(argv[1]),json.loads((state/"transaction.json").read_text()))
+            ticket=journal.enter(name)
+            def result(value):
+                journal.finish(ticket,"success",result=value)
+                return json.dumps(value)
+            if name==fail:
+                journal.finish(ticket,"failed")
+                raise Refused("simulated adapter failure")
+            if name=="update-backup":return result({"ok":True,"postgresql":True,"configuration":True})
             if name=="update-health":
                 health_count+=1
                 checks={k:True for k in REQUIRED_CHECKS}
                 if fail=="health-once" and health_count==1:checks["ingestion"]=False
-                return json.dumps({"ok":True,"checks":checks})
-            return '{"ok":true}'
+                return result({"ok":True,"checks":checks})
+            return result({"ok":True})
         return UpdateManager(state,hooks,runner),calls
     def install(self,manager):
         with patch("nebulalog_manager.updates.require_linux_root"),patch("nebulalog_manager.updates.trusted_file",side_effect=lambda p:p):
@@ -320,6 +343,72 @@ class TransactionTests(unittest.TestCase):
         with self.assertRaises(Refused):self.install(manager)
         self.assertNotIn("update-activate",calls)
         self.assertEqual(manager.status()["transaction"]["state"],"recovery_required")
+        self.assertIs(manager.status()["transaction"]["activation_started"], False)
+    def test_activation_journal_is_durable_before_candidate_hook(self):
+        manager,calls=self.setup_manager()
+        runner=manager.runner
+        def observe(argv, **kwargs):
+            name=Path(argv[0]).name
+            if name in ("update-backup", "update-prepare", "update-activate"):
+                transaction=json.loads((manager.state/"transaction.json").read_text())
+                self.assertIs(transaction["activation_started"], name == "update-activate")
+            return runner(argv, **kwargs)
+        manager.runner=observe
+        self.assertEqual(self.install(manager)["state"], "committed")
+
+    def interrupted_preflight(self):
+        manager, calls = self.setup_manager()
+        # This interruption occurs before dispatch publication, not inside a
+        # running adapter. Only that zero-dispatch window can recapture proof.
+        with patch.object(manager, "_hook", side_effect=KeyboardInterrupt("before first dispatch")):
+            with self.assertRaises(KeyboardInterrupt): self.install(manager)
+        self.assertEqual(manager.status()["transaction"]["state"], "preflight")
+        return manager, calls
+
+    def recover(self, manager):
+        def trusted(path):
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            return path
+        with patch("nebulalog_manager.updates.require_linux_root"), \
+                patch("nebulalog_manager.updates.trusted_file", side_effect=trusted):
+            return manager.recover(self.public)
+
+    def test_recovery_rechecks_undispatched_preflight_before_restoring_host_or_stopping_services(self):
+        manager, calls = self.interrupted_preflight()
+        runner = manager.runner
+        def preflight(argv, **kwargs):
+            if Path(argv[0]).name == "update-preflight":
+                self.assertEqual(manager.status()["transaction"]["state"], "preflight")
+                atomic_json(Path(argv[1]) / "adapter-backup-intent.json", {"fixture": True})
+            return runner(argv, **kwargs)
+        manager.runner = preflight
+        result = self.recover(manager)
+        self.assertEqual(result["state"], "rolled_back")
+        self.assertEqual(calls, ["update-preflight", "update-rollback", "update-health", "update-finalize"])
+        self.assertEqual(manager.status()["current"]["components"]["nebulalog"]["version"], "0.1.0")
+
+    def test_missing_preflight_intent_never_recaptures_after_possible_effects(self):
+        manager, calls = self.interrupted_preflight()
+        stage = Path(manager.status()["transaction"]["release"])
+        for path in (stage / "recovery", stage / "host-activation.json", stage / "adapter-storage-maintenance.json",
+                     manager.state.parent / "maintenance.json"):
+            with self.subTest(path=path.name):
+                path.write_text("inert possible-effect marker")
+                with self.assertRaisesRegex(Refused, "possible runtime effects"): self.recover(manager)
+                self.assertEqual(calls, [])
+                path.unlink()
+        gate = manager.state.parent / "storage-maintenance/gate.json"
+        for value in ({"schema": 1, "held": True, "delivery_held": True, "operation": "a" * 64},
+                      {"schema": True, "held": False, "delivery_held": False, "operation": None}):
+            atomic_json(gate, value)
+            with self.assertRaisesRegex(Refused, "possible runtime effects"): self.recover(manager)
+            self.assertEqual(calls, [])
+        gate.unlink()
+        transaction = manager.status()["transaction"]; transaction["state"] = "preparing"
+        atomic_json(manager.state / "transaction.json", transaction)
+        with self.assertRaisesRegex(Refused, "possible runtime effects"): self.recover(manager)
+        self.assertEqual(calls, [])
     def test_health_failure_rolls_back_and_keeps_high_watermark(self):
         manager,calls=self.setup_manager("health-once")
         with self.assertRaisesRegex(Refused,"previous application restored"):self.install(manager)
@@ -360,6 +449,10 @@ class TransactionTests(unittest.TestCase):
             if Path(argv[0]).name=="update-finalize":
                 calls.append("update-finalize")
                 self.assertEqual(manager.status()["transaction"]["state"],"committed")
+                from nebulalog_manager.host_dispatch import HookJournal
+                journal=HookJournal(Path(argv[1]),manager.status()["transaction"])
+                ticket=journal.enter("update-finalize")
+                journal.finish(ticket,"success",result={"ok":True})
                 return '{"ok":true}'
             return original(argv,**kwargs)
         manager.runner=recovered
@@ -400,3 +493,31 @@ class TransactionTests(unittest.TestCase):
         with self.assertRaisesRegex(Refused,"OS maintenance"):
             self.install(manager)
         self.assertEqual(calls,[])
+
+    def test_os_hold_or_kernel_recovery_blocks_every_component_mutation_after_healthy_fallback(self):
+        manager, calls = self.setup_manager()
+        phases_by_field = {field: ("pending", "failed", "recovery_required", "unknown")
+                           for field in ("kernel_finalization", "kernel_retention", "kernel_rollback")}
+        phases_by_field["storage_maintenance"] = ("held", "release_pending")
+        for field, phases in phases_by_field.items():
+            for phase in phases:
+                operation = {"state": "complete", "finalization": "complete", field: phase}
+                path = manager.state.parent / "os-transaction.json"
+                atomic_json(path, operation)
+                before = path.read_bytes()
+                for action, state, finalization in (("install", "committed", "complete"),
+                        ("rollback", "committed", "complete"), ("recover", "activating", "pending"),
+                        ("finalize", "committed", "failed")):
+                    with self.subTest(field=field, phase=phase, action=action):
+                        atomic_json(manager.state / "transaction.json", {"state": state, "finalization": finalization})
+                        with patch("nebulalog_manager.updates.require_linux_root"), \
+                                patch("nebulalog_manager.updates.trusted_file", side_effect=lambda p: p), \
+                                self.assertRaisesRegex(Refused, "OS"):
+                            if action == "install":
+                                self.install(manager)
+                            else:
+                                getattr(manager, action)(self.public)
+                        self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(calls, [])
+                self.assertIsNone(manager.status()["recovery_action"])
+                self.assertEqual(manager.status()["recovery_blocked_by"], "os_update")

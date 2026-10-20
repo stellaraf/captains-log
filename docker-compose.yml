@@ -1,7 +1,9 @@
 name: nebulalog-dev
 services:
   postgres:
-    image: postgres:17.6-bookworm
+    # PostgreSQL 17.11; immutable Linux x86-64 vendor manifest.
+    image: postgres:17.11-bookworm@sha256:66aafa11cf15800a3c94763f7e11d1e7b2e37e5e84bc4ce027cb6e1e4bfaf4df
+    platform: linux/amd64
     restart: unless-stopped
     environment:
       POSTGRES_PASSWORD: ${PG_ADMIN_PASSWORD:?Run scripts/dev-init.py}
@@ -39,7 +41,8 @@ services:
       timeout: 3s
       retries: 30
   keycloak:
-    image: quay.io/keycloak/keycloak:26.3.3
+    image: quay.io/keycloak/keycloak:26.8.1@sha256:ed1cab21814c7d18ce8f0e11d5a1fa1c6923de12dd4c7625a18c5d34452a57a4
+    platform: linux/amd64
     restart: unless-stopped
     command: ["start-dev", "--import-realm"]
     environment:
@@ -61,6 +64,7 @@ services:
     mem_limit: 1g
   app:
     profiles: ["application"]
+    platform: linux/amd64
     restart: unless-stopped
     stop_grace_period: 45s
     user: "${DEV_UID:-501}:${DEV_GID:-20}"

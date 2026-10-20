@@ -8,26 +8,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stellaraf/captains-log/internal/panos"
 	"log/slog"
-	"time"
 )
 
 type Store struct {
-	CH *ClickHouse
-	PG *pgxpool.Pool
-}
-type Retention struct {
-	GlobalDays int            `json:"global_days"`
-	PerType    map[string]int `json:"per_type"`
-}
-
-func (s *Store) Retention(ctx context.Context) (Retention, error) {
-	var b []byte
-	r := Retention{}
-	e := s.PG.QueryRow(ctx, "SELECT value FROM settings WHERE key='retention'").Scan(&b)
-	if e == nil {
-		e = json.Unmarshal(b, &r)
-	}
-	return r, e
+	StorageMaintenancePath string
+	CH                     *ClickHouse
+	PG                     *pgxpool.Pool
 }
 
 var Columns = map[string]string{
@@ -35,10 +21,6 @@ var Columns = map[string]string{
 }
 
 func (s *Store) Insert(ctx context.Context, events []panos.Event) error {
-	retention, e := s.Retention(ctx)
-	if e != nil {
-		return fmt.Errorf("load durable retention policy: %w", e)
-	}
 	rows := make([]map[string]any, 0, len(events))
 	devices := map[string]map[string]any{}
 	for _, event := range events {
@@ -78,24 +60,15 @@ func (s *Store) Insert(ctx context.Context, events []panos.Event) error {
 		if row["received_at"] == nil {
 			row["received_at"] = row["ingested_at"]
 		}
-		days := retention.GlobalDays
-		if n, ok := retention.PerType[fmt.Sprint(row["log_type"])]; ok {
-			days = n
-		}
-		if days < 1 || days > 3650 {
-			return fmt.Errorf("invalid durable retention policy")
-		}
-		now := time.Now().UTC()
-		if ts, e := time.Parse(time.RFC3339Nano, fmt.Sprint(row["ingested_at"])); e == nil {
-			now = ts
-		}
-		row["expires_at"] = now.AddDate(0, 0, days).Format(time.RFC3339)
+		// Retained for schema compatibility only. Normal expiry is current policy
+		// over immutable ingested_at; no arrival-time TTL may override an extension.
+		row["expires_at"] = "2100-01-01T00:00:00Z"
 		rows = append(rows, row)
 		if serial := fmt.Sprint(row["serial"]); serial != "" {
 			devices[serial] = row
 		}
 	}
-	if e := s.CH.InsertRows(ctx, rows); e != nil {
+	if e := s.insertEmergencyGuarded(ctx, rows); e != nil {
 		return e
 	}
 	// Log data is already durable. Metadata failure must not turn an acknowledged
