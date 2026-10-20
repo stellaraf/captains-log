@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/fips140"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stellaraf/captains-log/internal/api"
@@ -15,6 +16,7 @@ import (
 	"github.com/stellaraf/captains-log/internal/panos"
 	"github.com/stellaraf/captains-log/internal/retry"
 	"github.com/stellaraf/captains-log/internal/store"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -62,11 +64,41 @@ func run() error {
 		fmt.Println(version)
 		return nil
 	}
-	if role != "all" && role != "serve" && role != "ingest" && role != "migrate" && role != "migrate-retention" {
-		return fmt.Errorf("usage: nebulalog [all|serve|ingest|migrate|migrate-retention|version]; host operations use appliance/nebulalog")
+	if role != "all" && role != "serve" && role != "ingest" && role != "migrate" && role != "migrate-retention" && role != "initialize-storage" {
+		return fmt.Errorf("usage: nebulalog [all|serve|ingest|migrate|migrate-retention|initialize-storage|version]; host operations use appliance/nebulalog")
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	var initialization store.StorageInitialization
+	var storageSchema []byte
+	if role == "initialize-storage" {
+		if len(os.Args) != 2 {
+			return fmt.Errorf("initialize-storage accepts no arguments or SQL overrides")
+		}
+		initialization = store.StorageInitialization{Operation: env("STORAGE_INITIALIZATION_OPERATION", ""), TableUUID: env("STORAGE_INITIALIZATION_TABLE_UUID", ""), SchemaSHA256: env("STORAGE_INITIALIZATION_SCHEMA_SHA256", "")}
+		if err := initialization.Validate(); err != nil {
+			return err
+		}
+		if err := store.ValidateStorageMaintenancePath(env("STORAGE_MAINTENANCE_PATH", ""), true); err != nil {
+			return err
+		}
+		attempt, stop := context.WithTimeout(ctx, 90*time.Second)
+		defer stop()
+		ctx = attempt
+		// Unlike migrate, neither migration environment variable is consulted.
+		f, err := os.Open(store.StorageInitializationSchemaPath)
+		if err != nil {
+			return err
+		}
+		storageSchema, err = io.ReadAll(io.LimitReader(f, 16385))
+		closeErr := f.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	}
 	dsn := env("PG_DSN", "")
 	if dsn == "" {
 		return fmt.Errorf("PG_DSN is required")
@@ -78,7 +110,7 @@ func run() error {
 	defer pg.Close()
 	// The collector can durably spool while metadata or ClickHouse is offline.
 	// Only the explicit migration command requires immediate database readiness.
-	if role == "migrate" || role == "migrate-retention" {
+	if role == "migrate" || role == "migrate-retention" || role == "initialize-storage" {
 		if e = pg.Ping(ctx); e != nil {
 			return fmt.Errorf("PostgreSQL unavailable")
 		}
@@ -93,6 +125,13 @@ func run() error {
 		}
 	}
 	st.StorageMaintenancePath = storagePath
+	if role == "initialize-storage" {
+		receipt, err := st.InitializeStorage(ctx, initialization, storageSchema)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(receipt)
+	}
 	if role == "migrate-retention" {
 		attempt, stop := context.WithTimeout(ctx, 90*time.Second)
 		defer stop()

@@ -53,13 +53,16 @@ def behavior_receipt(image, reference):
 
 
 class ContractTests(unittest.TestCase):
+    revision = "3"
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
         self.source, snapshot_path = hosts.fixture_source(self.root)
         self.snapshot = json.loads(snapshot_path.read_bytes())
-        for name in Contract.REQUIRED_SOURCE | set(ApplicationSchema.SCHEMAS["3"]):
+        self.revision = getattr(self, "revision", "3")
+        for name in Contract.REQUIRED_SOURCE | set(ApplicationSchema.SCHEMAS[self.revision]):
             raw = ((PACKER.parents[1] / name).read_bytes() if name.startswith("migrations/") else (name + " fixture\n").encode())
             path = self.source / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -74,7 +77,7 @@ class ContractTests(unittest.TestCase):
         self.manifest = {"version": "1.0.1", "restore_auth": Contract.declaration(), "components": {
             "host": {"artifact": "host.tar", "version": "1.0.1", "host_source_sha256": self.host["metadata"]["host_source_sha256"], "rollback_safe": True},
             "nebulalog": {"artifact": self.image["archive"], "image": self.pins["NEBULALOG_IMAGE"], "rollback_safe": True,
-                          **ApplicationSchema.declaration(self.snapshot["files"], "3")}}, "artifacts": []}
+                          **ApplicationSchema.declaration(self.snapshot["files"], self.revision)}}, "artifacts": []}
         self.build = build_receipt(self.snapshot, self.image, self.manifest["version"])
         self.behavior = behavior_receipt(self.image, self.pins["NEBULALOG_IMAGE"])
         self.rewrite()
@@ -94,6 +97,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(result["subject"]["host_generation"], self.host["archive_sha256"])
         self.assertEqual(result["subject"]["application_config_digest"], self.image["config_digest"])
         self.assertEqual(Contract.application_hash(self.snapshot["files"]), application_hash(self.snapshot))
+        self.assertEqual(result["subject"]["schema_revision"], self.revision)
         self.assertFalse(result["native_qualified"])
         self.assertFalse(result["execution_verified_by_tool"])
 
@@ -178,8 +182,9 @@ class FactoryContractTests(unittest.TestCase):
         for name in Contract.EVIDENCE:
             shutil.copy2(self.bundle / name, self.share / "restore-auth" / name)
         value = Contract.factory_capture(self.snapshot["files"], self.image,
-            (self.bundle / Contract.BUILD).read_bytes(), (self.bundle / Contract.BEHAVIOR).read_bytes())
-        self.descriptor = {"schema_revision": "3", "source_snapshot_sha256": payload.digest((self.share / Contract.SOURCE).read_bytes()), "restore_auth": value}
+            (self.bundle / Contract.BUILD).read_bytes(), (self.bundle / Contract.BEHAVIOR).read_bytes(),
+            schema_revision=self.revision)
+        self.descriptor = {"schema_revision": self.revision, "source_snapshot_sha256": payload.digest((self.share / Contract.SOURCE).read_bytes()), "restore_auth": value}
         # Factory host version is deliberately independent of the application.
         self.factory_host = build_host(self.source, self.share / Contract.SOURCE, self.root / "factory-host.tar", version="0.0.0-factory.abcdef")
 
@@ -188,6 +193,7 @@ class FactoryContractTests(unittest.TestCase):
         proof = Contract.verify_factory(self.descriptor, self.share, self.factory_host, self.image, root_owned=False)
         self.assertEqual(proof["subject"]["host_generation"], self.factory_host["archive_sha256"])
         self.assertEqual(proof["subject"]["application_image"], self.pins["NEBULALOG_IMAGE"])
+        self.assertEqual(proof["subject"]["schema_revision"], self.revision)
         self.assertFalse(proof["native_qualified"])
 
     def test_factory_absence_loose_receipts_tamper_and_legacy_refuse(self):
@@ -215,3 +221,23 @@ class FactoryContractTests(unittest.TestCase):
         self.assertFalse(result["signature_created"])
         for name in Contract.EVIDENCE:
             self.assertEqual((output / "restore-auth" / name).read_bytes(), (self.bundle / name).read_bytes())
+
+
+class Schema4ContractTests(ContractTests):
+    revision = "4"
+
+
+class Schema4FactoryContractTests(unittest.TestCase):
+    """Explicit binding only; the default packaging/admission hold stays closed."""
+    revision = "4"
+    setUp = ContractTests.setUp
+    rewrite = ContractTests.rewrite
+    factory = FactoryContractTests.factory
+    test_factory_host_and_app_versions_are_independently_bound = FactoryContractTests.test_factory_host_and_app_versions_are_independently_bound
+    test_factory_absence_loose_receipts_tamper_and_legacy_refuse = FactoryContractTests.test_factory_absence_loose_receipts_tamper_and_legacy_refuse
+
+    def test_schema4_source_cannot_be_relabelled_as_same_schema3(self):
+        self.factory()
+        with self.assertRaises(Refused):
+            Contract.verify_factory({**self.descriptor, "schema_revision": "3"},
+                                    self.share, self.factory_host, self.image, root_owned=False)

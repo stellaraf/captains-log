@@ -1,5 +1,6 @@
 """Fresh restore runtime boundaries; no containers, services or host mutations."""
 import copy
+from contextlib import contextmanager, ExitStack
 import hashlib
 import json
 import os
@@ -13,6 +14,7 @@ from nebulalog_manager.aide import RUNTIME_STAGES
 from nebulalog_manager.bootstrap import Bootstrap
 from nebulalog_manager.common import Refused, atomic_json
 from nebulalog_manager.firstboot import Locations, RUNTIME_CHECKS
+from nebulalog_manager.image_bundle import ApplicationSchema
 
 SOURCE = "11111111-2222-4333-8444-555555555555"
 TARGET = "22222222-2222-4333-8444-555555555555"
@@ -35,7 +37,7 @@ class RestoreRuntimeTests(unittest.TestCase):
         self.configuration = self.paths.data / "configuration"
         self.bootstrap = self.configuration / "bootstrap"
         self.bootstrap.mkdir(parents=True)
-        self.tx = {"id": OPERATION, "source_installation_id": SOURCE, "target_installation_id": TARGET,
+        self.tx = {"schema": 1, "kind": "configuration-restore", "id": OPERATION, "source_installation_id": SOURCE, "target_installation_id": TARGET,
                    "manifest_sha256": "a" * 64, "stage": str(self.stage), "runtime": {}}
         self.calls = []
         def runner(argv, **kwargs):
@@ -63,14 +65,29 @@ class RestoreRuntimeTests(unittest.TestCase):
             item = patch.object(restore, name, side_effect=replacement)
             item.start()
             self.addCleanup(item.stop)
-        self.runtime.bootstrap._schema_revision = Mock(return_value="2")
+        self.runtime.bootstrap._schema_revision = Mock(return_value="3")
+        self.factory_binding = {"schema": 1, "installation_id": TARGET,
+            "initial_release_sha256": "d" * 64, "source_snapshot_sha256": "e" * 64,
+            "schema_revision": "3", "schema_sha256": ApplicationSchema.schema_digest("3"),
+            "bundle_manifest_sha256": "f" * 64, "host": {"generation": "e" * 64},
+            "host_catalog_sha256": "a" * 64, "images": PINS}
+        self.factory_proof = {"binding": self.factory_binding, "descriptor_sha256": "d" * 64,
+            "host": self.factory_binding["host"]}
+        factory = patch("nebulalog_manager.update_enrollment.UpdateEnrollment")
+        self.factory_verifier = factory.start()
+        self.addCleanup(factory.stop)
+        self.factory_verifier.return_value.verify_initialization_inputs.side_effect = lambda: copy.deepcopy(self.factory_proof)
+        self.catalog_proof = {"schema_revision": "3", "schema_sha256": ApplicationSchema.schema_digest("3"),
+            "profile": "host-stepup", "catalog_sha256": "b" * 64,
+            "database": {"system_identifier": "7654321098765432101", "database_oid": 16384,
+                         "database": "nebulalog", "owner": "nebulalog", "server_version": 170011}}
         setup = {"installation_id": SOURCE, "hostname": "logs.example.test", "baseline": "unified",
                  "administrator": {"username": "captain"}, "maintenance": {"timezone": "UTC"}}
         secrets = {key: "b" * 64 for key in ("postgresql_admin", "postgresql_app", "postgresql_keycloak", "clickhouse", "keycloak_bootstrap", "identity_service")}
         runtime = {"health_password": "long-health-password-Aa1!", "health_totp": "A" * 52, "inspector_service": "c" * 64}
         state = {"schema": 1, "installation_id": SOURCE, "administrator_id": ADMIN,
                  "identity_initialized": True, "completed": sorted(RUNTIME_STAGES), "active_stage": None}
-        lifecycle = {"schema_revision": "2", "issuer": "https://logs.example.test/realms/nebulalog", "auth_probe": {
+        lifecycle = {"schema_revision": "3", "issuer": "https://logs.example.test/realms/nebulalog", "auth_probe": {
             "username": "nebulalog-health", "client_id": "nebulalog", "redirect_uri": "https://logs.example.test/health-oidc",
             "password": runtime["health_password"], "totp_secret": runtime["health_totp"],
             "totp_algorithm": "SHA256", "totp_digits": 6, "totp_period": 30}}
@@ -84,7 +101,7 @@ class RestoreRuntimeTests(unittest.TestCase):
         atomic_json(self.bootstrap / "setup.json", {**setup, "installation_id": TARGET})
         atomic_json(self.bootstrap / "secrets.json", {key: "d" * 64 for key in secrets})
         atomic_json(self.paths.etc / "images.json", PINS)
-        self.manifest = {"installation_id": SOURCE, "runtime": {"images": PINS, "schema_revision": "2"}, "files": []}
+        self.manifest = {"installation_id": SOURCE, "runtime": {"images": PINS, "schema_revision": "3"}, "files": []}
         self.reseal()
 
     def reseal(self):
@@ -98,10 +115,110 @@ class RestoreRuntimeTests(unittest.TestCase):
 
     def normalized(self):
         self.tx["databases"] = {name: {"state": "restored", "archive_sha256": "f" * 64} for name in ("nebulalog", "keycloak")}
+        self.tx["runtime"]["restored_catalog"] = copy.deepcopy(self.catalog_proof)
         self.tx["operational_normalized"] = True
         atomic_json(self.stage / "normalization.json", {"schema": 1, "operation": OPERATION,
             "source_installation_id": SOURCE, "target_installation_id": TARGET, "observed": True})
         self.tx["normalization_sha256"] = hashlib.sha256((self.stage / "normalization.json").read_bytes()).hexdigest()
+
+    def storage_evidence(self, state="released"):
+        """Synthetic completed database boundary for non-database runtime tests."""
+        ready = {**copy.deepcopy(self.catalog_proof), "markers": [], "retention": {
+            "table_uuid": "777e3820-f194-49f8-b20c-bc3487eeebba", "mode": "partition", "ttl": False,
+            "ddl_sha256": "c" * 64}}
+        self.tx["runtime"].update(restored_catalog=copy.deepcopy(self.catalog_proof), schema_proof=ready,
+            storage={"state": state, "table_uuid": ready["retention"]["table_uuid"],
+                     "result": {"ddl_sha256": ready["retention"]["ddl_sha256"]}})
+        return ready
+
+    def checkpoint(self):
+        atomic_json(self.paths.data / "manager/restore.json", {"schema": 2, "id": OPERATION, "stage": str(self.stage)})
+        atomic_json(self.stage / "transaction.json", self.tx)
+
+    @contextmanager
+    def configuration_storage_transport(self):
+        """Exercise runtime ordering with only storage effects/readbacks injected."""
+        order = []
+        def start():
+            self.assertFalse((self.stage / "listeners-ready.json").exists())
+            order.append("clickhouse")
+        def initialize(tx, checkpoint):
+            self.assertEqual(order[-1], "clickhouse")
+            order.append("initialize")
+            self.storage_evidence("initialized")
+        def release(tx, checkpoint):
+            self.assertTrue({"schema", "identity-rebind", "lifecycle"} <= set(tx["runtime"]["completed"]))
+            tx["runtime"]["storage"]["state"] = "released"
+            self.runtime._log_checkpoint(tx, checkpoint)
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(self.runtime.bootstrap, "_clickhouse", side_effect=start))
+            stack.enter_context(patch.object(self.runtime, "_initialize_config_storage", side_effect=initialize))
+            stack.enter_context(patch.object(self.runtime, "_observe_ready_catalog",
+                side_effect=lambda tx: copy.deepcopy(tx["runtime"]["schema_proof"])))
+            stack.enter_context(patch.object(self.runtime, "_release_config_storage", side_effect=release))
+            stack.enter_context(patch.object(self.runtime, "_verify_released_catalog"))
+            yield order
+
+    def imported_databases(self):
+        self.loaded()
+        self.tx["runtime"]["completed"] = sorted(restore.PREPARED_STAGES)
+        self.tx["runtime"]["token_not_before"] = 1700000000
+        atomic_json(self.bootstrap / "restore-auth.json", {"schema": 1, "installation_id": TARGET,
+            "operation": OPERATION, "token_not_before": 1700000000})
+        (self.configuration / "runtime").mkdir(exist_ok=True)
+        (self.configuration / "runtime/api.env").write_text("OIDC_TOKEN_NOT_BEFORE=1700000000\n")
+        self.tx["databases"] = {name: {"state": "restored", "archive_sha256": "f" * 64}
+                               for name in ("nebulalog", "keycloak")}
+        self.runtime._fence(self.tx)
+        self.checkpoint()
+
+    def test_import_catalog_is_checkpointed_before_normalization_and_rechecked(self):
+        self.imported_databases()
+        with patch.object(self.runtime, "_observe_pg_catalog", return_value=copy.deepcopy(self.catalog_proof)) as observe:
+            result = self.runtime.verify_restored_catalog(self.source, self.manifest, self.tx)
+            self.assertEqual(result, self.catalog_proof)
+            self.assertEqual(json.loads((self.stage / "transaction.json").read_text())["runtime"]["restored_catalog"], result)
+            self.assertNotIn("operational_normalized", self.tx)
+            self.assertFalse((self.stage / "listeners-ready.json").exists())
+            self.runtime.verify_restored_catalog(self.source, self.manifest, self.tx)
+            self.assertEqual(observe.call_count, 2)
+            observe.return_value = {**self.catalog_proof, "catalog_sha256": "c" * 64}
+            with self.assertRaisesRegex(Refused, "identity or structural catalog changed"):
+                self.runtime.verify_restored_catalog(self.source, self.manifest, self.tx)
+        self.assertEqual(self.tx["runtime"]["restored_catalog"], self.catalog_proof)
+        self.assertFalse(any(argv[-1:] == ["migrate"] or argv[:2] == ["systemctl", "start"] for argv, _ in self.calls))
+
+    def test_import_catalog_requires_both_database_receipts_and_retained_fence(self):
+        self.imported_databases()
+        with patch.object(self.runtime, "_observe_pg_catalog") as observe:
+            self.tx["databases"]["keycloak"]["state"] = "restoring"
+            self.checkpoint()
+            with self.assertRaisesRegex(Refused, "both successful database restores"):
+                self.runtime.verify_restored_catalog(self.source, self.manifest, self.tx)
+            self.tx["databases"]["keycloak"]["state"] = "restored"
+            self.checkpoint()
+            path = self.runtime.systemd / "nebulalog-api.service.d/80-nebulalog-restore.conf"
+            path.write_text("[Unit]\n")
+            with self.assertRaisesRegex(Refused, "listener fence"):
+                self.runtime.verify_restored_catalog(self.source, self.manifest, self.tx)
+            observe.assert_not_called()
+
+    def test_same_four_restore_binds_profile_and_cross_profile_refuses(self):
+        lifecycle_path = self.source / "configuration/lifecycle.json"
+        source = json.loads(lifecycle_path.read_text())
+        source["schema_revision"] = self.manifest["runtime"]["schema_revision"] = "4"
+        atomic_json(lifecycle_path, source)
+        self.factory_binding.update(schema_revision="4", schema_sha256=ApplicationSchema.schema_digest("4"))
+        self.catalog_proof.update(schema_revision="4", schema_sha256=ApplicationSchema.schema_digest("4"), profile="host-stepup-v2")
+        self.reseal()
+        self.imported_databases()
+        with patch.object(self.runtime, "_observe_pg_catalog", return_value=copy.deepcopy(self.catalog_proof)) as observe:
+            self.assertEqual(self.runtime.verify_restored_catalog(self.source, self.manifest, self.tx)["schema_revision"], "4")
+            observe.assert_called_once_with("4", self.tx)
+            self.factory_binding.update(schema_revision="3", schema_sha256=ApplicationSchema.schema_digest("3"))
+            with self.assertRaisesRegex(Refused, "same installed image digests and schema"):
+                self.runtime.verify_restored_catalog(self.source, self.manifest, self.tx)
+            self.assertEqual(observe.call_count, 1)
 
     def test_fresh_guard_refuses_existing_data_and_enrolled_host(self):
         self.assertEqual(self.runtime.guard_fresh(), TARGET)
@@ -127,11 +244,11 @@ class RestoreRuntimeTests(unittest.TestCase):
     def test_review_inspection_binds_target_and_factory_without_disk_or_cutoff_mutation(self):
         tx = copy.deepcopy(self.tx)
         before = {str(path): path.read_bytes() for path in self.paths.data.rglob("*") if path.is_file()}
-        proof = {"descriptor_sha256": "d" * 64, "host": {"generation": "e" * 64}}
+        proof = copy.deepcopy(self.factory_proof)
         with patch("nebulalog_manager.update_enrollment.UpdateEnrollment") as factory:
-            factory.return_value.verify_build_inputs.return_value = proof
+            factory.return_value.verify_initialization_inputs.return_value = proof
             first = self.runtime.inspect_recovery(self.source, self.manifest, self.tx)
-            factory.return_value.verify_build_inputs.assert_called_once_with(include_host=True)
+            factory.return_value.verify_initialization_inputs.assert_called_once_with()
             self.assertEqual(self.tx, tx)
             self.assertEqual(before, {str(path): path.read_bytes() for path in self.paths.data.rglob("*") if path.is_file()})
             self.assertTrue(first["certificates_verified"])
@@ -146,13 +263,13 @@ class RestoreRuntimeTests(unittest.TestCase):
 
     def test_review_rejects_factory_or_tls_verification_failure_without_effects(self):
         with patch("nebulalog_manager.update_enrollment.UpdateEnrollment") as factory:
-            factory.return_value.verify_build_inputs.side_effect = Refused("Synthetic factory mismatch")
+            factory.return_value.verify_initialization_inputs.side_effect = Refused("Synthetic factory mismatch")
             with self.assertRaisesRegex(Refused, "factory mismatch"):
                 self.runtime.inspect_recovery(self.source, self.manifest, self.tx)
             self.assertEqual(self.calls, [])
             self.assertEqual(self.tx["runtime"], {})
-            factory.return_value.verify_build_inputs.side_effect = None
-            factory.return_value.verify_build_inputs.return_value = {"descriptor_sha256": "d" * 64, "host": {}}
+            factory.return_value.verify_initialization_inputs.side_effect = None
+            factory.return_value.verify_initialization_inputs.return_value = copy.deepcopy(self.factory_proof)
             self.runtime.runner = Mock(side_effect=Refused("Synthetic certificate mismatch"))
             with self.assertRaisesRegex(Refused, "certificate mismatch"):
                 self.runtime.inspect_recovery(self.source, self.manifest, self.tx)
@@ -232,10 +349,13 @@ class RestoreRuntimeTests(unittest.TestCase):
         (self.configuration / "runtime").mkdir()
         (self.configuration / "runtime/api.env").write_text("OIDC_TOKEN_NOT_BEFORE=1700000000\n")
         self.normalized()
+        self.checkpoint()
         with patch.object(b, "_migrate") as migrate, patch.object(b, "_lifecycle"), patch.object(b, "_edge"), \
-             patch.object(b, "_wait"), patch.object(b, "_realm") as realm, patch.object(b, "_identity") as identity:
+             patch.object(b, "_wait"), patch.object(b, "_realm") as realm, patch.object(b, "_identity") as identity, \
+             self.configuration_storage_transport() as storage_order:
             self.runtime.activate(self.source, self.manifest, self.tx)
-        migrate.assert_called_once_with(initialize_retention=False)
+        migrate.assert_not_called()
+        self.assertEqual(storage_order, ["clickhouse", "initialize"])
         realm.assert_not_called()
         identity.assert_not_called()
         sql = next(kwargs["input"].decode() for argv, kwargs in self.calls if "psql" in argv)
@@ -249,6 +369,7 @@ class RestoreRuntimeTests(unittest.TestCase):
         b = self.loaded()
         b.state.update(completed=sorted(restore.RESTORE_STAGES), identity_initialized=True)
         self.assertFalse(restore.valid_restored_state(b.state, self.paths))
+        self.storage_evidence()
         proof = self.runtime._proof(self.tx)
         atomic_json(self.stage / "runtime-activation.json", proof)
         atomic_json(self.stage / "listeners-ready.json", {**proof, "state": "databases-ready"})
@@ -297,12 +418,17 @@ class RestoreRuntimeTests(unittest.TestCase):
             plan.assert_not_called()
             manager.runner.assert_not_called()
 
-    def test_matching_schema_migration_preserves_restored_retention(self):
+    def test_matching_schema_observation_never_dispatches_general_migrate(self):
         b = self.loaded()
-        b._migrate(initialize_retention=False)
-        self.assertEqual(len(self.calls), 1)
-        self.assertEqual(self.calls[0][0][-1], "migrate")
-        self.assertNotIn("UPDATE settings", str(self.calls))
+        self.tx["runtime"]["completed"] = sorted(restore.PREPARED_STAGES)
+        self.normalized()
+        self.runtime._fence(self.tx)
+        self.checkpoint()
+        with patch.object(b, "_migrate", side_effect=AssertionError("general migration reached")), \
+             self.configuration_storage_transport():
+            self.runtime._restore_schema(self.tx, None)
+        self.assertFalse(any(argv[-1:] == ["migrate"] for argv, _ in self.calls))
+        self.assertEqual(self.tx["runtime"]["schema_proof"]["catalog_sha256"], self.catalog_proof["catalog_sha256"])
 
     def test_api_cutoff_comes_only_from_target_owned_restore_record(self):
         b = self.loaded()
@@ -321,6 +447,7 @@ class RestoreRuntimeTests(unittest.TestCase):
         b = self.loaded()
         self.tx["runtime"]["completed"] = sorted(restore.RESTORE_STAGES)
         b.state.update(completed=list(self.tx["runtime"]["completed"]), identity_initialized=True)
+        self.storage_evidence()
         atomic_json(b.state_path, b.state)
         self.runtime._fence(self.tx)
         atomic_json(self.stage / "listeners-ready.json", {**self.runtime._proof(self.tx), "state": "databases-ready"})
@@ -339,6 +466,7 @@ class RestoreRuntimeTests(unittest.TestCase):
         b = self.loaded()
         self.tx["runtime"]["completed"] = sorted(restore.RESTORE_STAGES)
         b.state.update(completed=list(self.tx["runtime"]["completed"]), identity_initialized=True)
+        self.storage_evidence()
         atomic_json(b.state_path, b.state)
         self.runtime._fence(self.tx)
         atomic_json(self.stage / "listeners-ready.json", {**self.runtime._proof(self.tx), "state": "databases-ready"})
@@ -379,13 +507,14 @@ class RestoreRuntimeTests(unittest.TestCase):
             path.parent.mkdir(exist_ok=True)
             path.write_text("OIDC_TOKEN_NOT_BEFORE=" + str(self.tx["runtime"]["token_not_before"]) + "\n")
         from contextlib import ExitStack
-        self.tx.update(kind="configuration-restore", state="preparing")
+        self.tx.update(schema=1, kind="configuration-restore", state="preparing")
         with ExitStack() as stack:
             stack.enter_context(patch("nebulalog_manager.restore_runtime.os.chown"))
             clock = stack.enter_context(patch("nebulalog_manager.restore_runtime.time.time", return_value=1700000000))
             for name in ("_directories", "_storage_maintenance", "_certificates", "_images", "_postgres", "_migrate", "_lifecycle", "_edge", "_wait", "_installed_release"):
                 stack.enter_context(patch.object(b, name))
             stack.enter_context(patch.object(b, "_environment", side_effect=env))
+            stack.enter_context(self.configuration_storage_transport())
             evidence = stack.enter_context(patch.object(b, "_evidence", return_value={"schema": 1, "installation_id": TARGET,
                 "state": "runtime-ready", "checks": {name: True for name in RUNTIME_CHECKS}}))
             self.runtime.prepare(self.source, self.manifest, self.tx, checkpoint=checkpoint)
@@ -554,11 +683,20 @@ class NativeLogRuntimeTests(unittest.TestCase):
         self.restored(); self.runtime.complete_log_restore(self.source, self.manifest, self.tx)
         b = self.runtime.bootstrap
         def held(*args, **kwargs): self.assertTrue(self.row["gate"]["delivery_held"])
+        def observed(tx):
+            held()
+            table = tx["logs"]["native"]["table"]
+            return {**copy.deepcopy(self.fixture.catalog_proof), "markers": [], "retention": {
+                "table_uuid": table["table_uuid"], "ddl_sha256": table["table_definition_sha256"],
+                "mode": "partition", "ttl": False}}
         def edge():
             self.assertFalse(self.row["gate"]["held"])
             self.assertTrue((self.stage / "listeners-ready.json").exists())
-        with patch.object(b, "_migrate", side_effect=held), patch.object(b, "_lifecycle", side_effect=held), \
-             patch.object(b, "_edge", side_effect=edge), patch.object(b, "_wait"):
+        with patch.object(b, "_migrate", side_effect=AssertionError("general migration reached")), \
+             patch.object(b, "_lifecycle", side_effect=held), patch.object(b, "_edge", side_effect=edge), patch.object(b, "_wait"), \
+             patch.object(self.runtime, "_observe_ready_catalog", side_effect=observed), \
+             patch.object(self.runtime, "_verify_released_catalog"), \
+             patch.object(self.runtime, "_initialize_config_storage", side_effect=AssertionError("populated storage initialized")):
             self.runtime.activate(self.source, self.manifest, self.tx)
         self.assertEqual(self.tx["logs"]["native"]["state"], "released")
         self.assertIn("log_restore_sha256", self.runtime._proof(self.tx))

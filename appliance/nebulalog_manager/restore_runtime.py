@@ -32,6 +32,7 @@ TLS_FILES = ("ca.key", "ca.crt", "server.key", "server.crt")
 SOURCE_FILES = tuple("configuration/" + name for name in (
     "bootstrap/setup.json", "bootstrap/secrets.json", "bootstrap/runtime-secrets.json",
     "bootstrap/runtime-state.json", "lifecycle.json", *("tls/" + name for name in TLS_FILES)))
+PREPARED_STAGES = frozenset(("directories", "storage-maintenance", "certificates", "images", "environment", "postgresql"))
 
 
 def _uuid(value):
@@ -47,6 +48,16 @@ def _sha(value):
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
         raise Refused("Invalid restore evidence digest")
     return value
+
+
+def _digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _storage_query_id(operation, phase):
+    raw = bytearray(hashlib.sha256(("captains-log/storage-init/" + _sha(operation) + "/" + phase).encode()).digest()[:16])
+    raw[6], raw[8] = (raw[6] & 15) | 0x50, (raw[8] & 63) | 0x80
+    return str(uuid.UUID(bytes=bytes(raw)))
 
 
 def _json(path):
@@ -88,7 +99,8 @@ def valid_restored_state(state, paths, *, pending=False):
                 or transaction.get("kind") != "configuration-restore"
                 or any(transaction.get(key) != value for key, value in context.items())
                 or transaction.get("runtime", {}).get("completed") != state.get("completed")
-                or transaction.get("runtime", {}).get("active_stage") is not None):
+                or transaction.get("runtime", {}).get("active_stage") is not None
+                or transaction.get("runtime", {}).get("factory_binding") != state.get("factory_binding")):
             return False
         return (state.get("kind") == "configuration-restore" and state.get("active_stage") is None
                 and state.get("identity_initialized") is True
@@ -97,6 +109,35 @@ def valid_restored_state(state, paths, *, pending=False):
                 and set(state["completed"]) == RESTORE_STAGES
                 and proof == FreshRestoreRuntime._proof(transaction)
                 and _json(stage / "listeners-ready.json") == {**proof, "state": "databases-ready"})
+    except (OSError, ValueError, KeyError, TypeError, Refused):
+        return False
+
+
+def valid_restored_enrollment_state(state, paths, binding):
+    """Validate activation's real enrollment intent without claiming completion."""
+    try:
+        context = state["restore"]
+        operation = _uuid(context["id"])
+        target = _uuid(context["target_installation_id"])
+        stage = paths.data / "manager/restores" / operation
+        _directory(stage, private=True)
+        tx = _json(stage / "transaction.json")
+        progress = tx["runtime"]
+        completed, active = progress["completed"], progress.get("active_stage")
+        unfinished = RESTORE_STAGES - {"installed-release"}
+        expected_context = {key: tx[key] for key in ("id", "stage", "source_installation_id", "target_installation_id", "manifest_sha256")}
+        return (context == expected_context and context["stage"] == str(stage)
+                and _json(paths.data / "manager/restore.json") == {"schema": 2, "id": operation, "stage": str(stage)}
+                and type(tx.get("schema")) is int and tx["schema"] == 1 and tx.get("kind") == state.get("kind") == "configuration-restore"
+                and tx.get("state") in ("enrollment_pending", "verifying", "runtime_ready")
+                and state.get("installation_id") == target == binding.get("installation_id")
+                and state.get("factory_binding") == progress.get("factory_binding") == binding
+                and state.get("identity_initialized") is True
+                and isinstance(completed, list) and len(completed) == len(set(completed))
+                and state.get("completed") == completed and state.get("active_stage") == active
+                and ((set(completed) == unfinished and active == "installed-release")
+                     or (set(completed) == RESTORE_STAGES and active is None))
+                and _json(stage / "listeners-ready.json") == {**FreshRestoreRuntime._proof(tx), "state": "databases-ready"})
     except (OSError, ValueError, KeyError, TypeError, Refused):
         return False
 
@@ -216,6 +257,20 @@ class FreshRestoreRuntime:
             if observed != "inactive":
                 raise Refused("Fresh restore requires stopped appliance services")
 
+    def _factory_inputs(self):
+        from .bootstrap import INITIAL_RELEASE
+        from .update_enrollment import UpdateEnrollment
+        return UpdateEnrollment(data=self.paths.data, etc=self.paths.etc,
+            share=INITIAL_RELEASE.parent, runner=self.runner, firstboot=self.firstboot).verify_initialization_inputs()
+
+    def _verify_images(self):
+        from .bootstrap import INITIAL_RELEASE
+        from .update_enrollment import UpdateEnrollment
+        enrollment = UpdateEnrollment(data=self.paths.data, etc=self.paths.etc,
+            share=INITIAL_RELEASE.parent, runner=self.runner, firstboot=self.firstboot)
+        for component in ("nebulalog", "postgresql", "clickhouse", "keycloak"):
+            enrollment.verify_initialization_image(self._current_factory, component)
+
     def inspect_recovery(self, source, manifest, tx):
         """Validate compatibility without advancing the restore or its auth cutoff.
 
@@ -223,13 +278,9 @@ class FreshRestoreRuntime:
         digest binds fresh setup, random target credentials and measured factory
         code; it does not expose any credential or source configuration values.
         """
-        from .bootstrap import INITIAL_RELEASE
-        from .update_enrollment import UpdateEnrollment
         candidate = copy.deepcopy(tx)
         b = self._load(source, manifest, candidate)
-        enrollment = UpdateEnrollment(data=self.paths.data, etc=self.paths.etc,
-            share=INITIAL_RELEASE.parent, runner=self.runner, firstboot=self.firstboot)
-        factory = enrollment.verify_build_inputs(include_host=True)
+        factory = self._current_factory
         binding = {"setup_sha256": _hash(b.bootstrap / "setup.json"),
                    "secrets_sha256": _hash(b.bootstrap / "secrets.json"),
                    "images_sha256": _hash(self.paths.etc / "images.json"),
@@ -321,8 +372,14 @@ class FreshRestoreRuntime:
         administrator = _uuid(source_state.get("administrator_id"))
         runtime = manifest.get("runtime", {})
         installed = image_pins(_json(self.paths.etc / "images.json"))
-        if image_pins(runtime.get("images")) != installed or runtime.get("schema_revision") != b._schema_revision():
+        factory = self._factory_inputs()
+        binding = factory["binding"]
+        if (image_pins(runtime.get("images")) != installed or binding["images"] != installed
+                or binding["installation_id"] != context["target_installation_id"]
+                or runtime.get("schema_revision") != binding["schema_revision"]
+                or binding["schema_revision"] not in ("3", "4")):
             raise Refused("Fresh restore requires the same installed image digests and schema")
+        self._current_factory = factory
         if source_lifecycle.get("schema_revision") != runtime["schema_revision"]:
             raise Refused("Source lifecycle schema differs from backup provenance")
         if (set(source_runtime) != {"health_password", "health_totp", "inspector_service"}
@@ -346,8 +403,10 @@ class FreshRestoreRuntime:
         b.secret["identity_service"] = source_secret["identity_service"]
         b.runtime, b.pins = source_runtime, installed
         if not tx.get("runtime"):
-            tx["runtime"] = {"context": context, "completed": [], "active_stage": None}
+            tx["runtime"] = {"context": context, "completed": [], "active_stage": None, "factory_binding": binding}
         progress = tx["runtime"]
+        if progress.get("factory_binding") != binding:
+            raise Refused("Restore authenticated factory binding changed")
         if "token_not_before" not in progress:
             if progress["completed"] or progress.get("active_stage"):
                 raise Refused("Existing restore lost its authentication cutoff")
@@ -364,7 +423,8 @@ class FreshRestoreRuntime:
                 raise Refused("Runtime API is not configured to reject source authentication tokens")
         b.state = {"schema": 1, "installation_id": context["target_installation_id"], "kind": "configuration-restore",
                    "restore": context, "completed": list(progress["completed"]), "active_stage": progress.get("active_stage"),
-                   "administrator_id": administrator, "identity_initialized": "identity-rebind" in progress["completed"]}
+                   "administrator_id": administrator, "identity_initialized": "identity-rebind" in progress["completed"],
+                   "factory_binding": binding}
         return b
 
     def _save(self, tx, checkpoint):
@@ -406,6 +466,7 @@ class FreshRestoreRuntime:
         tx = transaction
         self.guard_fresh(tx)
         b = self._load(source_dir, manifest, tx)
+        self._save(tx, checkpoint)  # Authenticated factory inputs precede service/database effects.
         self._fence(tx)  # Before writing any automatically startable Quadlet.
         if os.path.lexists(Path(tx["stage"]) / "listeners-ready.json"):
             raise Refused("Restore listeners were already released; preparation cannot restart")
@@ -438,6 +499,7 @@ class FreshRestoreRuntime:
             if item.get("state") != "restored":
                 raise Refused("Both database restores must have durable successful receipts")
             _sha(item.get("archive_sha256"))
+        self._catalog_proof(tx)
         if tx.get("operational_normalized") is not True:
             raise Refused("Source operational jobs must be quarantined before listeners start")
         if _hash(Path(tx["stage"]) / "normalization.json") != _sha(tx.get("normalization_sha256")):
@@ -445,6 +507,68 @@ class FreshRestoreRuntime:
         if _json(Path(tx["stage"]) / "normalization.json") != {"schema": 1, "operation": tx["id"],
                 "source_installation_id": tx["source_installation_id"], "target_installation_id": tx["target_installation_id"], "observed": True}:
             raise Refused("Restore normalization receipt belongs to another operation")
+
+    def _retained_owner(self, tx, *, held):
+        """Validate this coordinator's actual journal and persistent listeners."""
+        stage = Path(tx["stage"])
+        if (type(tx.get("schema")) is not int or tx["schema"] != 1 or tx.get("kind") != "configuration-restore"
+                or _json(self.paths.data / "manager/restore.json") != {"schema": 2, "id": tx["id"], "stage": str(stage)}
+                or _json(stage / "transaction.json") != tx
+                or not PREPARED_STAGES <= set(tx["runtime"]["completed"])):
+            raise Refused("Restored catalog needs its retained coordinator and prepared runtime")
+        body = ("[Unit]\nConditionPathExists=" + str(stage / "listeners-ready.json") + "\n").encode()
+        for name in LISTENERS:
+            path = self.systemd / ("nebulalog-" + name + ".service.d/80-nebulalog-restore.conf")
+            if trusted_file(path).read_bytes() != body:
+                raise Refused("Restored catalog lost its owned listener fence")
+        if held:
+            if os.path.lexists(stage / "listeners-ready.json"):
+                raise Refused("Restored schema cannot change after listeners are released")
+            self._stopped(LISTENERS)
+
+    def _observe_pg_catalog(self, revision, tx):
+        from nebulalog_adapters.lifecycle import _observe_fixed_pg_catalog
+        return _observe_fixed_pg_catalog(self.runner, revision, hashlib.sha256(tx["stage"].encode()).hexdigest())
+
+    def verify_restored_catalog(self, source_dir, manifest, transaction, *, checkpoint=None):
+        """Observe exact restored structure before normalization; never run DDL."""
+        tx = transaction
+        self.guard_fresh(tx)
+        self._load(source_dir, manifest, tx)
+        self._retained_owner(tx, held=tx.get("operational_normalized") is not True)
+        for name in ("nebulalog", "keycloak"):
+            entry = tx.get("databases", {}).get(name, {})
+            if entry.get("state") != "restored":
+                raise Refused("Catalog observation requires both successful database restores")
+            _sha(entry.get("archive_sha256"))
+        revision = manifest["runtime"]["schema_revision"]
+        if revision not in ("3", "4"):
+            raise Refused("Connected restore requires the same supported schema 3 or 4 profile")
+        self._verify_images()
+        observed = self._observe_pg_catalog(revision, tx)
+        previous = tx["runtime"].get("restored_catalog")
+        if previous is not None and observed != previous:
+            raise Refused("Restored database identity or structural catalog changed")
+        if previous is None:
+            if tx.get("operational_normalized") is True:
+                raise Refused("Restore lacks its pre-normalization structural catalog proof")
+            tx["runtime"]["restored_catalog"] = observed
+            self._log_checkpoint(tx, checkpoint)
+        return observed
+
+    @staticmethod
+    def _catalog_proof(tx):
+        from .image_bundle import ApplicationSchema
+        progress = tx["runtime"]
+        binding = progress["factory_binding"]
+        proof = progress.get("restored_catalog")
+        if (not isinstance(proof, dict) or proof.get("schema_revision") != binding["schema_revision"]
+                or proof.get("schema_revision") not in ("3", "4")
+                or proof.get("schema_sha256") != ApplicationSchema.schema_digest(binding["schema_revision"])
+                or not isinstance(proof.get("database"), dict)):
+            raise Refused("Restore lacks its exact pre-normalization structural catalog")
+        _sha(proof.get("catalog_sha256"))
+        return proof
 
     def _log_checkpoint(self, tx, checkpoint):
         # The coordinator's transaction is the only authoritative progress log.
@@ -489,7 +613,7 @@ class FreshRestoreRuntime:
                 or metadata["link"] != {"source_installation_id": tx["source_installation_id"],
                     "configuration_backup": {"sha256": _sha(tx.get("archive_sha256")), "bytes": trusted_file(stage / "backup.cms").stat().st_size},
                     "runtime": manifest.get("runtime")}
-                or manifest.get("runtime", {}).get("schema_revision") != "3"):
+                or manifest.get("runtime", {}).get("schema_revision") not in ("3", "4")):
             raise Refused("Log recovery set differs from this configuration, source or runtime")
         from .log_backup import VERSION
         if metadata["native"]["server_version"] != VERSION:
@@ -544,12 +668,12 @@ class FreshRestoreRuntime:
             raise Refused("Restored retention policy changed during native recovery")
         return row
 
-    def _log_sql_transition(self, tx, *, old_gate, new_gate, old_engine, new_engine):
+    def _log_sql_transition(self, tx, *, old_gate, new_gate, old_engine, new_engine, policy=None):
         # Only validated fixed JSON values enter SQL; no names or expressions
         # come from an archive. The shared storage lock also fences insertions.
         def literal(value):
             return "'" + json.dumps(value, sort_keys=True, separators=(",", ":")).replace("'", "''") + "'::jsonb"
-        policy = literal(tx["logs"]["native"]["policy"])
+        policy = literal(tx["logs"]["native"]["policy"] if policy is None else policy)
         return f"""BEGIN; SET LOCAL lock_timeout='15s'; SET LOCAL statement_timeout='60s';
 DO $restorelogs$ BEGIN
  PERFORM pg_advisory_xact_lock(4850182995969828167);
@@ -578,7 +702,7 @@ END $restorelogs$; COMMIT; SELECT 'native-restore-storage-settled';"""
                 raise Refused("Interrupted native staging cannot be replayed")
             self.log_restore_hold(tx)
             return {"prepared": True, "listeners_released": False}
-        if hashlib.sha256(SCHEMA3_SQL.encode()).hexdigest() != ApplicationSchema.SCHEMAS["3"]["migrations/clickhouse.sql"]:
+        if hashlib.sha256(SCHEMA3_SQL.encode()).hexdigest() != ApplicationSchema.SCHEMAS[manifest["runtime"]["schema_revision"]]["migrations/clickhouse.sql"]:
             raise Refused("Fresh native table DDL differs from its schema contract")
         row = self._log_pg_state()
         initial = {"schema": 1, "mode": "uninitialized"}
@@ -666,6 +790,164 @@ END $restorelogs$; COMMIT; SELECT 'native-restore-storage-settled';"""
         native["state"] = "released"
         self._log_checkpoint(tx, checkpoint)
 
+    def _config_storage_hold(self, tx):
+        storage = tx["runtime"]["storage"]
+        row = self._log_pg_state()
+        if (_json(self.paths.data / "manager/storage-maintenance/gate.json") != self._log_gate(tx)
+                or row["gate"] != self._log_gate(tx) or row["engine"] != storage["engine"]
+                or row["policy"] != storage["policy"]):
+            raise Refused("Configuration restore lost its owned storage hold or original policy")
+        return row
+
+    def _initialize_config_storage(self, tx, checkpoint):
+        """CH-only initialization of an absent table; restored PG is never migrated."""
+        from .image_bundle import ApplicationSchema
+        from .log_backup import LogBackupAdapter
+        if "logs" in tx:
+            raise Refused("Populated native recovery cannot initialize log storage")
+        self._retained_owner(tx, held=True)
+        b, progress = self.bootstrap, tx["runtime"]
+        adapter = LogBackupAdapter.for_restore(self)
+        instance = adapter._instance(b.pins["CLICKHOUSE_IMAGE"])
+        sql_sha = ApplicationSchema.SCHEMAS[progress["factory_binding"]["schema_revision"]]["migrations/clickhouse.sql"]
+        operation = self._log_gate(tx)["operation"]
+        storage = progress.get("storage")
+        if storage is not None:
+            # No lost DDL acknowledgement is silently converted into success.
+            if storage.get("state") != "initialized" or storage.get("instance") != instance:
+                raise Refused("Interrupted or changed configuration storage initialization requires recovery")
+            self._config_storage_hold(tx)
+            return
+        row = self._log_pg_state()
+        initial = {"schema": 1, "mode": "uninitialized"}
+        gate_path = self.paths.data / "manager/storage-maintenance/gate.json"
+        if (row["engine"] != initial or row["gate"] != self._log_gate(tx, False)
+                or _json(gate_path) != self._log_gate(tx, False) or not isinstance(row["policy"], dict)):
+            raise Refused("Configuration restore requires normalized uninitialized storage")
+        if self._log_ch("SELECT count() FROM system.tables WHERE database='nebulalog' AND name='events'") != "0":
+            raise Refused("Configuration restore refuses an existing events table")
+        policy_raw = self._log_pg("SELECT value::text FROM public.settings WHERE key='retention';")
+        if strict_json(policy_raw.encode()) != row["policy"]:
+            raise Refused("Restored policy changed during storage admission")
+        storage = {"state": "holding", "operation": operation, "table_uuid": str(uuid.uuid4()),
+            "instance": instance, "factory_binding_sha256": _digest(progress["factory_binding"]),
+            "schema_sql_sha256": sql_sha, "absent_observed": True, "policy": row["policy"],
+            "policy_sha256": hashlib.sha256(policy_raw.encode()).hexdigest(), "engine": initial,
+            "database_query_id": _storage_query_id(operation, "database"),
+            "table_query_id": _storage_query_id(operation, "table")}
+        progress["storage"] = storage
+        self._log_checkpoint(tx, checkpoint)  # Before host/DB holds or native DDL.
+        atomic_json(gate_path, self._log_gate(tx))
+        if self._log_pg(self._log_sql_transition(tx, old_gate=self._log_gate(tx, False), new_gate=self._log_gate(tx),
+                old_engine=initial, new_engine=initial, policy=storage["policy"])) != "native-restore-storage-settled":
+            raise Refused("Configuration storage hold did not settle")
+        self._config_storage_hold(tx)
+        if adapter._instance(b.pins["CLICKHOUSE_IMAGE"]) != instance:
+            raise Refused("Configuration storage server changed before dispatch")
+        storage["state"] = "dispatching"
+        self._log_checkpoint(tx, checkpoint)
+        command = ["podman", "run", "--rm", "--name", "nebulalog-restore-storage", "--network", "nebulalog", "--read-only",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--volume",
+            str(b.tls / "trust-bundle.pem") + ":/etc/nebulalog/tls/trust-bundle.pem:ro,z", "--volume",
+            str(gate_path.parent) + ":/run/nebulalog-storage-maintenance:ro,z", "--env-file", str(b.configuration / "runtime/api.env")]
+        for key, value in {"STORAGE_INITIALIZATION_OPERATION": operation, "STORAGE_INITIALIZATION_TABLE_UUID": storage["table_uuid"],
+                "STORAGE_INITIALIZATION_SCHEMA_SHA256": sql_sha, "STORAGE_MAINTENANCE_PATH": "/run/nebulalog-storage-maintenance/gate.json"}.items():
+            command += ["--env", key + "=" + value]
+        result = strict_json(self.runner([*command, b.pins["NEBULALOG_IMAGE"], "initialize-storage"], timeout=120).encode())
+        fields = {"schema", "state", "operation", "table_uuid", "schema_sql_sha256", "ddl_sha256", "retention_policy_sha256", "database_query_id", "table_query_id"}
+        if (not isinstance(result, dict) or set(result) != fields or type(result.get("schema")) is not int
+                or result["schema"] != 1 or result["state"] != "initialized"
+                or any(result[key] != storage[key] for key in ("operation", "table_uuid", "schema_sql_sha256", "database_query_id", "table_query_id"))
+                or result["retention_policy_sha256"] != storage["policy_sha256"]):
+            raise Refused("Configuration storage did not return its exact completion proof")
+        _sha(result["ddl_sha256"])
+        current = self._log_pg_state()
+        engine = current["engine"]
+        if (not isinstance(engine, dict) or engine.get("mode") != "partition" or engine.get("schema") != 1
+                or engine.get("table_uuid") != storage["table_uuid"] or engine.get("operation") != operation
+                or current["policy"] != storage["policy"] or adapter._instance(b.pins["CLICKHOUSE_IMAGE"]) != instance):
+            raise Refused("Initialized configuration storage lost its policy or server identity")
+        storage.update(engine=engine, result=result, state="initialized")
+        self._config_storage_hold(tx)
+        self._log_checkpoint(tx, checkpoint)
+
+    def _observe_ready_catalog(self, tx):
+        from nebulalog_adapters.lifecycle import _observe_ready_application_catalog
+        return _observe_ready_application_catalog(self.runner, tx["runtime"]["factory_binding"]["schema_revision"],
+            self._log_gate(tx)["operation"], data=self.paths.data, configuration=self.configuration)
+
+    def _restore_schema(self, tx, checkpoint):
+        self._retained_owner(tx, held=True)
+        self._verify_images()
+        before = self._catalog_proof(tx)
+        if "logs" in tx:
+            self.log_restore_hold(tx)  # Native restore already populated and bound this table.
+            table = tx["logs"]["native"]["table"]
+            expected_uuid, expected_ddl = table["table_uuid"], table["table_definition_sha256"]
+        else:
+            # Configuration recovery has only started PostgreSQL so far. Bring
+            # up the verified ClickHouse dependency while listener fences hold.
+            self.bootstrap._clickhouse()
+            self._initialize_config_storage(tx, checkpoint)
+            storage = tx["runtime"]["storage"]
+            expected_uuid, expected_ddl = storage["table_uuid"], storage["result"]["ddl_sha256"]
+        observed = self._observe_ready_catalog(tx)
+        if (any(observed.get(key) != value for key, value in before.items())
+                or observed.get("retention", {}).get("table_uuid") != expected_uuid
+                or observed["retention"].get("ddl_sha256") != expected_ddl):
+            raise Refused("Restored schema or physical log storage differs from its retained proof")
+        tx["runtime"]["schema_proof"] = observed
+        self._log_checkpoint(tx, checkpoint)
+
+    def _release_config_storage(self, tx, checkpoint):
+        storage = tx["runtime"]["storage"]
+        if storage.get("state") == "released":
+            return
+        if (storage.get("state") != "initialized"
+                or not {"schema", "identity-rebind", "lifecycle"} <= set(tx["runtime"]["completed"])):
+            raise Refused("Configuration storage cannot release before verified activation")
+        self._config_storage_hold(tx)
+        storage["state"] = "releasing"
+        self._log_checkpoint(tx, checkpoint)
+        if self._log_pg(self._log_sql_transition(tx, old_gate=self._log_gate(tx), new_gate=self._log_gate(tx, False),
+                old_engine=storage["engine"], new_engine=storage["engine"], policy=storage["policy"])) != "native-restore-storage-settled":
+            raise Refused("Configuration storage hold release did not settle")
+        atomic_json(self.paths.data / "manager/storage-maintenance/gate.json", self._log_gate(tx, False))
+        row = self._log_pg_state()
+        if row["gate"] != self._log_gate(tx, False) or row["engine"] != storage["engine"] or row["policy"] != storage["policy"]:
+            raise Refused("Configuration storage release failed readback")
+        storage["state"] = "released"
+        self._log_checkpoint(tx, checkpoint)
+
+    def _verify_released_catalog(self, tx):
+        """Final readback without reacquiring a hold or rewriting recovered data."""
+        self._verify_images()
+        before = self._catalog_proof(tx)
+        if self._observe_pg_catalog(before["schema_revision"], tx) != before:
+            raise Refused("Activated restore database identity or structure changed")
+        ready = tx["runtime"]["schema_proof"]["retention"]
+        gate_path = self.paths.data / "manager/storage-maintenance/gate.json"
+        expected_engine = tx["logs"]["native"]["engine"] if "logs" in tx else tx["runtime"]["storage"]["engine"]
+        query = "SELECT value::text FROM public.settings WHERE key='retention_engine';"
+        engine = strict_json(self._log_pg(query).encode())
+        if engine != expected_engine or _json(gate_path) != self._log_gate(tx, False):
+            raise Refused("Activated restore lost its retention binding or idle host gate")
+        raw = self._log_ch("SELECT toString(uuid) AS uuid,engine,partition_key,create_table_query FROM system.tables "
+            "WHERE database='nebulalog' AND name='events' "
+            "SETTINGS show_table_uuid_in_table_create_query_if_not_nil=0 FORMAT JSONEachRow")
+        if len(raw.encode()) > 65536:
+            raise Refused("Oversized restored table readback")
+        row = strict_json(raw.encode())
+        if (not isinstance(row, dict) or set(row) != {"uuid", "engine", "partition_key", "create_table_query"}
+                or row["uuid"] != ready["table_uuid"] or row["engine"] != "MergeTree"
+                or row["partition_key"] != "(log_type, toDate(ingested_at))"
+                or not isinstance(row["create_table_query"], str)
+                or hashlib.sha256(row["create_table_query"].encode()).hexdigest() != ready["ddl_sha256"]
+                or re.search(r"\bTTL\b", row["create_table_query"], flags=re.IGNORECASE)
+                or strict_json(self._log_pg(query).encode()) != engine
+                or _json(gate_path) != self._log_gate(tx, False)):
+            raise Refused("Activated restore physical log table changed")
+
     def activate(self, source_dir, manifest, transaction, *, checkpoint=None):
         tx = transaction
         self.guard_fresh(tx)
@@ -701,12 +983,15 @@ END $restorelogs$; COMMIT; SELECT 'native-restore-storage-settled';"""
             raise Refused("Requested native logs must be restored and bound before activation")
         self._step("restored-databases", lambda: self._databases(tx), tx, checkpoint)
         self._step("identity-rebind", rebind, tx, checkpoint)
-        self._step("schema", lambda: b._migrate(initialize_retention=False), tx, checkpoint)
+        self._step("schema", lambda: self._restore_schema(tx, checkpoint), tx, checkpoint)
         self._step("lifecycle", b._lifecycle, tx, checkpoint)
         if int(time.time()) < tx["runtime"]["token_not_before"]:
             raise Refused("Restore authentication cutoff is still in the future; resume after clock synchronization")
         if "logs" in tx:
             self._release_log_restore(source_dir, manifest, tx, checkpoint)
+        else:
+            self._release_config_storage(tx, checkpoint)
+        self._verify_released_catalog(tx)
         proof = {**self._proof(tx), "state": "databases-ready"}
         # All database/identity effects are settled before the boot-persistent
         # fence is released. A crash after this point cannot seed an empty realm.
@@ -720,7 +1005,21 @@ END $restorelogs$; COMMIT; SELECT 'native-restore-storage-settled';"""
 
     @staticmethod
     def _proof(tx):
-        proof = {"schema": 1, **{key: tx[key] for key in ("id", "source_installation_id", "target_installation_id", "manifest_sha256")}, "state": "runtime-ready"}
+        before = FreshRestoreRuntime._catalog_proof(tx)
+        progress = tx["runtime"]
+        ready = progress.get("schema_proof")
+        if (not isinstance(ready, dict) or any(ready.get(key) != value for key, value in before.items())
+                or ready.get("markers") != [] or ready.get("retention", {}).get("ttl") is not False
+                or ready["retention"].get("mode") != "partition"):
+            raise Refused("Activation lacks settled schema and physical log storage evidence")
+        proof = {"schema": 1, **{key: tx[key] for key in ("id", "source_installation_id", "target_installation_id", "manifest_sha256")},
+            "state": "runtime-ready", "factory_binding_sha256": _digest(progress["factory_binding"]), "schema_proof_sha256": _digest(ready)}
+        if "logs" not in tx:
+            storage = progress.get("storage", {})
+            if (storage.get("state") != "released" or storage.get("table_uuid") != ready["retention"].get("table_uuid")
+                    or storage.get("result", {}).get("ddl_sha256") != ready["retention"].get("ddl_sha256")):
+                raise Refused("Activation lacks released configuration-only storage proof")
+            proof["storage_initialization_sha256"] = _digest(storage)
         if "logs" in tx:
             logs = tx["logs"]
             native = logs.get("native", {})
@@ -826,6 +1125,7 @@ END $restorelogs$; COMMIT; SELECT 'native-restore-storage-settled';"""
         self._databases(transaction)
         if set(transaction["runtime"]["completed"]) != RESTORE_STAGES or _json(b.state_path) != b.state:
             raise Refused("Restored runtime has not completed its measured activation stages")
+        self._verify_released_catalog(transaction)
         result = b._evidence()
         if not all(result["checks"].get(key) is True for key in RUNTIME_CHECKS):
             raise Refused("Restored runtime failed verification")

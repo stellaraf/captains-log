@@ -22,6 +22,12 @@ be inspected before removal. Preserve source, credentials, VM disks, current
 releases, rollback copies and recovery evidence. Age alone does not authorize
 deletion. Never use a blanket Docker image, volume or system prune.
 
+Go extracts module directories read-only. After confirming the run has exited,
+make only that run's owned directories writable, without following links or
+changing shared module files, before removing its private module cache. Write
+the test outcome and cleanup receipt even when compilation times out or removal
+fails; reconcile incomplete cleanup before starting another build.
+
 The commands below are validation steps inside that managed run. They do not
 provide storage admission or post-run cleanup by themselves. Container builds
 also require a verified builder with its backing storage on the development

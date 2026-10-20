@@ -67,6 +67,26 @@ class NativeBackupTests(unittest.TestCase):
         if path.is_symlink() or not path.is_dir() or private and path.stat().st_mode & 0o077:
             raise Refused("Unsafe test directory")
 
+    def test_native_guard_accepts_only_fixed_same_source_profiles_three_and_four(self):
+        self.adapter.backup._guard = Mock(return_value=INSTALLATION)
+        self.adapter.backup._pending = Mock()
+        for revision in ("3", "4"):
+            self.life.application_schema_current = lambda: {"revision": revision}
+            self.assertEqual(native.LogBackupAdapter._guard(self.adapter), INSTALLATION)
+        for revision in ("1", "2", "5", 4, [], None):
+            self.life.application_schema_current = lambda: {"revision": revision}
+            with self.subTest(revision=revision), self.assertRaises(Refused):
+                native.LogBackupAdapter._guard(self.adapter)
+        self.assertFalse(self.calls)
+
+    def test_native_guard_refuses_different_clickhouse_sql_for_supported_profile(self):
+        self.adapter.backup._guard = Mock(return_value=INSTALLATION)
+        self.adapter.backup._pending = Mock()
+        self.life.application_schema_current = lambda: {"revision": "4"}
+        with patch.object(native, "SCHEMA3_SQL", native.SCHEMA3_SQL + "\n"), self.assertRaises(Refused):
+            native.LogBackupAdapter._guard(self.adapter)
+        self.assertFalse(self.calls)
+
     def trusted(self, path):
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o022:

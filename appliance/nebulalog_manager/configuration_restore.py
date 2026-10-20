@@ -551,6 +551,10 @@ class ConfigurationRestore:
                     self.cmd.feed(_pg(["pg_restore", "--list"], interactive=True), source / (name + ".dump"), timeout=3600)
                 for name in DATABASES:
                     databases.apply(name, source / (name + ".dump"), entries[name + ".dump"], tx, lambda: self._save(tx))
+                # A restored application database is never an input to general
+                # migration. Establish its exact structural profile before any
+                # source-host rows are normalized or identity data is rebound.
+                self.runtime.verify_restored_catalog(source, manifest, tx, checkpoint=lambda: self._save(tx))
                 receipt = {"schema": 1, "operation": tx["id"], "source_installation_id": tx["source_installation_id"],
                            "target_installation_id": tx["target_installation_id"], "observed": True}
                 normalization = Path(tx["stage"]) / "normalization.json"

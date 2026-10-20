@@ -214,14 +214,16 @@ class RestoredAuthContract:
         return value
 
     @classmethod
-    def factory_capture(cls, files, image, build_raw, behavior_raw):
+    def factory_capture(cls, files, image, build_raw, behavior_raw, *, schema_revision="3"):
         """Package already reviewed image evidence, with no native acceptance claim."""
         from . import host_payload
         if any(not isinstance(raw, bytes) or not 0 < len(raw) <= cls.MAX_RECEIPT for raw in (build_raw, behavior_raw)):
             raise Refused("Factory restored authentication receipts exceed their bounds")
+        if not isinstance(schema_revision, str) or schema_revision not in ApplicationSchema.RETENTION_REVISIONS:
+            raise Refused("Factory restored authentication requires an explicit fresh schema 3 or 4 profile")
         build = host_payload.strict_json(build_raw)
         version = build.get("requested_version") if isinstance(build, dict) else None
-        ApplicationSchema.bind_source(files, "3")
+        ApplicationSchema.bind_source(files, schema_revision)
         cls._build(build, files, {"version": version}, image)
         cls._behavior(host_payload.strict_json(behavior_raw), {"image": image.get("reference")}, image, cls.application_hash(files))
         return cls.factory_descriptor({"schema": 1, "contract": cls.CONTRACT, "version": version,
@@ -237,8 +239,9 @@ class RestoredAuthContract:
         """
         from . import host_payload
         factory = cls.factory_descriptor(descriptor.get("restore_auth"))
-        if descriptor.get("schema_revision") != "3":
-            raise Refused("Factory restored authentication requires the supported fresh schema 3 baseline")
+        schema_revision = descriptor.get("schema_revision")
+        if not isinstance(schema_revision, str) or schema_revision not in ApplicationSchema.RETENTION_REVISIONS:
+            raise Refused("Factory restored authentication requires an explicit fresh schema 3 or 4 profile")
         share = Path(share)
         source_raw = host_payload.read_regular(share / cls.SOURCE, cls.MAX_RECEIPT, trusted=root_owned)
         if host_payload.digest(source_raw) != descriptor.get("source_snapshot_sha256"):
@@ -249,15 +252,15 @@ class RestoredAuthContract:
             if {"bytes": len(raw[name]), "sha256": host_payload.digest(raw[name])} != expected:
                 raise Refused("Factory restored authentication receipt changed")
         subject = cls._subject(source_raw, raw[cls.BUILD], raw[cls.BEHAVIOR], host, image, factory["version"],
-                               host_version=host.get("metadata", {}).get("version"))
+                               host_version=host.get("metadata", {}).get("version"), schema_revision=schema_revision)
         return {"schema": 1, "contract": cls.CONTRACT, "subject": subject,
                 "proof_artifacts": factory["artifacts"], "native_qualified": False, "execution_verified_by_tool": False}
 
     @classmethod
-    def _subject(cls, source_raw, build_raw, behavior_raw, host, image, version, *, host_version=None):
+    def _subject(cls, source_raw, build_raw, behavior_raw, host, image, version, *, schema_revision, host_version=None):
         from . import host_payload
         files = host_payload.source_manifest(source_raw)["files"]
-        ApplicationSchema.bind_source(files, "3")
+        ApplicationSchema.bind_source(files, schema_revision)
         metadata = host_payload.validate_metadata(host.get("metadata"))
         generation = host.get("archive_sha256")
         if (not isinstance(generation, str) or not host_payload.SHA256.fullmatch(generation)
@@ -280,7 +283,7 @@ class RestoredAuthContract:
                 "application_source_sha256": source_hash, "host_source_sha256": metadata["host_source_sha256"],
                 "host_generation": generation, "catalog_sha256": metadata["catalog_sha256"],
                 "application_image": reference, "application_config_digest": image["config_digest"],
-                "schema_revision": "3", "schema_sha256": ApplicationSchema.schema_digest("3")}
+                "schema_revision": schema_revision, "schema_sha256": ApplicationSchema.schema_digest(schema_revision)}
 
     @classmethod
     def validate_metadata(cls, manifest):
@@ -293,10 +296,11 @@ class RestoredAuthContract:
         if not {"host", "nebulalog"} <= set(components):
             raise Refused("Restored authentication requires a combined host and application release")
         application = components["nebulalog"]
-        if (application.get("schema_revision") != "3" or application.get("database_migration") != "none"
-                or application.get("schema_sha256") != ApplicationSchema.schema_digest("3")
+        if (not isinstance(application.get("schema_revision"), str)
+                or application["schema_revision"] not in ApplicationSchema.RETENTION_REVISIONS or application.get("database_migration") != "none"
+                or application.get("schema_sha256") != ApplicationSchema.schema_digest(application["schema_revision"])
                 or any(components[name].get("rollback_safe") is not True for name in ("host", "nebulalog"))):
-            raise Refused("Restored authentication starts with fresh schema 3; legacy prototypes require a separate qualified bridge")
+            raise Refused("Restored authentication requires an explicit same-profile fresh schema 3 or 4 release")
         artifacts = {}
         for item in manifest.get("artifacts", []):
             if (not isinstance(item, dict) or set(item) != {"name", "sha256", "bytes"}
@@ -384,7 +388,7 @@ class RestoredAuthContract:
         source = host_payload.source_manifest(raw[cls.SOURCE])
         files = source["files"]
         application = manifest["components"]["nebulalog"]
-        ApplicationSchema.bind_source(files, "3")
+        ApplicationSchema.bind_source(files, application["schema_revision"])
         host_change = manifest["components"]["host"]
         if host_change.get("artifact") not in artifacts or application.get("artifact") not in artifacts:
             raise Refused("Restored authentication component artifacts are absent")
@@ -411,7 +415,7 @@ class RestoredAuthContract:
                 or not isinstance(image.get("config_digest"), str) or not DIGEST.fullmatch(image["config_digest"])):
             raise Refused("Restored authentication image differs from its signed OCI identity")
         subject = cls._subject(raw[cls.SOURCE], raw[cls.BUILD], raw[cls.BEHAVIOR], host,
-                               {**image, "reference": application["image"]}, manifest["version"])
+                               {**image, "reference": application["image"]}, manifest["version"], schema_revision=application["schema_revision"])
         return {"schema": 1, "contract": cls.CONTRACT,
                 "subject": subject,
                 "proof_artifacts": {name: artifacts[name] for name in (cls.SOURCE, cls.BUILD, cls.BEHAVIOR)},

@@ -87,6 +87,16 @@ initializer verifies the empty table and binds its UUID. The immutable schema3
 descriptor, exact host catalog and backup/quiescence barriers must travel with
 that application image. Source implementation is not native acceptance.
 
+The new host coordinator uses `initialize-storage` for fresh schema4 preparation
+and configuration-only restores within schema3 or schema4. The command runs
+without listeners, requires matching host/database delivery holds, and creates
+only the captured ClickHouse schema with the table UUID recorded by the host
+before dispatch. It performs no PostgreSQL schema migration and preserves the
+stored retention policy. Foreign tables, populated tables, altered schema bytes,
+and conflicting operation ownership are refused. Full log restores use the
+native restore path instead. Public schema4 image admission remains held until
+the complete factory and restored-authentication qualification succeeds.
+
 **Existing schema2 → schema3 upgrade and cross-schema rollback remain pending.**
 The explicit application migration primitive above does not authorize the host
 updater to cross that boundary. Existing schema2 installations must be refused

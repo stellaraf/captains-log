@@ -130,6 +130,80 @@ def load_config(path=CONFIG / "lifecycle.json"):
     return value
 
 
+def _initialization_context(revision, operation):
+    if (not isinstance(revision, str) or revision not in ApplicationSchema.RETENTION_REVISIONS
+            or not isinstance(operation, str) or not re.fullmatch(r"[0-9a-f]{64}", operation)):
+        raise Refused("Unsupported fixed initialization catalog observation")
+    return {"operation": operation, "owner": "nebulalog"}
+
+
+def _fixed_catalog_digest(value):
+    collections = {"relations", "columns", "constraints", "indexes", "sequences",
+                   "triggers", "rules", "policies", "inheritance"}
+    counters = {"extra_objects", "functions", "extra_types", "extensions"}
+    if (not isinstance(value, dict) or set(value) != collections | counters
+            or any(not isinstance(value[key], list) for key in collections)
+            or any(type(value[key]) is not int or value[key] != 0 for key in counters)):
+        raise Refused("Unrecognized fixed application catalog")
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _observe_fixed_pg_catalog(commands, revision, operation):
+    """Private structural readback; the caller owns factory/restore authority.
+
+    Reconstruct the expected catalog in a disposable transactional namespace.
+    No application DDL, row normalization, maintenance transition or enrollment
+    occurs here. Restored transient rows may still exist at this boundary.
+    """
+    context = _initialization_context(revision, operation)
+    adapter = Lifecycle({}, commands=commands)
+    raw = adapter._schema_psql(adapter._schema_query(context, catalog_only=revision, structural_only=True))
+    if not isinstance(raw, str) or not 1 <= len(raw.encode()) <= 256 * 1024:
+        raise Refused("Invalid fixed application catalog readback")
+    observed = strict_json(raw.encode())
+    profile = "host-stepup-v2" if revision == "4" else "host-stepup"
+    if (not isinstance(observed, dict) or set(observed) != {"revision", "profile", "catalog", "database"}
+            or observed["revision"] != revision or observed["profile"] != profile):
+        raise Refused("Fixed application catalog profile differs")
+    database = observed["database"]
+    if (not isinstance(database, dict)
+            or set(database) != {"system_identifier", "database_oid", "database", "owner", "server_version"}
+            or database["database"] != "nebulalog" or database["owner"] != "nebulalog"
+            or not isinstance(database["system_identifier"], str)
+            or not re.fullmatch(r"[1-9][0-9]{0,19}", database["system_identifier"])
+            or type(database["database_oid"]) is not int or not 1 <= database["database_oid"] < 2**32
+            or type(database["server_version"]) is not int or database["server_version"] // 10000 != 17):
+        raise Refused("Fixed application database identity differs")
+    return {"schema_revision": revision, "schema_sha256": ApplicationSchema.schema_digest(revision),
+            "profile": profile, "catalog_sha256": _fixed_catalog_digest(observed["catalog"]),
+            "database": database}
+
+
+def _observe_ready_application_catalog(commands, revision, operation, *, data=DATA, configuration=CONFIG):
+    """Private settled readback under the caller's exact retained delivery hold.
+
+    This is not a public authority route. The installed firstboot/restore
+    coordinator must bind its journal, immutable inputs and stopped services
+    before calling; release/OS-update stage allowlists remain unchanged.
+    """
+    context = _initialization_context(revision, operation)
+    adapter = Lifecycle({}, commands=commands, data=data, configuration=configuration)
+    adapter._schema_hold(None, context)
+    structure = _observe_fixed_pg_catalog(commands, revision, operation)
+    raw = adapter._schema_psql(adapter._schema_query(context, catalog_only=revision))
+    if not isinstance(raw, str) or not 1 <= len(raw.encode()) <= 256 * 1024:
+        raise Refused("Invalid settled application catalog readback")
+    observed = strict_json(raw.encode())
+    if (not isinstance(observed, dict) or set(observed) != {"revision", "catalog", "marker", "profile", "markers"}
+            or observed["revision"] != revision or observed["profile"] != structure["profile"]
+            or observed["marker"] is not None or observed["markers"] != []
+            or _fixed_catalog_digest(observed["catalog"]) != structure["catalog_sha256"]):
+        raise Refused("Settled application catalog differs from its fixed profile")
+    retention = adapter._retention_table_operation(operation)
+    adapter._schema_hold(None, context)
+    return {**structure, "markers": [], "retention": retention}
+
+
 class Lifecycle:
     def __init__(self, config, commands=None, *, state=STATE, data=DATA, configuration=CONFIG,
                  quadlets=QUADLETS, guard=require_linux_root):
@@ -545,8 +619,14 @@ SELECT value::text FROM public.settings WHERE key='storage_emergency_maintenance
         The host fence remains conservative across both database observations.
         This is a readback only; an uninitialized/migrating engine is never adopted.
         """
-        expected_gate = {"schema": 1, "held": True, "delivery_held": True,
-                         "operation": hashlib.sha256(str(stage.resolve()).encode()).hexdigest()}
+        return self._retention_table_operation(hashlib.sha256(str(stage.resolve()).encode()).hexdigest())
+
+    def _retention_table_operation(self, operation):
+        # Private firstboot/restore callers establish their own immutable journal
+        # and exact service/pin authority; an operation string grants none.
+        if not isinstance(operation, str) or not re.fullmatch(r"[0-9a-f]{64}", operation):
+            raise Refused("Invalid retention observation owner")
+        expected_gate = {"schema": 1, "held": True, "delivery_held": True, "operation": operation}
         path = self.data / "manager/storage-maintenance/gate.json"
         if storage_gate_value(strict_json(trusted_file(path).read_bytes())) != expected_gate:
             raise Refused("Retention table verification requires the exact host delivery fence")
@@ -559,7 +639,8 @@ SELECT value::text FROM public.settings WHERE key='storage_emergency_maintenance
                 or identifier == "00000000-0000-0000-0000-000000000000"):
             raise Refused("Retention engine has no settled physical table identity")
         raw = self.ch("SELECT toString(uuid) AS uuid,engine,partition_key,create_table_query FROM system.tables "
-                      "WHERE database='nebulalog' AND name='events' FORMAT JSONEachRow")
+                      "WHERE database='nebulalog' AND name='events' "
+                      "SETTINGS show_table_uuid_in_table_create_query_if_not_nil=0 FORMAT JSONEachRow")
         if len(raw.encode()) > 65536:
             raise Refused("Oversized retention table evidence")
         rows = [strict_json(line.encode()) for line in raw.splitlines() if line.strip()]
@@ -725,8 +806,10 @@ SELECT value::text FROM public.settings WHERE key='storage_emergency_maintenance
             os.close(descriptor)
         return hashlib.sha256(raw).hexdigest()
 
-    def _schema_query(self, context, *, migrate=False, gate_operation=None, catalog_only=None):
-        if catalog_only not in (None, "1", "2", "3", "4") or migrate and catalog_only:
+    def _schema_query(self, context, *, migrate=False, gate_operation=None, catalog_only=None, structural_only=False):
+        if (catalog_only not in (None, "1", "2", "3", "4") or migrate and catalog_only
+                or type(structural_only) is not bool
+                or structural_only and (migrate or catalog_only not in ApplicationSchema.RETENTION_REVISIONS)):
             raise Refused("Invalid catalog-only schema request")
         legacy, additive, stepup = ApplicationSchema.reviewed_sql()
         owner = context["owner"]
@@ -756,6 +839,19 @@ DECLARE old_catalog jsonb; new_catalog jsonb; retention_catalog jsonb; challenge
 BEGIN
  PERFORM pg_advisory_xact_lock({STORAGE_LOCK});
  IF current_setting('server_version_num')::integer / 10000 != 17 THEN RAISE EXCEPTION 'Unqualified PostgreSQL major'; END IF;
+ IF {str(structural_only).lower()} THEN
+  IF current_user<>'postgres' OR current_database()<>'nebulalog'
+   OR NOT EXISTS(SELECT FROM pg_roles WHERE rolname='nebulalog' AND rolcanlogin
+    AND NOT (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls))
+   OR EXISTS(SELECT FROM pg_auth_members WHERE member=(SELECT oid FROM pg_roles WHERE rolname='nebulalog'))
+  THEN RAISE EXCEPTION 'Unexpected fixed application role authority'; END IF;
+  IF EXISTS(SELECT FROM pg_prepared_xacts WHERE database=current_database())
+   OR EXISTS(SELECT FROM pg_extension WHERE extname<>'plpgsql')
+   OR EXISTS(SELECT FROM pg_foreign_server)
+   OR EXISTS(SELECT FROM pg_namespace WHERE nspname NOT IN ('public','pg_catalog','information_schema')
+    AND nspname NOT LIKE 'pg_toast%' AND nspname NOT LIKE 'pg_temp_%')
+  THEN RAISE EXCEPTION 'Unqualified fixed application database objects'; END IF;
+ END IF;
  IF (SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname=current_database()) IS DISTINCT FROM '{owner}'
  THEN RAISE EXCEPTION 'Application database owner differs from backup'; END IF;
  IF EXISTS(SELECT FROM pg_event_trigger) OR EXISTS(SELECT FROM pg_default_acl WHERE defaclnamespace IN (0,'public'::regnamespace))
@@ -810,6 +906,23 @@ BEGIN
  EXECUTE {actual_query} INTO actual;
  IF actual IS DISTINCT FROM old_catalog AND actual IS DISTINCT FROM new_catalog AND actual IS DISTINCT FROM retention_catalog AND actual IS DISTINCT FROM challenge_catalog
  THEN RAISE EXCEPTION 'Application catalog differs before reading any application data'; END IF;
+ -- Firstboot/restore may verify the exact structure before normalizing any
+ -- restored operation rows. This branch never executes application DDL/DML.
+ IF {str(structural_only).lower()} THEN
+  IF current_database()<>'nebulalog' OR current_user<>'{owner}'
+   OR ('{catalog_only or ''}'='3' AND actual IS DISTINCT FROM retention_catalog)
+   OR ('{catalog_only or ''}'='4' AND actual IS DISTINCT FROM challenge_catalog)
+  THEN RAISE EXCEPTION 'Catalog differs from the requested fixed initialization profile'; END IF;
+  IF EXISTS(SELECT FROM public.settings WHERE key LIKE 'application_schema_migration:%')
+  THEN RAISE EXCEPTION 'Factory/restored schema contains unowned migration evidence'; END IF;
+  RESET ROLE;
+  INSERT INTO pg_temp.captainslog_schema_result VALUES(jsonb_build_object(
+   'revision','{catalog_only or ''}','catalog',actual,'profile',profile,
+   'database',jsonb_build_object('system_identifier',(SELECT system_identifier::text FROM pg_control_system()),
+    'database_oid',(SELECT oid::bigint FROM pg_database WHERE datname=current_database()),
+    'database',current_database(),'owner','{owner}','server_version',current_setting('server_version_num')::integer)));
+  RETURN;
+ END IF;
  IF (SELECT value FROM public.settings WHERE key='storage_emergency_maintenance') IS DISTINCT FROM {gate}
  THEN RAISE EXCEPTION 'Database delivery hold differs'; END IF;
  SELECT value INTO found FROM public.settings WHERE key='application_schema_migration:{operation}';

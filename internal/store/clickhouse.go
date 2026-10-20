@@ -18,8 +18,10 @@ import (
 type ClickHouse struct {
 	URL, User, Password string
 	Client              *http.Client
-	pageProbeMu         sync.Mutex
-	pageProbe           *pageCapabilityProbe
+	// Only the fixed storage initializer reads metadata before nebulalog exists.
+	initializationMetadata bool
+	pageProbeMu            sync.Mutex
+	pageProbe              *pageCapabilityProbe
 }
 
 type pageCapabilityProbe struct {
@@ -47,6 +49,10 @@ func NewClickHouse(endpoint, user, password string) *ClickHouse {
 	return &ClickHouse{URL: endpoint, User: user, Password: password, Client: &http.Client{Timeout: 45 * time.Second}}
 }
 
+func (c *ClickHouse) storageInitializationClient() *ClickHouse {
+	return &ClickHouse{URL: c.URL, User: c.User, Password: c.Password, Client: c.Client, initializationMetadata: true}
+}
+
 // Query binds all literals independently from the trusted SQL program.
 func (c *ClickHouse) Query(ctx context.Context, sql string, params map[string]string) (io.ReadCloser, error) {
 	return c.request(ctx, sql, params, nil, queryDefault)
@@ -58,6 +64,9 @@ func (c *ClickHouse) request(ctx context.Context, sql string, params map[string]
 	}
 	q := u.Query()
 	q.Set("database", "nebulalog")
+	if c.initializationMetadata {
+		q.Set("database", "default")
+	}
 	if id, ok := ctx.Value(clickHouseQueryIDKey{}).(string); ok {
 		q.Set("query_id", id)
 	}

@@ -96,6 +96,12 @@ class FakeRuntime:
             raise AssertionError("Activation before normalization")
         checkpoint()
 
+    def verify_restored_catalog(self, source, manifest, tx, checkpoint):
+        self.calls.append("catalog")
+        if any(tx["databases"].get(name, {}).get("state") != "restored" for name in ("nebulalog", "keycloak")):
+            raise AssertionError("Catalog observation before both database restores")
+        checkpoint()
+
     def finish_enrollment(self, source, manifest, tx, checkpoint):
         self.calls.append("enrollment")
         # This operation must be outside all four coordination locks.
@@ -358,7 +364,7 @@ class CoordinatorTests(unittest.TestCase):
         result = self.manager.resume(OP)
         self.assertEqual(result["state"], "runtime_ready")
         self.assertFalse(result["setup_complete"])
-        self.assertEqual(self.runtime.calls, ["prepare", "activate", "enrollment", "verify"])
+        self.assertEqual(self.runtime.calls, ["prepare", "catalog", "activate", "enrollment", "verify"])
         observed = self.manager._load(OP)
         self.assertEqual({row["state"] for row in observed["databases"].values()}, {"restored"})
         self.assertEqual(sum("--single-transaction" in cmd for cmd, _ in self.commands.calls), 2)

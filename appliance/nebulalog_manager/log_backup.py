@@ -310,8 +310,11 @@ class LogBackupAdapter:
     def _guard(self):
         installation = self.backup._guard()
         self.backup._pending()
-        if self.lifecycle.application_schema_current()["revision"] != "3":
-            raise Refused("Native log recovery currently requires the factory schema 3 profile")
+        revision = self.lifecycle.application_schema_current()["revision"]
+        if not isinstance(revision, str) or revision not in ApplicationSchema.RETENTION_REVISIONS:
+            raise Refused("Native log recovery requires the fixed fresh schema 3 or 4 profile")
+        if hashlib.sha256(SCHEMA3_SQL.encode()).hexdigest() != ApplicationSchema.SCHEMAS[revision]["migrations/clickhouse.sql"]:
+            raise Refused("Native log recovery schema differs from its fixed source profile")
         return installation
 
     def _save(self, stage, value):

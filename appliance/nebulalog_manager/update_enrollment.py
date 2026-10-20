@@ -210,7 +210,7 @@ class UpdateEnrollment:
         _tree(self.temp)
         return identity
 
-    def _descriptor(self):
+    def _descriptor(self, *, _initialization=False):
         raw = _read(self.share / "initial-release.json")
         value = strict_json(raw)
         fields = {"schema", "product", "sequence", "schema_revision", "source_commit", "source_dirty",
@@ -222,12 +222,12 @@ class UpdateEnrollment:
                 or type(value.get("source_dirty")) is not bool or value.get("qualification_status") != "pending"
                 or any(not SHA256.fullmatch(str(value.get(key, ""))) for key in ("source_snapshot_sha256", "bundle_manifest_sha256"))):
             raise Refused("Initial release provenance is missing explicit build identity or has unsupported claims")
-        if value["schema_revision"] == application_schema.HOST_CHALLENGE_REVISION:
+        if value["schema_revision"] == application_schema.HOST_CHALLENGE_REVISION and not _initialization:
             raise Refused("Schema 4 activation awaits fresh initialization, restored authentication, and image qualification")
         if "restore_auth" in value:
             RestoredAuthContract.factory_descriptor(value["restore_auth"])
-            if value["schema_revision"] != "3":
-                raise Refused("Factory restored authentication requires the supported fresh schema 3 baseline")
+            if value["schema_revision"] not in (("3", "4") if _initialization else ("3",)):
+                raise Refused("Factory restored authentication requires an explicitly supported fresh schema")
         source = _read(self.share / "source-manifest.json", 8 * 1024**2)
         manifest = strict_json(source)
         if (_hash(source) != value["source_snapshot_sha256"] or not isinstance(manifest, dict)
@@ -289,7 +289,7 @@ class UpdateEnrollment:
         This is factory-only; it cannot bless a later selected update baseline.
         """
         from . import host_payload
-        descriptor, descriptor_sha, _ = self._descriptor()
+        descriptor, descriptor_sha, _ = self._activation_descriptor()
         host = self._factory_host(descriptor)
         source = strict_json(_read(self.share / "source-manifest.json", host_payload.MAX_SOURCE_MANIFEST))
         mappings = dict(FIXED_HOST_FILES)
@@ -329,6 +329,59 @@ class UpdateEnrollment:
                 "restore_auth": auth_proof,
                 "publisher": {key: value for key, value in publisher.items() if key != "public"}}
 
+    def verify_initialization_inputs(self):
+        """Authenticate fresh/restore inputs without enrolling or starting anything.
+
+        The private schema4 parser alone grants no authority. Host security,
+        factory generation, every OCI archive/source binding and the measured
+        restored-authentication proof must all agree before a coordinator uses
+        this result. Public packaging/default descriptor admission is unchanged.
+        """
+        require_linux_root()
+        gate = self.firstboot.gate()
+        identity = _identity(gate.get("installation_id"))
+        if gate.get("host_ready") is not True or _json(self.data / "configuration/bootstrap/setup.json").get("installation_id") != identity:
+            raise Refused("Initialization requires the enrolled measured host")
+        descriptor, descriptor_sha, application_source = self._descriptor(_initialization=True)
+        pins = _json(self.etc / "images.json")
+        if descriptor["bundle_manifest_sha256"] != _hash(_read(self.share / "images/manifest.json")):
+            raise Refused("Initialization bundle differs from factory provenance")
+        verified = verify_bundle(self.share / "images", pins, root_owned=True)
+        if verified["images"]["NEBULALOG_IMAGE"].get("application_source_sha256") != application_source:
+            raise Refused("Initialization image differs from captured application source")
+        publisher = self._publisher(descriptor)
+        host = self._factory_host(descriptor)
+        self._running_host(host)
+        auth = self._factory_restore_auth(descriptor, verified, host)
+        if descriptor["schema_revision"] == "4" and auth is None:
+            raise Refused("Schema4 initialization requires measured restored-authentication proof")
+        from .host_payload import CATALOG_SHA256
+        binding = {"schema": 1, "installation_id": identity,
+            "initial_release_sha256": descriptor_sha, "source_snapshot_sha256": descriptor["source_snapshot_sha256"],
+            "schema_revision": descriptor["schema_revision"], "schema_sha256": application_schema.schema_digest(descriptor["schema_revision"]),
+            "bundle_manifest_sha256": descriptor["bundle_manifest_sha256"], "host": host,
+            "host_catalog_sha256": CATALOG_SHA256, "images": pins}
+        return {"binding": binding, "descriptor": descriptor, "descriptor_sha256": descriptor_sha,
+            "application_source_sha256": application_source, "bundle": verified, "host": host, "restore_auth": auth,
+            "publisher": {key: value for key, value in publisher.items() if key != "public"}}
+
+    def verify_initialization_image(self, factory, component):
+        """Measure one loaded dependency against previously authenticated inputs."""
+        if component not in COMPONENT_IMAGES:
+            raise Refused("Unknown initialization dependency")
+        key = COMPONENT_IMAGES[component]
+        if _json(self.etc / "images.json") != factory["binding"]["images"]:
+            raise Refused("Initialization image selection changed")
+        loaded = _json(self.state.parent / "image-bundle-receipt.json")
+        if (not isinstance(loaded, dict) or loaded.get("schema") != 1 or loaded.get("status") != "loaded"
+                or loaded.get("network_used") is not False):
+            raise Refused("Initialization requires the verified offline image load")
+        expected = factory["bundle"]["images"][key]
+        observed = ImageBundleLoader(data=self.data, runner=self.runner)._inspect_installed(factory["binding"]["images"][key], expected)
+        if loaded.get("images", {}).get(key) != observed:
+            raise Refused("Initialization image differs from its offline load receipt")
+        return observed
+
     def _factory_restore_auth(self, descriptor, verified, host=None):
         """Validate descriptor-covered receipts; loose files never grant support."""
         if "restore_auth" not in descriptor:
@@ -341,7 +394,7 @@ class UpdateEnrollment:
         if any({"bytes": len(raw[name]), "sha256": _hash(raw[name])} != expected for name, expected in factory["artifacts"].items()):
             raise Refused("Factory restored authentication receipt differs from initial provenance")
         image = verified["images"]["NEBULALOG_IMAGE"]
-        if RestoredAuthContract.factory_capture(source["files"], image, raw[RestoredAuthContract.BUILD], raw[RestoredAuthContract.BEHAVIOR]) != factory:
+        if RestoredAuthContract.factory_capture(source["files"], image, raw[RestoredAuthContract.BUILD], raw[RestoredAuthContract.BEHAVIOR], schema_revision=descriptor["schema_revision"]) != factory:
             raise Refused("Factory restored authentication receipts differ from measured image inputs")
         if host is None:
             return None  # Pristine installer checks precede generation creation.
@@ -393,12 +446,31 @@ class UpdateEnrollment:
                 or os.environ.get("NEBULALOG_HOST_ABI") != "1"):
             raise Refused("Initial release enrollment must run through the measured fixed host dispatcher")
 
+    def _activation_descriptor(self):
+        """Schema4 enrollment requires the coordinator's retained ready proof."""
+        candidate = _json(self.share / "initial-release.json")
+        if not isinstance(candidate, dict) or candidate.get("schema_revision") != "4":
+            return self._descriptor()
+        factory = self.verify_initialization_inputs()
+        state = _json(self.data / "configuration/bootstrap/runtime-state.json")
+        from .firstboot import Locations
+        paths = Locations(etc=self.etc, data=self.data)
+        if state.get("kind") == "configuration-restore":
+            from .restore_runtime import valid_restored_enrollment_state
+            valid = valid_restored_enrollment_state(state, paths, factory["binding"])
+        else:
+            from .bootstrap import valid_fresh_enrollment_state
+            valid = valid_fresh_enrollment_state(state, paths, factory["binding"])
+        if not valid:
+            raise Refused("Schema4 activation lacks its protected completed initialization proof")
+        return factory["descriptor"], factory["descriptor_sha256"], factory["application_source_sha256"]
+
     def _installed(self):
         identity = self._gate()
         with locked(self.state.parent / "transaction.lock"), locked(self.state / "transaction.lock"):
             if (self.state / "current.json").exists() and not (self.state / "initial-pending.json").exists():
                 raise Refused("Existing installed state has no initial enrollment proposal; automatic adoption differs from supported crash recovery")
-            descriptor, descriptor_sha, application_source = self._descriptor()
+            descriptor, descriptor_sha, application_source = self._activation_descriptor()
             self._publisher(descriptor)
             host = self._factory_host(descriptor)
             self._running_host(host)
@@ -489,7 +561,7 @@ class UpdateEnrollment:
         The factory image is the authentication boundary; downloading a key and
         hash together from an untrusted origin is not independent authentication.
         """
-        descriptor, descriptor_sha, _ = self._descriptor()
+        descriptor, descriptor_sha, _ = self._activation_descriptor()
         publisher = self._publisher(descriptor)
         if publisher["mode"] == "private-unsealed":
             return {"mode": "private-unsealed", "status": "not_configured", "update_ready": False}
@@ -505,7 +577,7 @@ class UpdateEnrollment:
 
     def factory_status(self):
         """Read-only first-boot acceptance; missing trust never triggers enrollment."""
-        descriptor, descriptor_sha, _ = self._descriptor()
+        descriptor, descriptor_sha, _ = self._activation_descriptor()
         publisher = self._publisher(descriptor)
         if publisher["mode"] == "private-unsealed":
             return {"mode": "private-unsealed", "update_ready": False}
