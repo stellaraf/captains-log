@@ -149,7 +149,7 @@ signing-key snapshots stayed equal. Temporary administration was removed and
 its credentials and issued token were refused; the original bootstrap account
 remained disabled.
 
-The SQL backup deliberately included the fixture's temporary administrator so
+The earlier journal-only fixture's SQL backup deliberately included its temporary administrator so
 the restored server could be administered without introducing a second recovery
 identity. Therefore this test does **not** qualify durable temporary-administrator
 creation/deletion recovery. The fixture supplied the fence-admission callback
@@ -157,9 +157,83 @@ from its API-stopped observation; production maintenance admission, encrypted
 host-storage verification, full lifecycle rollback, native TLS/FIPS and failure
 between a remote mutation and persistence remain separate gates.
 
+## Durable temporary-authority controller
+
+`TemporaryIdentityAuthority` records the installation, target realm, disabled
+bootstrap identity, maintenance operation, random temporary client name, secret,
+observed client/service-user IDs and current phase in a private manager journal.
+It persists intent before invoking the vendor recovery command. Its trusted
+backend must stop the sole identity server and reconcile any still-running owned
+recovery process before it observes or creates the account.
+
+| Phase | Recovery rule |
+| --- | --- |
+| `intent` | No account may exist yet; persist `creating` before dispatch. |
+| `creating` | Observe the vendor temporary marker, exact account shape and service user; prove the persisted secret works before adoption. A known bound identity that disappears is not silently recreated. |
+| `ready` | Verify administration of the owned realm, run the fixed scope/session workflow, and persist its bounded receipt. |
+| `removing` | Skip completed work; delete only the bound client, verify client and service-user absence, and check that its secret and issued token are refused. |
+| `removed` | Retain the receipt with secret and token erased. Reuse requires live settled-state readback; a new recovery operation uses new credentials. |
+
+The backend must positively verify the external maintenance fence at each
+boundary. Untracked clients in the appliance's temporary-account namespace,
+orphan service users, an enabled original bootstrap identity, foreign token
+subject/client claims, changed account IDs and unsafe records are refused.
+Failed work or uncertain responses retain the private recovery record; they do
+not authorize resuming service or falsely claim that administration was removed.
+A removed account that reappears requires explicit recovery instead of adoption.
+
+The work callback accepts the fixed session-journal receipt shape, preventing
+arbitrary callback data or credentials from being copied into completion
+metadata. A successful return still requires fresh login and never releases
+maintenance. Repeating a completed operation requires the backend to verify the
+live realm, API environment and required scope state. Database rollback uses a
+distinct authorized recovery operation so that reconciliation runs again.
+
+All **124 focused tests** passed on Rocky Python 3.14.8, including 18 authority
+state-machine tests. These cover response loss after committed creation and
+deletion, interrupted work, credential erasure, stale completion, foreign
+identity/token state, missing records, invalid receipts, fencing and durable-write
+failure. Live vendor-command and database-restore evidence is recorded separately.
+
+### Live temporary-authority recovery
+
+The source-bound recovery fixture passed **13 live authority/token/rollback
+checks**. The actual controller ran in four separate Rocky Python 3.14.8
+Linux/amd64 processes against PostgreSQL 17.11 and Keycloak 26.8.1:
+
+1. The vendor recovery command created one account, then the fixture injected a
+   lost response after the command committed. The journal retained its secret
+   and `creating` intent.
+2. A new process observed and authenticated that same account, without creating
+   another one. It reconciled browser scopes and the session journal, then lost
+   the response after actual client deletion. The durable phase was `removing`.
+3. A new process skipped completed work, verified client/service-user absence
+   and refusal of the retained secret and administration token, then durably
+   erased both credentials. It neither recreated nor deleted another account.
+4. The fixture restored an actual database backup taken before any temporary
+   account existed. The original refresh session worked again. A distinct
+   recovery operation created fresh vendor authority, reconciled the retained
+   session journal and restored API environment, and removed that new account.
+   The revived refresh token and both still-unexpired API access tokens were
+   rejected afterward.
+
+The original bootstrap account remained disabled. Identity/credential/grant and
+signing-key snapshots matched. Six browser regressions passed before and six
+after the sequence, alongside four role-permission cases, authenticator
+enrollment, invalid-code rejection and fresh-context password/TOTP login.
+
+The fixture backend used narrowly checked Docker Engine operations on its owned
+containers, real SQL observations and loopback Admin REST. It checked that its
+API container stayed stopped. It did not implement or qualify the production
+Podman/systemd backend, external edge-maintenance admission, encrypted native
+storage, service-client migration, strict-FIPS execution, or interruption while
+the vendor command itself was still writing. The two injected failures occurred
+after committed real operations; they are not a claim of arbitrary power-loss
+coverage. No production updater entrypoint invokes this controller yet.
+
 ## Rollback and integration limits
 
-Both helpers are catalogued libraries, not an automatic migration entrypoint.
+These maintenance primitives are catalogued libraries, not an automatic migration entrypoint.
 The new factory host catalog contains 136 files. Existing 134-file factory
 catalogs cannot automatically accept it: catalog/boot migration and rollback
 must be qualified separately. A verified new archive is not installed or
@@ -174,7 +248,7 @@ simply restoring an older API environment can remove local JWT rejection.
 The recovery path must also remove temporary administration and retain the
 original bootstrap account's disabled state.
 
-Automatic transaction integration, durable temporary-authority recovery,
+Automatic transaction integration, production temporary-authority admission,
 full lifecycle rollback, native TLS/FIPS execution and full appliance acceptance
-remain open. The isolated SQL/configuration rollback above does not release
-those production gates.
+remain open. The isolated controller and SQL/configuration rollback fixtures do
+not release those production gates.
