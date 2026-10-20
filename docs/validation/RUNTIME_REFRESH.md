@@ -107,6 +107,32 @@ The tmpfs was empty afterward; the container and host compile caches were
 independently confirmed absent. Physical disk failures, native encrypted
 storage and full appliance recovery remain separate acceptance gates.
 
+## Subsequent retention and ClickHouse qualification
+
+Twelve selected integration tests passed with **41 passes including subtests,
+zero failures and zero skips** against disposable PostgreSQL 17.11 and the
+pinned Altinity `25.3.8.30001.altinityfips` Linux/amd64 server. The client was
+Go 1.27.2 on macOS/arm64. Tests covered:
+
+- Emergency-policy HTTP revision conflicts and signed-actor audit records.
+- Emergency intent, admission, maintenance holds and recovery behavior.
+- Actual partition removal and physical cleanup, protection of diagnostic
+  records, a delayed INSERT during PostgreSQL lock loss, and uncertainty after
+  a successful DROP whose response was lost.
+- Normal retention policy changes over existing rows, late-delivery fencing,
+  legacy TTL removal only under an owned migration hold, and uncertain dispatch.
+- Complete wide-row reads at 1, 200 and 1,000 rows; ascending/descending cursor
+  sorting over one million inline records; threat/DNS category membership;
+  inventory time-window and storage write-demand calculations.
+
+Pressure observations and selected transport failures were injected; the
+PostgreSQL transactions and ClickHouse INSERT, ALTER and DROP effects were real.
+The SQL fixtures used temporary credentials, loopback-only published ports,
+a private PostgreSQL volume and a bounded 1 GiB ClickHouse tmpfs. They do not
+qualify production TLS, native FIPS operation or large-estate performance.
+No temporary PostgreSQL schemas remained afterward. Both containers, the
+volume, credentials and host compile caches were independently confirmed absent.
+
 ## Remaining acceptance
 
 Existing-appliance interpreter installation and fixed-host migration,
