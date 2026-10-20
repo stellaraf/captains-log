@@ -254,8 +254,8 @@ def _qualified(path, row):
             'acl': acl, 'selinux': base64.b64encode(row['selinux']).decode(), 'xattrs': xattrs}
 
 
-def parse_database(raw, *, expected_sha256):
-    """Parse fixed historical rows after digest verification, not authorization."""
+def _database_rows(raw, *, expected_sha256):
+    """Decode the bounded vendor format; callers select and qualify rows."""
     if (not isinstance(raw, bytes) or not 0 < len(raw) <= MAX_COMPRESSED
             or not isinstance(expected_sha256, str) or not SHA.fullmatch(expected_sha256)
             or hashlib.sha256(raw).hexdigest() != expected_sha256):
@@ -275,7 +275,7 @@ def parse_database(raw, *, expected_sha256):
             refuse('unsupported_database_spec')
     except StopIteration:
         refuse('incomplete_database_header')
-    rows, seen, ended = {}, set(), False
+    seen, ended = set(), False
     for line in lines:
         if ended:
             refuse('data_after_end_marker')
@@ -288,13 +288,38 @@ def parse_database(raw, *, expected_sha256):
         if name in seen:
             refuse('duplicate_filename')
         seen.add(name)
+        yield name, value
+    if not ended:
+        refuse('missing_end_or_required_targets')
+
+
+def parse_database(raw, *, expected_sha256):
+    """Parse fixed historical rows after digest verification, not authorization."""
+    rows, count = {}, 0
+    for name, value in _database_rows(raw, expected_sha256=expected_sha256):
+        count += 1
         path = name.decode('ascii') if name.isascii() else None
         if path in TARGETS:
             rows[path] = _qualified(path, value)
-    if not ended or set(rows) != TARGETS:
+    if set(rows) != TARGETS:
         refuse('missing_end_or_required_targets')
     return {'schema': 1, 'format': FORMAT, 'database_sha256': expected_sha256,
-            'entry_count': len(seen), 'rows': rows}
+            'entry_count': count, 'rows': rows}
+
+
+def parse_regular_file(raw, *, expected_sha256, path):
+    """Read one fully monitored regular file; this grants no mutation authority."""
+    if not isinstance(path, str) or not path.startswith('/') or len(path) > MAX_PATH:
+        refuse('invalid_file_path')
+    selected = None
+    for name, value in _database_rows(raw, expected_sha256=expected_sha256):
+        if name == path.encode():
+            selected = value
+    if (selected is None or selected['attr'] != REGULAR_MASK
+            or stat.S_IFMT(selected['mode']) != stat.S_IFREG or selected['target'] is not None
+            or selected['lcount'] != 1 or selected['sha512'] is None):
+        refuse('unqualified_regular_file')
+    return selected
 
 
 def validate_change_summary(path, summary, *, row, attribute):

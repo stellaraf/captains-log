@@ -114,9 +114,9 @@ before subsequent durable work.
 
 The composed operation is not yet invoked automatically by lifecycle service
 startup. Host resource preservation now verifies the exact completed restore
-transformation described below. AIDE still requires the original API environment
-hash and needs retained historical authorization before this operation can be
-connected without failing integrity acceptance. The completed-restore retry path must also
+transformation described below. AIDE now retains the corresponding authorization
+and verifies its historical database rows, but native qualification is still
+required. The completed-restore retry path must also
 preserve the new cutoff rather than recopying the old configuration. Those checks
 remain enforced; this work does not exempt the API environment from integrity
 monitoring or claim full appliance rollback acceptance.
@@ -177,8 +177,56 @@ maintenance. Creation, session work and deletion each occurred once despite
 lost creation/deletion acknowledgements. Native admission, command journaling
 and encrypted-storage checks remain injected as described above.
 
-This host check does not grant an AIDE exception. Historical authorization,
-completed-restore resume ordering and lifecycle invocation remain required.
+This host check alone does not grant an AIDE exception. The independent AIDE
+authorization below, completed-restore resume ordering and lifecycle invocation
+are required before full appliance acceptance.
+
+### Retained AIDE cutoff authorization
+
+AIDE accepts this transformation only during a host rollback. Under its existing
+locks, it invokes the fixed read-only restore verifier; callers cannot provide
+an arbitrary replacement file or exemption. The authorization binds the original
+preparation, plan digest, release stage, installation and completed session
+operation. It is retained in the scanning/ready journal and accepted chain
+entry. The immutable original plan and preparation remain unchanged.
+
+Snapshots require the exact final API bytes and original ACL/xattr/SELinux
+metadata. The update report may name only the already-authorized host resources
+plus this one API file. Retry must recover the same authorization, including
+after a lost database-replacement acknowledgement. Reverting the API, changing
+the completion evidence or attempting forward use cannot silently rebaseline it.
+
+Historical verification uses retained evidence and the actual authenticated
+input/output AIDE databases, without consulting mutable live session state.
+Their API rows must have full static attribute coverage, matching SHA-512 content
+and sizes, root/private permissions, and unchanged ACLs, labels and other xattrs.
+Only content, size, inode and timestamps may change. The bounded vendor-format
+parser consumes the entire database and rejects malformed or duplicate rows.
+Foreign preparations, forged content hashes and missing SELinux coverage are
+refused before the current database can be replaced.
+
+Validation ran **700 tests** on Rocky Python **3.14.8**: **699 passed**, and the
+read-only ACL ABI check skipped on the tmpfs scratch filesystem. Shared fixture
+helpers and a snapshot mock were corrected after the broader regression run
+exposed their interface assumptions. The nine new AIDE cases cover acceptance,
+historical replay, changed authorization, unrelated edits, metadata drift,
+interrupted scanning/CAS, and interrupted forward-to-rollback progression.
+
+An isolated Linux/amd64 image installed public, signature-checked Rocky packages
+`aide-0.19.2-5.el9_8.1` and `python3.14-3.14.8-1.el9_8`. **Eleven additional
+checks passed** using the actual AIDE scanner/parser and a Docker volume,
+including the previously skipped ACL ABI check. Docker does not provide SELinux
+coverage: the initial real-scanner attempt was correctly refused. Positive
+scanner cases explicitly inject that platform attribute contract, while a
+separate negative case verifies the unchanged production refusal. Restore
+admission, plan/storage identity and native platform acceptance remain fixtures.
+These results are not native FIPS/SELinux or full appliance acceptance.
+
+[`aide_identity_cutoff_native.py`](../../appliance/validation/aide_identity_cutoff_native.py)
+provides the corresponding guest runner without that SELinux injection. It
+requires the pinned vendor AIDE/Python versions, kernel FIPS flag and SELinux
+Enforcing before creating its private output directory. Its non-FIPS refusal
+was verified; positive native execution remains pending.
 
 ### Pre-restore cutoff capture
 

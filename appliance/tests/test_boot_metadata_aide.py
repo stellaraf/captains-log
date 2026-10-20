@@ -433,9 +433,10 @@ class MetadataAideTests(unittest.TestCase):
             if hashlib.sha256(raw).hexdigest() != checksum or json.loads(raw) != plan:
                 raise Refused('fixture host binding changed')
             return copy.deepcopy(plan), checksum
-        def snapshot(manager, actual_plan, phase, retained=None):
+        def snapshot(manager, actual_plan, phase, retained=None, *, cutoff=None):
             if actual_plan != plan:
-                return original_snapshot(manager, actual_plan, phase, retained)
+                return original_snapshot(manager, actual_plan, phase, retained, cutoff=cutoff)
+            self.assertIsNone(cutoff, "This boot fixture does not authorize API changes")
             expected = plan['files'][0]['after' if phase == 'forward' else 'before']['fixture_sha512']
             if self.current_rows['/etc/issue']['sha512'] != expected:
                 raise Refused('fixture host payload differs from exact direction')

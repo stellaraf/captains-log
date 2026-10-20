@@ -250,6 +250,7 @@ def verify_restore_api_preservation(life, stage, before, after):
         raise Refused("API preservation changed during verification")
     return {"schema": 1, "kind": "restored-api-cutoff-v1", "operation": operation,
             "installation_id": installation, "before": before, "after": after,
+            "before_sha512": hashlib.sha512(original).hexdigest(), "after_sha512": hashlib.sha512(current).hexdigest(),
             "configuration_sha256": configuration, "token_not_before": floor,
             "completion_sha256": _digest(complete_raw), "maintenance_release_authorized": False}
 

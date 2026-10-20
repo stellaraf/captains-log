@@ -23,11 +23,14 @@ class AuthorizedAideTests(unittest.TestCase):
     def setUp(self):
         lifecycle_fixture.AideLifecycleTests.setUp(self)
 
-    def authorized_fixture(self):
+    def authorized_fixture(self, *, api=False):
         self.runtime = self.root / "managed.conf"
         self.selection = self.root / "host-selection.json"
-        self.unrelated = self.root / "unrelated.conf"
-        for path, raw in ((self.runtime, b"old managed\n"), (self.selection, b"old selection\n"), (self.unrelated, b"preserved\n")):
+        self.unrelated = self.root / "configuration/runtime/api.env" if api else self.root / "unrelated.conf"
+        if api:
+            self.unrelated.parent.mkdir(parents=True, mode=0o700)
+        for path, raw in ((self.runtime, b"old managed\n"), (self.selection, b"old selection\n"),
+                          (self.unrelated, b"OIDC_CLIENT_ID=nebulalog\nOIDC_ISSUER=https://fixture.invalid/realms/nebulalog\n" if api else b"preserved\n")):
             self.write_private(path, raw)
         self.monitored = [self.runtime, self.selection, self.unrelated]
         # This macOS Python has no os xattr API. Inject empty Linux metadata
@@ -103,10 +106,12 @@ class AuthorizedAideTests(unittest.TestCase):
         self.scan_calls.append(action)
         current = self.snapshot_files()
         initializing = action == "init"
-        old = {} if initializing else json.loads(gzip.decompress(source.read_bytes()))
+        decode = getattr(self, "decode_snapshot", lambda raw: json.loads(gzip.decompress(raw)))
+        encode = getattr(self, "encode_snapshot", lambda value: gzip.compress(json.dumps(value, sort_keys=True).encode(), mtime=0))
+        old = {} if initializing else decode(source.read_bytes())
         if action in ("init", "update"):
             self.assertFalse(output.exists(), "scan must never overwrite retained output")
-            self.write_private(output, gzip.compress(json.dumps(current, sort_keys=True).encode(), mtime=0))
+            self.write_private(output, encode(current))
         added, removed = set(current) - set(old), set(old) - set(current)
         changed = {path for path in set(current) & set(old) if current[path] != old[path]}
         code = 0 if initializing else int(bool(added)) + 2 * int(bool(removed)) + 4 * int(bool(changed))
@@ -124,6 +129,12 @@ class AuthorizedAideTests(unittest.TestCase):
         if self.scan_hook:
             self.scan_hook(action, source, output)
         return aide.Result(code, json.dumps(report))
+
+    def encode_snapshot(self, value):
+        return gzip.compress(json.dumps(value, sort_keys=True).encode(), mtime=0)
+
+    def decode_snapshot(self, raw):
+        return json.loads(gzip.decompress(raw))
 
     def prepare_update(self):
         return updates.prepare(self.manager, self.stage, self.plan_path)

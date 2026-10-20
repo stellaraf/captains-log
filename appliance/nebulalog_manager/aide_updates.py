@@ -277,7 +277,119 @@ def _bound_plan(manager, stage, path, *, preparing):
     return plan, _sha(raw)
 
 
-def _snapshot(manager, plan, phase, retained=None, *, proof=None):
+def _cutoff_contract(value, plan, phase):
+    """Validate the retained, narrowly typed exception without live reads."""
+    if phase != "rollback" or plan.get("kind") is not None:
+        _refuse("cutoff_requires_host_rollback")
+    exact(value, {"schema", "installation_id", "stage", "plan_sha256", "prepared", "proof"})
+    if type(value["schema"]) is not int or value["schema"] != 1:
+        _refuse("cutoff_invalid_schema")
+    uuid_value(value["installation_id"])
+    digest_value(value["plan_sha256"])
+    exact(value["prepared"], {"id", "sha256"})
+    uuid_value(value["prepared"]["id"]); digest_value(value["prepared"]["sha256"])
+    stage = value["stage"]
+    if (not isinstance(stage, str) or not Path(stage).is_absolute()
+            or str(Path(os.path.normpath(stage))) != stage):
+        _refuse("cutoff_invalid_stage")
+    proof = value["proof"]
+    exact(proof, {"schema", "kind", "operation", "installation_id", "before", "after",
+                  "before_sha512", "after_sha512",
+                  "configuration_sha256", "token_not_before", "completion_sha256",
+                  "maintenance_release_authorized"})
+    if (type(proof["schema"]) is not int or proof["schema"] != 1
+            or proof["kind"] != "restored-api-cutoff-v1"
+            or proof["operation"] != _sha((stage + "/identity/rollback").encode())
+            or proof["installation_id"] != value["installation_id"]
+            or proof["maintenance_release_authorized"] is not False
+            or type(proof["token_not_before"]) is not int
+            or not 1577836800 <= proof["token_not_before"] < 2**31):
+        _refuse("cutoff_invalid_operation")
+    for key in ("configuration_sha256", "completion_sha256"):
+        digest_value(proof[key])
+    for key in ("before_sha512", "after_sha512"):
+        if not isinstance(proof[key], str) or not re.fullmatch(r"[a-f0-9]{128}", proof[key]):
+            _refuse("cutoff_invalid_content_digest")
+    path = str(CONFIGURATION / "runtime/api.env")
+    originals = [item for item in plan["preserved"] if item["path"] == path]
+    if len(originals) != 1 or proof["before"] != originals[0]:
+        _refuse("cutoff_original_plan_changed")
+    for key in ("before", "after"):
+        item = proof[key]
+        exact(item, {"path", "kind", "uid", "gid", "mode", "bytes", "sha256"})
+        _description({k: v for k, v in item.items() if k != "path"})
+        if item["path"] != path or item["uid"] != 0 or item["gid"] != 0 or item["mode"] != 0o600:
+            _refuse("cutoff_invalid_file")
+    if proof["before"] == proof["after"]:
+        _refuse("cutoff_requires_changed_file")
+    return proof
+
+
+def _cutoff_binding(value, plan, phase, prepared, identity):
+    proof = _cutoff_contract(value, plan, phase)
+    if (value["installation_id"] != identity.installation_id or value["stage"] != prepared["release"]
+            or value["plan_sha256"] != prepared["plan_sha256"] or value["prepared"] != _pointer(prepared)):
+        _refuse("cutoff_preparation_changed")
+    return proof
+
+
+def _cutoff_databases(manager, state, identity, entry):
+    """Bind historical authority to the actual retained input/output AIDE rows."""
+    from .ordinary_boot_metadata import parse_regular_file
+    proof = entry["api_cutoff"]["proof"]
+    rows = {}
+    for key, side, hash_key in (("input", "before", "previous_database_sha256"),
+                                ("output", "after", "database_sha256")):
+        raw, checksum = manager._database(state / "authorized/artifacts" / (entry[key] + ".db.gz"), identity)
+        if checksum != entry[hash_key]:
+            _refuse("cutoff_database_changed")
+        row = parse_regular_file(raw, expected_sha256=checksum, path=proof[side]["path"])
+        expected = proof[side]
+        if (row["uid"] != expected["uid"] or row["gid"] != expected["gid"]
+                or stat.S_IMODE(row["mode"]) != expected["mode"] or row["size"] != expected["bytes"]
+                or row["sha512"].hex() != proof[side + "_sha512"]):
+            _refuse("cutoff_database_content_changed")
+        rows[side] = row
+    # Only content, size and the inode/timestamps of the atomic replacement
+    # may differ. ACLs, labels, other xattrs, ownership and attribute coverage
+    # remain equal to the authenticated input database.
+    excluded = {"size", "sha512", "inode", "ctime", "mtime"}
+    if ({k: v for k, v in rows["before"].items() if k not in excluded}
+            != {k: v for k, v in rows["after"].items() if k not in excluded}):
+        _refuse("cutoff_database_metadata_changed")
+
+
+def _capture_cutoff(manager, identity, stage, plan, prepared, direction):
+    """Observe through the fixed restore verifier; never accept a supplied proof."""
+    if direction != "rollback" or plan.get("kind") is not None:
+        return None
+    path = str(CONFIGURATION / "runtime/api.env")
+    entries = [item for item in plan["preserved"] if item["path"] == path]
+    if not entries:
+        return None
+    if len(entries) != 1:
+        _refuse("cutoff_duplicate_path")
+    before = entries[0]
+    observed, _ = _measure(manager, before, preserved=True)
+    after = {"path": path, **observed}
+    if after == before:
+        return None
+    if not aide.present(Path(stage) / "adapter-database-restore-complete.json"):
+        _refuse("cutoff_restore_incomplete")
+    from nebulalog_adapters.lifecycle import Lifecycle
+    from nebulalog_adapters.identity_maintenance import verify_restore_api_preservation
+    def no_commands(*args, **kwargs):
+        _refuse("cutoff_verification_must_be_read_only")
+    life = Lifecycle({}, commands=no_commands, state=host_dispatch.STATE,
+                     data=identity.root, configuration=CONFIGURATION)
+    proof = verify_restore_api_preservation(life, Path(stage), before, after)
+    value = {"schema": 1, "installation_id": identity.installation_id, "stage": str(stage),
+             "plan_sha256": prepared["plan_sha256"], "prepared": _pointer(prepared), "proof": proof}
+    _cutoff_binding(value, plan, direction, prepared, identity)
+    return value
+
+
+def _snapshot(manager, plan, phase, retained=None, *, proof=None, cutoff=None):
     from . import boot_metadata_native, boot_metadata_proof
     if retained is not None:
         stored = retained.get(boot_metadata_proof.KEY)
@@ -285,14 +397,15 @@ def _snapshot(manager, plan, phase, retained=None, *, proof=None):
             _refuse('boot_metadata_preparation_changed')
         proof = stored
         retained = {key: value for key, value in retained.items() if key != boot_metadata_proof.KEY}
-    values = _plan_snapshot(manager, plan, phase, retained)
+    values = _plan_snapshot(manager, plan, phase, retained, cutoff=cutoff)
     if proof is not None:
         boot_metadata_proof.recheck(proof, plan, phase, boot_metadata_native.capture())
         values = {**values, boot_metadata_proof.KEY: proof}
     return values
 
 
-def _plan_snapshot(manager, plan, phase, retained=None):
+def _plan_snapshot(manager, plan, phase, retained=None, *, cutoff=None):
+    cutoff_proof = _cutoff_contract(cutoff, plan, phase) if cutoff is not None else None
     if plan.get('kind') == 'rocky-kernel-rollback-v1':
         from . import kernel_rollback
         return kernel_rollback.integrity_snapshot(manager, plan, phase, retained)
@@ -318,6 +431,8 @@ def _plan_snapshot(manager, plan, phase, retained=None):
     selection_phase = {"prepare": "before", "forward": "after", "rollback": "restored"}[phase]
     items += [{"path": plan["selection"]["path"], **plan["selection"][selection_phase]}]
     items += plan["generation_additions"] + plan.get("content_additions", []) + plan["preserved"]
+    if cutoff_proof is not None:
+        items = [cutoff_proof["after"] if item["path"] == cutoff_proof["before"]["path"] else item for item in items]
     values = {}
     preserved_paths = {item["path"] for item in plan["preserved"]}
     content_paths = {item["path"] for item in plan.get("content_additions", [])}
@@ -349,7 +464,8 @@ def _parse_update(result, database_in, database_out):
     return report, measured
 
 
-def _allowed_report(report, plan, phase, metadata=None):
+def _allowed_report(report, plan, phase, metadata=None, *, cutoff=None):
+    cutoff_proof = _cutoff_contract(cutoff, plan, phase) if cutoff is not None else None
     from . import boot_metadata_proof
     report = boot_metadata_proof.filter_report(report, metadata)
     if plan.get('kind') == 'rocky-kernel-rollback-v1':
@@ -375,6 +491,8 @@ def _allowed_report(report, plan, phase, metadata=None):
         return os_payload.allowed_integrity_report(report, plan, phase)
     additions = {item["path"] for item in plan["generation_additions"] + plan.get("content_additions", [])}
     changes = set() if phase == "prepare" else {item["path"] for item in plan["files"]} | {plan["selection"]["path"]}
+    if cutoff_proof is not None:
+        changes.add(cutoff_proof["before"]["path"])
     if set(report.get("added", {})) - additions or report.get("removed") or set(report.get("changed", {})) - changes:
         _refuse("unrelated_integrity_change")
 
@@ -451,7 +569,8 @@ def _chain(manager, state, identity, base, *, head_override=_UNSET, proposed=Non
                 _refuse("retained_evidence_changed")
         else:
             entry = manager.records.read(entry_path, identity)
-        exact(entry, {"schema", "id", "installation_id", "original_enrollment_sha256", "previous", "previous_database_sha256", "database_sha256", "input", "output", "update_report", "check_report", "prepared", "direction", "plan_sha256", "accepted_at"})
+        exact(entry, {"schema", "id", "installation_id", "original_enrollment_sha256", "previous", "previous_database_sha256", "database_sha256", "input", "output", "update_report", "check_report", "prepared", "direction", "plan_sha256", "accepted_at"}
+              | ({"api_cutoff"} if "api_cutoff" in entry else set()))
         if (type(entry["schema"]) is not int or entry["schema"] != 1 or entry["id"] != token or digest(entry) != expected
                 or entry["installation_id"] != identity.installation_id or entry["original_enrollment_sha256"] != digest(base)
                 or entry["direction"] not in {"forward", "rollback"} or next_db is not None and entry["database_sha256"] != next_db):
@@ -464,6 +583,9 @@ def _chain(manager, state, identity, base, *, head_override=_UNSET, proposed=Non
         if (prepared["plan_sha256"] != entry["plan_sha256"] or prepared["original_enrollment_sha256"] != digest(base)
                 or entry["prepared"] != _pointer(prepared)):
             _refuse("prepared_plan_changed")
+        if "api_cutoff" in entry:
+            _cutoff_binding(entry["api_cutoff"], prepared["plan"], entry["direction"], prepared, identity)
+            _cutoff_databases(manager, state, identity, entry)
         preparation_report = _read_bound(manager, state / "reports", prepared["report"], identity)
         parse_report(preparation_report["stdout"], preparation_report["stderr"], preparation_report["exit_code"], "check", str(state / "aide.db.gz"))
         _allowed_report(strict_json(preparation_report["stdout"]), prepared["plan"], "prepare", prepared['metadata'])
@@ -473,7 +595,7 @@ def _chain(manager, state, identity, base, *, head_override=_UNSET, proposed=Non
         update = _read_bound(manager, state / "reports", entry["update_report"], identity)
         checked = _read_bound(manager, state / "reports", entry["check_report"], identity)
         raw, _ = _parse_update(aide.Result(update["exit_code"], update["stdout"], update["stderr"]), root / "artifacts" / (entry["input"] + ".db.gz"), root / "artifacts" / (entry["output"] + ".db.gz"))
-        _allowed_report(raw, prepared["plan"], entry["direction"], prepared['metadata'])
+        _allowed_report(raw, prepared["plan"], entry["direction"], prepared['metadata'], cutoff=entry.get("api_cutoff"))
         measured = parse_report(checked["stdout"], checked["stderr"], checked["exit_code"], "check", str(root / "artifacts" / (entry["output"] + ".db.gz")))
         if (measured["state"] != "clean" or checked["database_sha256"] != entry["database_sha256"]
                 or checked["facts_sha256"] != digest(base["facts"]) or update["facts_sha256"] != digest(base["facts"])
@@ -519,7 +641,10 @@ def _pending(manager, state, identity):
         digest_value(value["database_sha256"])
     elif phase in {"scanning", "ready"}:
         fields = {"schema", "state", "id", "prepared", "direction", "previous", "previous_database_sha256"}
-        exact(value, fields | ({"entry", "proposed_entry", "database_sha256"} if phase == "ready" else set()))
+        exact(value, fields | ({"entry", "proposed_entry", "database_sha256"} if phase == "ready" else set())
+              | ({"api_cutoff"} if "api_cutoff" in value else set()))
+        if "api_cutoff" in value and (value["direction"] != "rollback" or not isinstance(value["api_cutoff"], dict)):
+            _refuse("invalid_pending_cutoff")
         uuid_value(value["id"])
         digest_value(value["previous_database_sha256"])
         if value["direction"] not in {"forward", "rollback"}:
@@ -1137,10 +1262,14 @@ def accept(manager, stage, plan_path, *, direction="forward"):
         if prepared is None or prepared["original_enrollment_sha256"] != digest(base):
             _refuse("preparation_required")
         metadata = prepared["metadata"]
-        _snapshot(manager, plan, direction, metadata)
+        cutoff = _capture_cutoff(manager, identity, stage, plan, prepared, direction)
+        _snapshot(manager, plan, direction, metadata, cutoff=cutoff)
         root = state / "authorized"
         pending_path = root / "pending.json"
         pending = _pending(manager, state, identity)
+        if (pending is not None and pending["state"] in {"scanning", "ready"}
+                and pending["direction"] == direction and pending.get("api_cutoff") != cutoff):
+            _refuse("pending_cutoff_changed")
         # A ready journal may have atomically replaced the DB but not its head.
         # Resolve this exact retained entry first, never adopt an arbitrary DB.
         if pending is not None and pending.get("state") == "ready":
@@ -1168,10 +1297,12 @@ def accept(manager, stage, plan_path, *, direction="forward"):
         # Idempotent repeats perform a fresh check; they never rewrite a baseline
         # or absorb new inode/ctime drift after its completed acceptance.
         if latest is not None and latest["prepared"] == _pointer(prepared) and latest["direction"] == direction:
+            if latest.get("api_cutoff") != cutoff:
+                _refuse("accepted_cutoff_changed")
             token = str(uuid.uuid4())
             config = _config(manager, state, identity, policy, token, state / "aide.db.gz", root / "artifacts" / (token + ".unused.db.gz"))
             report, _ = _scan(manager, state, identity, config, "check", base["facts"], state / "aide.db.gz")
-            if report["state"] != "clean" or _snapshot(manager, plan, direction, metadata) != metadata or manager._monitor(identity, state, base) != policy:
+            if report["state"] != "clean" or _snapshot(manager, plan, direction, metadata, cutoff=cutoff) != metadata or manager._monitor(identity, state, base) != policy:
                 _refuse("accepted_baseline_no_longer_clean")
             if manager._database(state / "aide.db.gz", identity)[1] != database_sha:
                 _refuse("current_database_changed")
@@ -1181,24 +1312,28 @@ def accept(manager, stage, plan_path, *, direction="forward"):
         token, input_token, output_token = (str(uuid.uuid4()) for _ in range(3))
         pending = {"schema": 1, "state": "scanning", "id": token, "prepared": _pointer(prepared), "direction": direction,
                    "previous": head, "previous_database_sha256": database_sha}
+        if cutoff is not None:
+            pending["api_cutoff"] = cutoff
         manager.records.write(pending_path, pending, identity)
         input_path, output_path = (root / "artifacts" / (item + ".db.gz") for item in (input_token, output_token))
         manager._write_bytes(input_path, manager._database(state / "aide.db.gz", identity)[0], identity)
         config = _config(manager, state, identity, policy, token, input_path, output_path)
         report, raw = _scan(manager, state, identity, config, "update", base["facts"], input_path, output_path)
-        _allowed_report(raw, plan, direction, metadata)
+        _allowed_report(raw, plan, direction, metadata, cutoff=cutoff)
         _, output_sha = manager._database(output_path, identity)
-        if manager._database(input_path, identity)[1] != database_sha or _snapshot(manager, plan, direction, metadata) != metadata:
+        if manager._database(input_path, identity)[1] != database_sha or _snapshot(manager, plan, direction, metadata, cutoff=cutoff) != metadata:
             _refuse("scan_context_changed")
         check_config = _config(manager, state, identity, policy, str(uuid.uuid4()), output_path, root / "artifacts" / (token + ".unused.db.gz"))
         checked, _ = _scan(manager, state, identity, check_config, "check", base["facts"], output_path)
         if (checked["state"] != "clean" or manager._database(output_path, identity)[1] != output_sha
-                or _snapshot(manager, plan, direction, metadata) != metadata or manager._monitor(identity, state, base) != policy):
+                or _snapshot(manager, plan, direction, metadata, cutoff=cutoff) != metadata or manager._monitor(identity, state, base) != policy):
             _refuse("new_baseline_not_clean")
         entry = {"schema": 1, "id": token, "installation_id": identity.installation_id, "original_enrollment_sha256": digest(base),
                  "previous": head, "previous_database_sha256": database_sha, "database_sha256": output_sha,
                  "input": input_token, "output": output_token, "update_report": _pointer(report), "check_report": _pointer(checked),
                  "prepared": _pointer(prepared), "direction": direction, "plan_sha256": plan_sha, "accepted_at": manager.clock()}
+        if cutoff is not None:
+            entry["api_cutoff"] = cutoff
         # Journal owns the full proposed entry before an immutable entry appears,
         # so an interruption at the first head write has unambiguous recovery.
         pending.update(state="ready", entry=_pointer(entry), proposed_entry=entry, database_sha256=output_sha)
@@ -1212,7 +1347,8 @@ def _complete(manager, state, identity, base, pending, plan, metadata, policy):
     entry = pending["proposed_entry"]
     if (_pointer(entry) != pending["entry"] or entry["id"] != pending["id"] or entry["prepared"] != pending["prepared"]
             or entry["previous"] != pending["previous"] or entry["direction"] != pending["direction"]
-            or entry["database_sha256"] != pending["database_sha256"] or entry["previous_database_sha256"] != pending["previous_database_sha256"]):
+            or entry["database_sha256"] != pending["database_sha256"] or entry["previous_database_sha256"] != pending["previous_database_sha256"]
+            or entry.get("api_cutoff") != pending.get("api_cutoff")):
         _refuse("pending_entry_changed")
     head_path = root / "head.json"
     current_head = manager.records.read(head_path, identity) if aide.present(head_path) else None
@@ -1230,18 +1366,19 @@ def _complete(manager, state, identity, base, pending, plan, metadata, policy):
         _refuse("pending_database_changed")
     report = _read_bound(manager, state / "reports", entry["update_report"], identity)
     raw, _ = _parse_update(aide.Result(report["exit_code"], report["stdout"], report["stderr"]), input_path, output_path)
-    _allowed_report(raw, plan, entry["direction"], metadata)
+    cutoff = entry.get("api_cutoff")
+    _allowed_report(raw, plan, entry["direction"], metadata, cutoff=cutoff)
     config = _config(manager, state, identity, policy, str(uuid.uuid4()), output_path, root / "artifacts" / (str(uuid.uuid4()) + ".unused.db.gz"))
     checked, _ = _scan(manager, state, identity, config, "check", base["facts"], output_path)
     if (checked["state"] != "clean" or manager._database(output_path, identity)[1] != output_sha
-            or _snapshot(manager, plan, entry["direction"], metadata) != metadata or manager._monitor(identity, state, base) != policy):
+            or _snapshot(manager, plan, entry["direction"], metadata, cutoff=cutoff) != metadata or manager._monitor(identity, state, base) != policy):
         _refuse("recovery_baseline_not_clean")
     current_sha = manager._database(state / "aide.db.gz", identity)[1]
     if current_sha not in (entry["previous_database_sha256"], output_sha):
         _refuse("current_database_cas_failed")
     if current_sha != output_sha:
         _replace_current(manager, state, identity, entry["previous_database_sha256"], output_data)
-    if (_snapshot(manager, plan, entry['direction'], metadata) != metadata
+    if (_snapshot(manager, plan, entry['direction'], metadata, cutoff=cutoff) != metadata
             or manager._database(state / 'aide.db.gz', identity)[1] != output_sha
             or manager._monitor(identity, state, base) != policy):
         _refuse('publication_context_changed')
@@ -1250,7 +1387,7 @@ def _complete(manager, state, identity, base, pending, plan, metadata, policy):
     # _chain fully validates the just-installed link and its entire ancestry.
     if _chain(manager, state, identity, base)[:2] != (pending["entry"], output_sha):
         _refuse("accepted_chain_changed")
-    if (_snapshot(manager, plan, entry['direction'], metadata) != metadata
+    if (_snapshot(manager, plan, entry['direction'], metadata, cutoff=cutoff) != metadata
             or manager._database(state / 'aide.db.gz', identity)[1] != output_sha
             or manager._monitor(identity, state, base) != policy):
         _refuse('completion_context_changed')
