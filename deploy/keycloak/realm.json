@@ -43,6 +43,14 @@
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": false,
+      "fullScopeAllowed": false,
+      "defaultClientScopes": [
+        "basic",
+        "profile",
+        "email",
+        "acr"
+      ],
+      "optionalClientScopes": [],
       "redirectUris": [
         "http://127.0.0.1:18080/*",
         "http://localhost:18080/*"
@@ -65,10 +73,79 @@
             "id.token.claim": "false",
             "access.token.claim": "true"
           }
+        },
+        {
+          "name": "captains-log-administrator-projection",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-role-name-mapper",
+          "config": {
+            "role": "nebulalog.ADMINISTRATOR",
+            "new.role.name": "captains-log-token-roles.ADMINISTRATOR"
+          }
+        },
+        {
+          "name": "captains-log-analyst-projection",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-role-name-mapper",
+          "config": {
+            "role": "nebulalog.ANALYST",
+            "new.role.name": "captains-log-token-roles.ANALYST"
+          }
+        },
+        {
+          "name": "captains-log-viewer-projection",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-role-name-mapper",
+          "config": {
+            "role": "nebulalog.VIEWER",
+            "new.role.name": "captains-log-token-roles.VIEWER"
+          }
+        },
+        {
+          "name": "captains-log-application-roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-client-role-mapper",
+          "config": {
+            "usermodel.clientRoleMapping.clientId": "captains-log-token-roles",
+            "claim.name": "resource_access.nebulalog.roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "userinfo.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
         }
       ]
+    },
+    {
+      "clientId": "captains-log-token-roles",
+      "name": "Captain’s Log token role projection",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "bearerOnly": true,
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "fullScopeAllowed": false,
+      "defaultClientScopes": [],
+      "optionalClientScopes": []
     }
   ],
+  "clientScopeMappings": {
+    "nebulalog": [
+      {
+        "client": "nebulalog",
+        "roles": [
+          "ADMINISTRATOR",
+          "ANALYST",
+          "VIEWER"
+        ]
+      }
+    ]
+  },
   "authenticationFlows": [
     {
       "alias": "nebulalog-browser",

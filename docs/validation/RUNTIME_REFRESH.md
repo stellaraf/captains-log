@@ -306,8 +306,9 @@ At this checkpoint the retained production Keycloak 26.7.3 image predated the
 theme change. A subsequent 26.8.1 candidate is recorded below. Keycloak also reports
 that the client's full-scope setting is deprecated. Subsequent
 [service-account scope qualification](IDENTITY_SERVICE_SCOPES.md) replaces
-broad service token scopes; browser-client scope review and migration of
-already-initialized appliances remain open.
+broad service token scopes. [Browser-role projection](BROWSER_ROLE_SCOPES.md)
+restricts new-realm application tokens to the supported roles; migration of
+already-initialized realms remains open.
 
 Both fixture attempts removed their owned containers, volumes, newly pulled
 images and private credentials. The live development deployment was unchanged.

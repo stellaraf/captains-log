@@ -64,6 +64,24 @@ class RuntimeBoundaryTests(unittest.TestCase):
         self.assertIn("pbkdf2-sha512", realm["passwordPolicy"])
         client = next(client for client in realm["clients"] if client["clientId"] == "nebulalog")
         self.assertFalse(client["directAccessGrantsEnabled"])
+        self.assertFalse(client["fullScopeAllowed"])
+        self.assertEqual(set(client["defaultClientScopes"]), {"basic", "profile", "email", "acr"})
+        self.assertEqual(client["optionalClientScopes"], [])
+        self.assertEqual(realm["clientScopeMappings"], {
+            "nebulalog": [{"client": "nebulalog", "roles": ["ADMINISTRATOR", "ANALYST", "VIEWER"]}]})
+        projections = [m["config"] for m in client["protocolMappers"] if m["protocolMapper"] == "oidc-role-name-mapper"]
+        self.assertEqual(projections, [
+            {"role": "nebulalog." + role, "new.role.name": "captains-log-token-roles." + role}
+            for role in ("ADMINISTRATOR", "ANALYST", "VIEWER")])
+        role_mapper = next(m for m in client["protocolMappers"] if m["protocolMapper"] == "oidc-usermodel-client-role-mapper")
+        self.assertEqual(role_mapper["config"]["usermodel.clientRoleMapping.clientId"], "captains-log-token-roles")
+        self.assertEqual(role_mapper["config"]["claim.name"], "resource_access.nebulalog.roles")
+        projection = next(c for c in realm["clients"] if c["clientId"] == "captains-log-token-roles")
+        self.assertTrue(projection["enabled"])
+        self.assertTrue(projection["bearerOnly"])
+        for grant in ("standardFlowEnabled", "implicitFlowEnabled", "directAccessGrantsEnabled", "serviceAccountsEnabled"):
+            self.assertFalse(projection[grant])
+        self.assertNotIn("redirectUris", projection)
         self.assertEqual(client["redirectUris"], ["https://logs.example.test/*"])
         self.assertEqual(client["attributes"]["pkce.code.challenge.method"], "S256")
         forms = next(flow for flow in realm["authenticationFlows"] if flow["alias"] == "nebulalog-forms")

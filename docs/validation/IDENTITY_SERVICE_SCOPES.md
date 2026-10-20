@@ -81,7 +81,9 @@ is **not an automatic migration of existing appliance realms**.
 Disabling a client prevents new token issuance; it does not establish revocation
 of already-issued access tokens. Existing-appliance migration must account for
 their validity period and verify revocation/expiry behavior before acceptance.
-The browser client's role scopes remain a separate review item.
+New-realm browser scopes are covered by the separate
+[browser-role qualification](BROWSER_ROLE_SCOPES.md). Existing-realm migration
+remains open.
 
 These tests use disposable development-mode storage and loopback HTTP. They do
 not qualify native FIPS/TLS operation, real Okta/Entra/AD sign-in, existing
