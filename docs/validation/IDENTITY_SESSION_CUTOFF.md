@@ -308,3 +308,35 @@ Automatic transaction integration, production temporary-authority admission,
 full lifecycle rollback, native TLS/FIPS execution and full appliance acceptance
 remain open. The isolated controller and SQL/configuration rollback fixtures do
 not release those production gates.
+
+## API security metadata during cutoff replacement
+
+The completed-database rollback coordinator now invokes the composed identity
+workflow; its integration evidence and remaining limits are recorded in
+[IDENTITY_NATIVE_BACKEND](IDENTITY_NATIVE_BACKEND.md). Forward activation and
+native appliance acceptance remain open.
+
+API cutoff replacement previously created a new 0600 file without copying the
+original ACLs or extended attributes. That could discard customer metadata or
+a SELinux label even when all unrelated configuration bytes were preserved,
+and contradict the recovery integrity proof.
+
+The replacement now retains the original owner/group and exact extended
+attribute values, including Linux POSIX ACLs and SELinux labels. It verifies
+the temporary file before rename and checks that the original inode and
+metadata have not changed during preparation. A denied, unsupported or
+unacknowledged metadata operation fails before replacement, leaving the
+session journal at the recoverable realm phase. The private temporary file is
+removed on failure. New temporary-authority credential files continue to use
+the separate default 0600 creation behavior.
+
+Validation passed **724 regression tests without skips** on public Rocky
+Python **3.14.8**, Linux/amd64, using a disposable Docker volume with POSIX ACL
+support. The six added cases exercise an actual named-user ACL, binary xattrs,
+group ownership, retry, denied writes, ignored writes, unavailable metadata
+and a concurrent metadata change. All six fail against the preceding
+implementation (four assertion failures and two missing-attribute errors).
+Both isolated test containers and volumes were removed after terminal results.
+
+Linux ACL/xattr tests are not evidence of native SELinux policy permission,
+FIPS acceptance, or a complete appliance restore. Those gates remain open.

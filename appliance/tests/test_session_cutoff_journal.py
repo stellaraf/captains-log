@@ -75,8 +75,8 @@ class SessionCutoffJournalTests(unittest.TestCase):
 
     def test_lost_api_write_response_reconciles_without_changing_other_values(self):
         actual = sessions._atomic_private_bytes
-        def lost(path, body):
-            actual(path, body)
+        def lost(path, body, **kwargs):
+            actual(path, body, **kwargs)
             raise OSError('Lost API write acknowledgement')
         with patch.object(sessions, '_atomic_private_bytes', lost), self.assertRaises(OSError):
             self.reconcile()
@@ -84,6 +84,78 @@ class SessionCutoffJournalTests(unittest.TestCase):
         self.initialize = False
         self.assertEqual(self.reconcile()['token_not_before'], self.cutoff + 10)
         self.assertEqual(self.api.read_bytes().count(b'OIDC_TOKEN_NOT_BEFORE='), 1)
+
+    def test_replacement_and_retry_preserve_extended_attributes_and_group(self):
+        os.setxattr(self.api, 'user.captainslog-test', b'customer metadata\0binary')
+        os.chown(self.api, 0, 12345)
+        original_inode = self.api.stat().st_ino
+        self.reconcile()
+        self.assertNotEqual(self.api.stat().st_ino, original_inode)
+        self.reconcile()
+        self.assertEqual(os.getxattr(self.api, 'user.captainslog-test'), b'customer metadata\0binary')
+        self.assertEqual(self.api.stat().st_gid, 12345)
+        self.assertEqual(self.api.stat().st_mode & 0o777, 0o600)
+
+    def test_posix_acl_survives_atomic_replacement(self):
+        import errno
+        import struct
+        # Linux POSIX ACL v2: named user permissions remain masked off by 0600.
+        # Retain the actual ACL, not merely the equivalent permission bits.
+        entries = [(1, 6, 0xffffffff), (2, 4, 12345), (4, 0, 0xffffffff),
+                   (16, 0, 0xffffffff), (32, 0, 0xffffffff)]
+        acl = struct.pack('<I', 2) + b''.join(struct.pack('<HHI', *e) for e in entries)
+        try:
+            os.setxattr(self.api, 'system.posix_acl_access', acl)
+        except OSError as error:
+            if error.errno in {errno.ENOSYS, errno.ENOTSUP}:
+                self.skipTest('fixture filesystem lacks POSIX ACL support')
+            raise
+        self.assertEqual(self.api.stat().st_mode & 0o777, 0o600)
+        self.reconcile()
+        self.assertEqual(os.getxattr(self.api, 'system.posix_acl_access'), acl)
+        self.assertEqual(self.api.stat().st_mode & 0o777, 0o600)
+
+    def test_metadata_copy_failure_keeps_original_and_recoverable_journal(self):
+        os.setxattr(self.api, 'user.captainslog-test', b'retain')
+        inode = self.api.stat().st_ino
+        with patch('os.setxattr', side_effect=PermissionError('metadata write denied')):
+            with self.assertRaises(PermissionError):
+                self.reconcile()
+        self.assertEqual(self.api.read_bytes(), self.original)
+        self.assertEqual(self.api.stat().st_ino, inode)
+        self.assertEqual(os.getxattr(self.api, 'user.captainslog-test'), b'retain')
+        self.assertEqual(json.loads(self.journal.path.read_text())['phase'], 'realm')
+        self.assertEqual(list(self.config.glob('.session-cutoff-*')), [])
+        self.initialize = False
+        self.reconcile()
+        self.assertEqual(os.getxattr(self.api, 'user.captainslog-test'), b'retain')
+
+    def test_unacknowledged_metadata_copy_never_replaces_original(self):
+        os.setxattr(self.api, 'user.captainslog-test', b'retain')
+        with patch('os.setxattr', return_value=None):
+            with self.assertRaisesRegex(Refused, 'metadata did not persist'):
+                self.reconcile()
+        self.assertEqual(self.api.read_bytes(), self.original)
+        self.assertEqual(json.loads(self.journal.path.read_text())['phase'], 'realm')
+
+    def test_concurrent_metadata_change_is_not_overwritten(self):
+        os.setxattr(self.api, 'user.captainslog-test', b'before')
+        original_set = os.setxattr
+        def changed(fd, key, value):
+            original_set(fd, key, value)
+            original_set(self.api, key, b'changed')
+        with patch('os.setxattr', changed):
+            with self.assertRaisesRegex(Refused, 'changed during'):
+                self.reconcile()
+        self.assertEqual(self.api.read_bytes(), self.original)
+        self.assertEqual(os.getxattr(self.api, 'user.captainslog-test'), b'changed')
+
+    def test_metadata_enumeration_failure_does_not_replace_original(self):
+        with patch('os.listxattr', side_effect=OSError('metadata unavailable')):
+            with self.assertRaises(OSError):
+                self.reconcile()
+        self.assertEqual(self.api.read_bytes(), self.original)
+        self.assertEqual(list(self.config.glob('.session-cutoff-*')), [])
 
     def test_durable_intent_write_failure_prevents_rest_mutation(self):
         with patch('nebulalog_manager.common.atomic_json', side_effect=OSError('disk full')), self.assertRaises(OSError):

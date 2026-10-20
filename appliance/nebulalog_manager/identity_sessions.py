@@ -305,7 +305,7 @@ class SessionCutoffJournal:
             held()
             if self._read(api) != raw:
                 raise Refused("API configuration changed during session maintenance")
-            _atomic_private_bytes(api, expected)
+            _atomic_private_bytes(api, expected, preserve_metadata=True)
             if self._read(api) != expected:
                 raise Refused("API cutoff durable readback failed")
             persist("api")
@@ -315,16 +315,61 @@ class SessionCutoffJournal:
                     "maintenance_release_authorized": False, "fresh_login_required": True}
 
 
-def _atomic_private_bytes(path, body):
+def _atomic_private_bytes(path, body, *, preserve_metadata=False):
+    """Replace private bytes, retaining API security metadata when requested.
+
+    ACLs and SELinux labels are extended attributes on the supported Linux
+    appliance. Copy and verify them before rename; an unsupported attribute or
+    denied write must leave the old API file intact and maintenance held.
+    Fresh temporary-authority credentials use the private-file default.
+    """
     import os
+    import stat
     import tempfile
-    fd, name = tempfile.mkstemp(prefix=".session-cutoff-", dir=path.parent)
+    source, name = None, None
+
+    def metadata(fd):
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+            raise Refused("API replacement requires a private root-owned regular file")
+        attrs = {key: os.getxattr(fd, key) for key in os.listxattr(fd)}
+        return info, attrs
+
+    def identity(info):
+        return (info.st_dev, info.st_ino, info.st_uid, info.st_gid,
+                info.st_mode, info.st_nlink, info.st_size,
+                info.st_mtime_ns, info.st_ctime_ns)
+
     try:
+        if preserve_metadata:
+            source = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            before, attributes = metadata(source)
+            if identity(os.fstat(source)) != identity(before):
+                raise Refused("API security metadata changed during capture")
+        fd, name = tempfile.mkstemp(prefix=".session-cutoff-", dir=path.parent)
         with os.fdopen(fd, "wb") as stream:
             os.fchmod(stream.fileno(), 0o600)
             stream.write(body)
             stream.flush()
+            if preserve_metadata:
+                target = stream.fileno()
+                current = os.fstat(target)
+                if (current.st_uid, current.st_gid) != (before.st_uid, before.st_gid):
+                    os.fchown(target, before.st_uid, before.st_gid)
+                for key in set(os.listxattr(target)) - attributes.keys():
+                    os.removexattr(target, key)
+                for key, value in attributes.items():
+                    os.setxattr(target, key, value)
+                copied, copied_attributes = metadata(target)
+                if (copied.st_gid != before.st_gid or copied_attributes != attributes):
+                    raise Refused("API replacement security metadata did not persist")
             os.fsync(stream.fileno())
+        if preserve_metadata:
+            current, current_attributes = metadata(source)
+            if (identity(current) != identity(before) or current_attributes != attributes
+                    or identity(path.lstat()) != identity(before)):
+                raise Refused("API file changed during metadata-preserving replacement")
         os.replace(name, path)
         directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
@@ -332,7 +377,9 @@ def _atomic_private_bytes(path, body):
         finally:
             os.close(directory)
     finally:
-        if os.path.lexists(name):
+        if source is not None:
+            os.close(source)
+        if name is not None and os.path.lexists(name):
             os.unlink(name)
 
 
