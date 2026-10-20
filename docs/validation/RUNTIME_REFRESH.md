@@ -49,6 +49,31 @@ factory binding and service/image/database startup boundaries. It does not
 perform database restore, final enrollment, full activation, or native FIPS
 qualification. Go integration skips are not passing integration evidence.
 
+## Subsequent database authentication qualification
+
+The complete `internal/auth` package subsequently passed with the PostgreSQL
+integration opt-in enabled: **55 top-level tests, 491 passes including subtests,
+zero failures and zero skips**. The client used Go 1.27.2 on macOS/arm64; the
+isolated server used the pinned official PostgreSQL 17.11 Linux/amd64 image.
+This is application/database integration evidence, not an ARM appliance build
+or native Rocky/FIPS qualification.
+
+The previously skipped `TestPostgresStepUpAtomicIntegration` and
+`TestStepUpTLSPostgresIntegration` both executed. Coverage includes exact
+transaction binding, replay refusal, 24 concurrent consumers with one success,
+database constraints, bounded retention, and the actual TLS/PAR/token/JWKS
+client flow against a synthetic HTTPS issuer. It does not prove a real
+Keycloak, Okta, or Entra login.
+
+The fixture now pins PostgreSQL 17.11 instead of the stale 17.6 guard. In
+addition to the existing bind-mount fixture, it accepts an explicitly selected,
+uniquely named and labelled local Docker volume. Container/image identity,
+loopback port, resource limits, mount identity, volume ownership labels and
+database system identity remain mandatory. This accommodates Docker Desktop
+bind-mount ownership behavior without relaxing production database checks.
+Both temporary schemas were removed; the container, volume, private fixture
+credentials and build caches were independently confirmed absent afterward.
+
 ## Remaining acceptance
 
 Existing-appliance interpreter installation and fixed-host migration,

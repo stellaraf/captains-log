@@ -32,6 +32,7 @@ type stepUpPGFixtureTarget struct {
 	ContainerID string `json:"container_id"`
 	ImageID     string `json:"image_id"`
 	DataPath    string `json:"data_path"`
+	VolumeName  string `json:"volume_name,omitempty"`
 	Port        uint16 `json:"port"`
 	Password    string `json:"password"`
 	SystemID    string `json:"system_id"`
@@ -75,7 +76,16 @@ func readStepUpPGFixtureTarget(path string) (stepUpPGFixtureTarget, error) {
 		!regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(target.ContainerID) ||
 		!regexp.MustCompile(`^sha256:[a-f0-9]{64}$`).MatchString(target.ImageID) ||
 		!regexp.MustCompile(`^[0-9]{1,20}$`).MatchString(target.SystemID) ||
-		!filepath.IsAbs(target.DataPath) || target.Port == 0 || target.Port == 25432 || len(target.Password) == 0 || len(target.Password) > 1024 {
+		target.Port == 0 || target.Port == 25432 || len(target.Password) == 0 || len(target.Password) > 1024 {
+		return stepUpPGFixtureTarget{}, bad
+	}
+	if target.VolumeName != "" {
+		if target.DataPath != "" || !regexp.MustCompile(`^captainslog-stepup-[a-f0-9]{32}$`).MatchString(target.VolumeName) {
+			return stepUpPGFixtureTarget{}, bad
+		}
+		return target, nil
+	}
+	if !filepath.IsAbs(target.DataPath) {
 		return stepUpPGFixtureTarget{}, bad
 	}
 	resolved, err = filepath.EvalSymlinks(target.DataPath)
@@ -101,8 +111,8 @@ func pinnedStepUpPGFixture(t *testing.T, path string) (*pgxpool.Config, string) 
 		Running          bool
 		Memory, CPU      int64
 		Mounts           []struct {
-			Type, Source, Destination string
-			RW                        bool
+			Type, Name, Source, Destination string
+			RW                              bool
 		}
 		Ports map[string][]struct {
 			HostIP   string `json:"HostIp"`
@@ -112,9 +122,32 @@ func pinnedStepUpPGFixture(t *testing.T, path string) (*pgxpool.Config, string) 
 	if err != nil || len(raw) > 16384 || json.Unmarshal(raw, &observed) != nil ||
 		observed.ID != target.ContainerID || observed.Image != target.ImageID || !observed.Running ||
 		observed.Label != "emergency-destructive" || observed.Memory <= 0 || observed.Memory > 384<<20 || observed.CPU <= 0 || observed.CPU > 1e9 ||
-		len(observed.Mounts) != 1 || observed.Mounts[0].Type != "bind" || observed.Mounts[0].Source != target.DataPath || observed.Mounts[0].Destination != "/var/lib/postgresql/data" || !observed.Mounts[0].RW ||
+		len(observed.Mounts) != 1 || observed.Mounts[0].Destination != "/var/lib/postgresql/data" || !observed.Mounts[0].RW ||
 		len(observed.Ports) != 1 || len(observed.Ports["5432/tcp"]) != 1 || observed.Ports["5432/tcp"][0].HostIP != "127.0.0.1" || observed.Ports["5432/tcp"][0].HostPort != strconv.Itoa(int(target.Port)) {
 		t.Fatal("existing PostgreSQL fixture identity differs from its protected target")
+	}
+	mount := observed.Mounts[0]
+	if target.VolumeName == "" {
+		if mount.Type != "bind" || mount.Source != target.DataPath {
+			t.Fatal("PostgreSQL fixture bind mount differs from its protected target")
+		}
+	} else {
+		// Docker Desktop bind mounts do not reliably preserve database UID
+		// ownership. Admit only a uniquely named, explicitly labelled local
+		// fixture volume, never an arbitrary existing database volume.
+		var volume struct {
+			Name, Driver, Scope, Mountpoint string
+			Labels, Options                 map[string]string
+		}
+		raw, err := exec.CommandContext(ctx, "docker", "volume", "inspect", "--format", "{{json .}}", target.VolumeName).Output()
+		if err != nil || len(raw) > 16384 || json.Unmarshal(raw, &volume) != nil ||
+			mount.Type != "volume" || mount.Name != target.VolumeName ||
+			volume.Name != target.VolumeName || volume.Driver != "local" || volume.Scope != "local" ||
+			len(volume.Options) != 0 || mount.Source != volume.Mountpoint ||
+			volume.Labels["captainslog.fixture"] != "emergency-destructive" ||
+			volume.Labels["captainslog.fixture.run"] != strings.TrimPrefix(target.VolumeName, "captainslog-stepup-") {
+			t.Fatal("PostgreSQL fixture volume differs from its protected target")
+		}
 	}
 	config, err := pgxpool.ParseConfig("postgres://127.0.0.1:" + strconv.Itoa(int(target.Port)) + "/emergency_test?sslmode=disable")
 	if err != nil {
@@ -143,12 +176,21 @@ func TestPostgresStepUpFixtureTargetAdmission(t *testing.T) {
 	if got, err := readStepUpPGFixtureTarget(path); err != nil || got != target {
 		t.Fatal("private exact fixture target refused")
 	}
+	volumeTarget := target
+	volumeTarget.DataPath = ""
+	volumeTarget.VolumeName = "captainslog-stepup-" + strings.Repeat("c", 32)
+	write(volumeTarget, 0600)
+	if got, err := readStepUpPGFixtureTarget(path); err != nil || got != volumeTarget {
+		t.Fatal("private exact volume fixture target refused")
+	}
 	for name, mutate := range map[string]func(*stepUpPGFixtureTarget){
 		"live dev port":           func(v *stepUpPGFixtureTarget) { v.Port = 25432 },
 		"missing credential":      func(v *stepUpPGFixtureTarget) { v.Password = "" },
 		"container name":          func(v *stepUpPGFixtureTarget) { v.ContainerID = "postgres" },
 		"mutable image":           func(v *stepUpPGFixtureTarget) { v.ImageID = "postgres:latest" },
 		"relative mount":          func(v *stepUpPGFixtureTarget) { v.DataPath = "data" },
+		"ambiguous mount":         func(v *stepUpPGFixtureTarget) { v.VolumeName = volumeTarget.VolumeName },
+		"unowned volume":          func(v *stepUpPGFixtureTarget) { v.DataPath = ""; v.VolumeName = "production-postgres" },
 		"missing server identity": func(v *stepUpPGFixtureTarget) { v.SystemID = "" },
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -330,7 +372,7 @@ func postgresStepUpTestPool(t *testing.T) *pgxpool.Pool {
 	if expectedSystemID != "" {
 		var systemID, database, user, version string
 		err = admin.QueryRow(ctx, "SELECT system_identifier::text,current_database(),current_user,current_setting('server_version_num') FROM pg_control_system()").Scan(&systemID, &database, &user, &version)
-		if err != nil || systemID != expectedSystemID || database != "emergency_test" || user != "emergency_test" || version != "170006" {
+		if err != nil || systemID != expectedSystemID || database != "emergency_test" || user != "emergency_test" || version != "170011" {
 			admin.Close()
 			t.Fatal("connected PostgreSQL server differs from the isolated fixture")
 		}
