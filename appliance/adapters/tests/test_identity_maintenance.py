@@ -1,5 +1,7 @@
 """Native-boundary injections; these tests do not qualify Podman or LUKS."""
 import copy
+import base64
+import time
 import hashlib
 import json
 from pathlib import Path
@@ -439,6 +441,138 @@ class MaintenanceBackendTests(unittest.TestCase):
                 self.restore_capture()
         self.assertFalse((self.backend.directory/'restore-cutoff.json').exists())
         self.assertFalse(any("--command" in call for call in self.native.calls[before:]))
+
+
+    def prepare_session_restore(self):
+        stage=self.backend.stage
+        self.backend=IdentityMaintenanceBackend(self.life,stage,'rollback')
+        self.backend.hold()
+        self.restore_context={'schema':1,'stage':str(stage),'backup_sha256':'a'*64}
+        self.life.checked_backup=Mock(return_value={'verified':True})
+        self.life.database_restore_status=Mock(return_value=(self.restore_context,True,True))
+        self.original_api=b'OIDC_CLIENT_ID=nebulalog\nOIDC_ISSUER=https://logs.example.test/realms/nebulalog\nCH_PASSWORD=keep-this-fixture-value\n'
+        original=stage/'recovery/configuration/runtime/api.env';original.parent.mkdir(parents=True,mode=0o700)
+        original.write_bytes(self.original_api);original.chmod(0o600)
+        self.backend.api_environment.write_bytes(self.original_api);self.backend.api_environment.chmod(0o600)
+        capture_operation=hashlib.sha256(json.dumps(self.restore_context,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        self.capture_path=self.backend.directory/'restore-cutoff.json'
+        self.capture_floor=int(time.time())+600
+        atomic_json(self.capture_path,{'schema':1,'installation_id':INSTALLATION,'operation':capture_operation,
+            'floor':self.capture_floor,'api_path':str(self.backend.api_environment),'realm_id':'realm'})
+        self.native.floor='0';self.restore_secret=None;self.logout_calls=0;self.restore_fault=None
+        original_command=self.native.__call__
+        def command(argv,**kwargs):
+            try:return original_command(argv,**kwargs)
+            finally:
+                if argv[:2]==['podman','create'] and self.native.container is not None:
+                    record=self.backend._read_command()
+                    self.restore_secret=dict(x.split('=',1)for x in self.native.container['Config']['Env'])['CAPTAINSLOG_MAINT_SECRET']
+                    self.native.observation.update(client={'id':'owned-client','client_name':record['client'],
+                        'service_user_id':'owned-user','realm':'master','temporary':True,'enabled':True,
+                        'public':False,'service_accounts':True,'standard_flow':False,'implicit_flow':False,
+                        'password_grant':False,'admin_role':True},service_users=['owned-user'])
+        self.life.cmd=command
+        def authenticate(name,secret):
+            client=self.native.observation['client']
+            assert client and client['client_name']==name and secret==self.restore_secret
+            claims=base64.urlsafe_b64encode(json.dumps({'azp':name,'sub':'owned-user'}).encode()).decode().rstrip('=')
+            return 'e30.'+claims+'.signature'
+        def call(token,path='',method='GET',body=None):
+            if method=='GET':return {'id':'realm','realm':'nebulalog','notBefore':int(self.native.floor),
+                'attributes':{'nebulalog.installation-id':INSTALLATION}}
+            if method=='PUT':self.native.floor=str(body['notBefore'])
+            if path=='logout-all':
+                self.logout_calls+=1;self.native.floor=str(int(time.time()))
+                if self.restore_fault=='logout':
+                    self.restore_fault=None;raise OSError('lost logout response')
+        def delete(token,cid):
+            assert cid=='owned-client';self.native.observation.update(client=None,service_users=[])
+            if self.restore_fault=='delete':
+                self.restore_fault=None;raise OSError('lost delete response')
+        self.backend.api=SimpleNamespace(ready=lambda:True,authenticate=authenticate,probe=lambda *a:True,
+            call=call,delete=delete,credentials_refused=lambda *a:self.native.observation['client'] is None,
+            token_refused=lambda *a:self.native.observation['client'] is None)
+
+    def test_post_restore_composes_authority_session_and_cleanup(self):
+        self.prepare_session_restore();result=self.backend.restore_sessions()
+        self.assertTrue(result['authority_removed']);self.assertFalse(result['maintenance_released'])
+        self.assertEqual(result['session']['token_not_before'],self.capture_floor)
+        self.assertEqual(self.backend.api_environment.read_bytes(),self.original_api+f'OIDC_TOKEN_NOT_BEFORE={self.capture_floor}\n'.encode())
+        record=json.loads((self.backend.directory/'temporary-authority.json').read_text())
+        self.assertEqual(record['phase'],'removed');self.assertIsNone(record['secret']);self.assertIsNone(record['token'])
+        self.assertIsNone(self.native.container);self.assertFalse(self.backend.environment_path.exists())
+        self.assertEqual(self.native.units['api'],'inactive');self.assertEqual(self.native.units['edge'],'inactive')
+        calls=len(self.native.calls);self.assertEqual(self.backend.restore_sessions(),result)
+        self.assertEqual(self.logout_calls,1)
+        self.assertFalse(any(call[:2]==['podman','create']for call in self.native.calls[calls:]))
+
+    def test_post_restore_resumes_lost_creation_logout_and_deletion(self):
+        for fault in ('created','logout','delete'):
+            with self.subTest(fault=fault):
+                # Each case gets a separate test instance and private filesystem.
+                case=MaintenanceBackendTests('test_post_restore_composes_authority_session_and_cleanup')
+                case.setUp()
+                try:
+                    case.prepare_session_restore()
+                    if fault=='created':case.native.fault=fault
+                    else:case.restore_fault=fault
+                    with self.assertRaises(OSError):case.backend.restore_sessions()
+                    case.native.fault=None
+                    before=case.logout_calls
+                    result=case.backend.restore_sessions()
+                    self.assertTrue(result['authority_removed'])
+                    self.assertEqual(sum(call[:2]==['podman','create']for call in case.native.calls),1)
+                    if fault=='delete':self.assertEqual(case.logout_calls,before)
+                    self.assertEqual(result['session']['token_not_before'],case.capture_floor)
+                finally:case.doCleanups()
+
+    def test_post_restore_requires_completed_restore_and_bound_capture(self):
+        self.prepare_session_restore()
+        self.life.database_restore_status.return_value=(self.restore_context,True,False)
+        with self.assertRaises(Refused):self.backend.restore_sessions()
+        self.life.database_restore_status.return_value=(self.restore_context,True,True)
+        captured=json.loads(self.capture_path.read_text());atomic_json(self.capture_path,{**captured,'operation':'f'*64})
+        with self.assertRaises(Refused):self.backend.restore_sessions()
+        self.capture_path.unlink()
+        with self.assertRaises(Refused):self.backend.restore_sessions()
+        self.assertIsNone(self.native.container)
+
+    def test_post_restore_refuses_missing_admission_or_changed_customer_bytes(self):
+        self.prepare_session_restore()
+        self.backend.api_environment.write_bytes(self.original_api.replace(b'keep-this',b'changed'))
+        with self.assertRaises(Refused):self.backend.restore_sessions()
+        self.backend.api_environment.write_bytes(self.original_api)
+        result=self.backend.restore_sessions()
+        (self.backend.workdir/'restore-admission.json').unlink()
+        with self.assertRaises(Refused):self.backend.restore_sessions()
+        self.assertEqual(self.logout_calls,1)
+
+    def test_post_restore_admission_and_completion_lost_acknowledgements(self):
+        self.prepare_session_restore()
+        actual=atomic_json
+        def lost_admission(path,value):
+            actual(path,value)
+            if path.name=='restore-admission.json':raise OSError('lost admission acknowledgement')
+        with patch('nebulalog_adapters.identity_maintenance.atomic_json',lost_admission):
+            with self.assertRaises(OSError):self.backend.restore_sessions()
+        self.assertIsNone(self.native.container)
+        def lost_complete(path,value):
+            actual(path,value)
+            if path.name=='restore-complete.json':raise OSError('lost completion acknowledgement')
+        with patch('nebulalog_adapters.identity_maintenance.atomic_json',lost_complete):
+            with self.assertRaises(OSError):self.backend.restore_sessions()
+        self.assertTrue(self.backend.restore_sessions()['authority_removed'])
+        self.assertEqual(self.logout_calls,1)
+
+    def test_post_restore_completion_and_capture_drift_are_refused(self):
+        self.prepare_session_restore();self.backend.restore_sessions()
+        complete=self.backend.workdir/'restore-complete.json';saved=complete.read_bytes()
+        changed=json.loads(saved);changed['maintenance_released']=True;atomic_json(complete,changed)
+        with self.assertRaises(Refused):self.backend.restore_sessions()
+        complete.write_bytes(saved)
+        captured=json.loads(self.capture_path.read_text());atomic_json(self.capture_path,{**captured,'floor':self.capture_floor+1})
+        with self.assertRaises(Refused):self.backend.restore_sessions()
+        self.assertEqual(self.logout_calls,1)
 
 
 if __name__ == "__main__":

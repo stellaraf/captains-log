@@ -92,6 +92,55 @@ bootstrap identity. The separate interruption-recovery evidence remains required
 
 ## Acceptance boundary
 
+### Composed post-restore session recovery
+
+`IdentityMaintenanceBackend.restore_sessions()` composes the retained temporary
+authority, session journal and completion observer. It requires rollback
+direction, verified completed database restoration, the exact pre-restore
+capture, and the original API environment from the verified recovery set.
+Before creating authority it persists an operation-bound admission recording
+whether first-use authority/session initialization is permitted. Retries reject
+changed admission, changed customer bytes and missing admission with existing
+work.
+
+The operation retains maintenance while obtaining the vendor recovery account,
+reconciling the captured cutoff over HTTPS, writing the API cutoff, and removing
+the recovery account. Completion requires the controller's persisted removed
+state, erased secret/token, live SQL/session readback and removed command
+containers. Its receipt explicitly leaves maintenance held. A lost completion
+acknowledgement can reuse the exact receipt without creating a second account
+or repeating completed session work. New state-directory entries are fsynced
+before subsequent durable work.
+
+The composed operation is not yet invoked automatically by lifecycle service
+startup. Host resource preservation and AIDE both currently require the original
+API environment hash. They need a narrowly authorized cutoff transformation,
+including historical integrity evidence, before this operation can be connected
+without failing integrity acceptance. The completed-restore retry path must also
+preserve the new cutoff rather than recopying the old configuration. Those checks
+remain enforced; this work does not exempt the API environment from integrity
+monitoring or claim full appliance rollback acceptance.
+
+Validation passed **314 focused tests** under Rocky Python **3.14.8**, with no
+skips. The composed-operation cases cover lost creation, logout, deletion,
+admission and completion acknowledgements; changed customer configuration or
+capture; missing admission; and idempotent completion.
+
+A real PostgreSQL **17.11** / Keycloak **26.8.1** HTTPS fixture passed the
+**20 identity checks**, **six database capture/restore checks**, and **15
+post-restore workflow checks**. Three separate Rocky Python processes lost the
+vendor-command creation response, resumed through session repair and lost the
+account-deletion response, then completed cleanup and repeated completion.
+The workflow created one recovery account, performed session work once, and
+verified its removal and credential erasure. The retained cutoff and all other
+API environment bytes remained correct after actual database replacement.
+
+This fixture executes the production composition, SQL observations, HTTPS
+transport, session journal and authority controller. Its command boundary uses
+owned Docker containers for the real vendor CLI and server, with injected native
+Podman journaling, lifecycle admission and encrypted-storage checks. It does not
+qualify those native boundaries, AIDE acceptance, or the full appliance lifecycle.
+
 ### Pre-restore cutoff capture
 
 Failed-activation rollback now calls `capture_before_database_restore()` after

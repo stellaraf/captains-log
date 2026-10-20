@@ -242,7 +242,88 @@ class IdentityMaintenanceBackend:
                 raise Refused("Identity recovery state cannot traverse links")
             _encrypted_staging(path, self.life.cmd)
             SessionCutoffJournal._directory(path)
+            parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(parent)
+            finally:
+                os.close(parent)
         self.fenced(self.operation)
+
+    def restore_sessions(self):
+        """Compose post-restore authority, session repair and verified removal.
+
+        Admission requires a completed, bound database restore and its retained
+        pre-restore cutoff. No caller may use this receipt as permission to
+        release maintenance: host/AIDE preservation and service startup remain
+        the lifecycle coordinator's responsibility.
+        """
+        if self.binding["direction"] != "rollback":
+            raise Refused("Post-restore identity work requires the rollback direction")
+        self.hold()
+        backup = self.life.checked_backup(self.stage)
+        context, restoring, restored = self.life.database_restore_status(self.stage, backup)
+        if restoring is not True or restored is not True:
+            raise Refused("Post-restore identity work requires completed database replacement")
+        journal = SessionCutoffJournal(self.directory, self.installation_id)
+        captured = journal._restore_record(self.api_environment)
+        capture_operation = _digest(json.dumps(context, sort_keys=True, separators=(",", ":")).encode())
+        if captured is None or captured["operation"] != capture_operation:
+            raise Refused("Post-restore identity work lost its exact pre-restore cutoff")
+        original = SessionCutoffJournal._read(self.stage / "recovery/configuration/runtime/api.env")
+        original_floor, _, original_configuration = journal._environment(original)
+        current = SessionCutoffJournal._read(self.api_environment)
+        _, _, configuration = journal._environment(current)
+        if configuration != original_configuration or captured["floor"] < original_floor:
+            raise Refused("Restored API configuration differs beyond its authorized cutoff")
+        admission_path = self.workdir / "restore-admission.json"
+        fixed = {"schema": 1, "binding": self.binding, "restore_operation": capture_operation,
+                 "capture_sha256": _digest(json.dumps(captured, sort_keys=True, separators=(",", ":")).encode()),
+                 "original_api_sha256": _digest(original), "api_configuration_sha256": configuration}
+        authority = TemporaryIdentityAuthority(self.directory, self.installation_id)
+        if os.path.lexists(admission_path):
+            admission = strict_json(SessionCutoffJournal._read(admission_path))
+            if (not isinstance(admission, dict)
+                    or set(admission) != set(fixed) | {"initialize_authority", "initialize_session"}
+                    or any(admission.get(key) != value for key, value in fixed.items())
+                    or any(type(admission[key]) is not bool for key in ("initialize_authority", "initialize_session"))):
+                raise Refused("Post-restore identity admission changed")
+        else:
+            if (current != original or any(os.path.lexists(path) for path in
+                    (self.command_path, self.work_path, self.workdir / "restore-complete.json"))):
+                raise Refused("Missing post-restore admission cannot adopt existing recovery work")
+            admission = {**fixed, "initialize_authority": not os.path.lexists(authority.path),
+                         "initialize_session": not os.path.lexists(journal.path)}
+            self.fenced(self.operation)
+            atomic_json(admission_path, admission)
+            if strict_json(SessionCutoffJournal._read(admission_path)) != admission:
+                raise Refused("Post-restore identity admission did not persist")
+
+        def work(token):
+            result = journal.reconcile(
+                lambda path, method="GET", body=None: self.call(token, path, method, body),
+                self.operation, self.api_environment, max(captured["floor"], int(time.time())),
+                self.fenced, initialize=admission["initialize_session"])
+            return self.record_work(result)
+
+        receipt = authority.run(self.operation, self, work, initialize=admission["initialize_authority"])
+        # Verify removal again from the retained controller record rather than
+        # treating a successful work callback as completed authority cleanup.
+        record = strict_json(SessionCutoffJournal._read(authority.path))
+        if (record.get("phase") != "removed" or record.get("operation") != self.operation
+                or record.get("secret") is not None or record.get("token") is not None
+                or record.get("work_receipt") != receipt or not self.settled(receipt)):
+            raise Refused("Post-restore authority removal is not durably complete")
+        result = {"schema": 1, "binding": self.binding,
+                  "admission_sha256": _digest(SessionCutoffJournal._read(admission_path)),
+                  "session": receipt, "authority_removed": True, "maintenance_released": False}
+        complete = self.workdir / "restore-complete.json"
+        if os.path.lexists(complete) and strict_json(SessionCutoffJournal._read(complete)) != result:
+            raise Refused("Post-restore completion record changed")
+        self.fenced(self.operation)
+        atomic_json(complete, result)
+        if strict_json(SessionCutoffJournal._read(complete)) != result:
+            raise Refused("Post-restore completion record did not persist")
+        return result
 
     def _storage(self):
         self.life.encrypted()
