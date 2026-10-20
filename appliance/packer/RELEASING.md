@@ -70,6 +70,14 @@ Inputs must describe the same captured source, real build receipt and verified
 Linux/amd64 OCI image, which must already be loaded in a local Unix-socket Docker
 daemon. The application image must include `/usr/bin/python3` for the separate
 public-JWKS fixture container. The probe never builds, imports or pulls an image.
+Classic Docker configuration IDs and containerd manifest IDs are supported only
+when the digest belongs to the verified OCI archive; mutable tags are not used
+to select test containers. Supply absolute paths for the receipt inputs.
+If Docker's default network pools are exhausted, inventory existing subnets and
+pass `--fixture-subnet` with an unused, aligned `/28` or `/29` in `198.18.0.0/15`.
+This range is restricted to the internal test network; Docker rejects overlaps,
+the probe verifies the assigned subnet, and cleanup removes only its owned network.
+Do not remove existing networks or change daemon-wide pools to run this test.
 It refuses before runtime access when the storage volume has less than 150 GiB
 free. This check proves free space on the output volume; it does not discover or
 prove Docker Desktop's backing-disk location. Before an actual run, independently
@@ -79,8 +87,9 @@ evidence with the execution receipt. The probe does not relocate runtime storage
 Both temporary containers use that exact OCI configuration. The API retains its
 normal entrypoint, unprivileged user and `REQUIRE_FIPS=true`; a second container
 serves an isolated fixture issuer and creates a root-owned read-only storage
-maintenance gate. A private internal network prevents external egress. Only the
-API is published to an ephemeral `127.0.0.1` port. Database addresses point to
+maintenance gate. A private internal network prevents external egress. The HTTP
+client executes inside the fixture container and receives tokens through stdin;
+neither container publishes a host port. Database addresses point to
 closed ports on container loopback: this probe exercises `/api/me`, not database
 availability, browser login, MFA, native kernel FIPS or appliance health.
 

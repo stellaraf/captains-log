@@ -12,6 +12,7 @@ import argparse
 import base64
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -159,7 +160,30 @@ def request(port, token=None):
         connection.close()
 
 
-def collect(port, signer, image, cutoff, observed_cutoff, observations):
+def internal_request(runtime, container, port, token=None):
+    code = """import sys,json,http.client,hashlib
+v=json.load(sys.stdin)
+c=http.client.HTTPConnection('api',v['port'],timeout=5)
+try:
+ c.request('GET','/api/me',headers={} if v['token'] is None else {'Authorization':'Bearer '+v['token']})
+ r=c.getresponse(); raw=r.read(65537)
+ assert len(raw)<=65536 and r.getheader('Content-Type','').split(';')[0]=='application/json'
+ body=json.loads(raw); assert isinstance(body,dict)
+ print(json.dumps([r.status,body,{'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest()}]))
+finally: c.close()
+"""
+    result = runtime.call(["container","exec","-i",container,"/usr/bin/python3","-c",code],
+                          check=False,input=encoded({"port":port,"token":token}))
+    if result.returncode:
+        raise OSError("Isolated HTTP client could not reach the normal API")
+    value = host_payload.strict_json(result.stdout)
+    if not isinstance(value,list) or len(value)!=3:
+        raise Refused("Isolated HTTP client returned an invalid response")
+    return tuple(value)
+
+
+def collect(port, signer, image, cutoff, observed_cutoff, observations, requester=None):
+    requester = requester or request
     report = {"schema":1, "kind":"captains-log-restored-token-boundary", "method":"isolated-image-normal-api-http",
               "application_image":image["reference"], "application_config_digest":image["config_digest"],
               "application_source_sha256":image["application_source_sha256"], "command":["serve"],
@@ -170,7 +194,7 @@ def collect(port, signer, image, cutoff, observed_cutoff, observations):
         claims = claims_for(name, cutoff, now)
         token = signer.token(claims, name == "wrong_signature")
         observed = int(time.time())
-        status, body, identity = request(port, token)
+        status, body, identity = requester(port, token)
         role = body.get("role")
         observations.append({"case":name, "http_status":status, "observed_at":observed, "response":identity})
         if status != wanted or (wanted == 200 and body != {"id":"fixture-viewer", "name":"fixture-viewer", "role":"VIEWER"}):
@@ -190,11 +214,12 @@ def env_value(environment, key):
 
 
 def target_identity(value, image, network, cutoff, run_id, volume):
+    runtime_id = image.get("runtime_image_id", image["config_digest"])
     config, host = value.get("Config", {}), value.get("HostConfig", {})
     environment = config.get("Env", [])
-    bindings = value.get("NetworkSettings", {}).get("Ports", {}).get("8080/tcp")
+    bindings = value.get("NetworkSettings", {}).get("Ports", {})
     mounts = value.get("Mounts", [])
-    if (value.get("Image") != image["config_digest"] or config.get("Image") != image["config_digest"]
+    if (value.get("Image") != runtime_id or config.get("Image") != runtime_id
             or config.get("Entrypoint") != ["nebulalog"] or config.get("Cmd") != ["serve"]
             or config.get("User") != "10001:10001" or config.get("Labels", {}).get(LABEL) != run_id
             or value.get("Path") != "nebulalog" or value.get("Args") != ["serve"]
@@ -205,17 +230,15 @@ def target_identity(value, image, network, cutoff, run_id, volume):
             or {str(x).upper() for x in host.get("CapDrop", [])} != {"ALL"}
             or "no-new-privileges" not in host.get("SecurityOpt", [])
             or not any(m.get("Type")=="volume" and m.get("Name")==volume and m.get("Destination")==GATE and m.get("RW") is False for m in mounts)
-            or not isinstance(bindings, list) or len(bindings) != 1 or bindings[0].get("HostIp") != "127.0.0.1"):
+            or any(bindings.values()) or host.get("PortBindings")
+            or host.get("PublishAllPorts") is True):
         raise Refused("Normal API container identity or isolation differs from the fixture plan")
     expected = {"OIDC_TOKEN_NOT_BEFORE":str(cutoff), "REQUIRE_FIPS":"true", "OIDC_ISSUER":ISSUER,
                 "OIDC_CLIENT_ID":CLIENT, "OIDC_BACKCHANNEL_URL":"", "PG_DSN":"postgresql://fixture@127.0.0.1:1/fixture?sslmode=disable&connect_timeout=1",
                 "CH_URL":"http://127.0.0.1:1", "STORAGE_MAINTENANCE_PATH":GATE+"/gate.json", "API_LISTEN":":8080"}
     for key, wanted in expected.items():
         if env_value(environment,key) != wanted: raise Refused("Runtime environment mismatch: " + key)
-    port = bindings[0].get("HostPort", "")
-    if not isinstance(port,str) or not re.fullmatch(r"[1-9][0-9]{0,4}",port) or int(port)>65535:
-        raise Refused("Runtime did not expose one bounded loopback port")
-    return int(port), int(env_value(environment,"OIDC_TOKEN_NOT_BEFORE"))
+    return 8080, int(env_value(environment,"OIDC_TOKEN_NOT_BEFORE"))
 
 
 class Docker:
@@ -224,16 +247,21 @@ class Docker:
         self.calls = []
         self.context, self.transport = None, None
 
-    def call(self, args, *, check=True):
+    def call(self, args, *, check=True, input=None):
         remaining = self.deadline-time.monotonic()
         if remaining <= 0: raise Refused("Probe runtime deadline exhausted")
         prefix=["docker", "--context", self.context] if self.context else ["docker"]
-        result = subprocess.run([*prefix, *args], capture_output=True, timeout=min(30,remaining))
+        result = subprocess.run([*prefix, *args], input=input, capture_output=True, timeout=min(30,remaining))
         if len(result.stdout)+len(result.stderr) > 8*1024**2:
             raise Refused("Runtime response exceeded its bounded evidence size")
         self.calls.append({"operation":args[:2], "returncode":result.returncode,
                            "stdout_sha256":hashlib.sha256(result.stdout).hexdigest(), "stderr_sha256":hashlib.sha256(result.stderr).hexdigest()})
-        if check and result.returncode: raise Refused("Local fixture runtime operation failed: " + " ".join(args[:2]))
+        if check and result.returncode:
+            # Fixture CLI arguments contain no tokens or passwords. Keep bounded
+            # daemon diagnostics in the private receipt so failed starts can be
+            # distinguished from image, mount and network errors.
+            diagnostic = result.stderr.decode("utf-8", errors="replace")[:2048]
+            raise Refused("Local fixture runtime operation failed: " + " ".join(args[:2]) + ": " + diagnostic)
         return result
 
     def inspect(self, kind, name):
@@ -265,15 +293,52 @@ def absent(kind, name, result):
     return any(re.search(re.escape(value.lower())+r"(?:\s|$)",text) for value in patterns[kind])
 
 
-def execute(archive, reference, source, build, output, storage):
+def loaded_image(runtime, image):
+    """Resolve only digests cryptographically bound by the verified OCI archive."""
+    allowed = (image["config_digest"], image["manifest_digest"])
+    for digest in allowed:
+        result = runtime.call(["image", "inspect", digest], check=False)
+        if result.returncode:
+            message = result.stderr.decode("utf-8", errors="replace").lower()
+            if not re.search(r"no such image: " + re.escape(digest) + r"(?:\s|$)", message):
+                raise Refused("Loaded image lookup failed without confirmed absence")
+            continue
+        values = host_payload.strict_json(result.stdout)
+        if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+            raise Refused("Loaded image identity is ambiguous")
+        installed = values[0]
+        if (installed.get("Id") not in allowed or installed.get("Architecture") != "amd64"
+                or installed.get("Os") != "linux"
+                or installed.get("Config", {}).get("Entrypoint") != ["nebulalog"]
+                or installed.get("Config", {}).get("User") != "10001:10001"
+                or installed.get("Config", {}).get("Labels", {}).get("io.nebulalog.application-source-sha256") != image["application_source_sha256"]):
+            raise Refused("Already loaded application differs from verified OCI configuration")
+        return installed
+    raise Refused("Verified application image is not loaded")
+
+
+def fixture_network(value):
+    if value is None:
+        return None
+    try:
+        network = ipaddress.ip_network(value, strict=True)
+        if network.version == 4 and network.prefixlen in (28, 29) and network.subnet_of(ipaddress.ip_network("198.18.0.0/15")):
+            return str(network)
+    except ValueError:
+        pass
+    raise Refused("Fixture subnet must be an aligned /28 or /29 in the isolated benchmark range 198.18.0.0/15")
+
+
+def execute(archive, reference, source, build, output, storage, fixture_subnet=None):
+    fixture_subnet = fixture_network(fixture_subnet)
     # This check precedes image hashing, CLI access and any resource creation.
     reserve(storage, output)
     output = Path(output).absolute()
     if output.exists() or output.is_symlink(): raise Refused("Probe output must be a new directory")
     image = {**verify_oci_archive(archive, reference), "reference":reference}
-    snapshot_raw = host_payload.read_regular(source, Contract.MAX_RECEIPT)
+    snapshot_raw = host_payload.read_regular(Path(source), Contract.MAX_RECEIPT)
     snapshot = host_payload.source_manifest(snapshot_raw)
-    build_raw = host_payload.read_regular(build, Contract.MAX_RECEIPT)
+    build_raw = host_payload.read_regular(Path(build), Contract.MAX_RECEIPT)
     built = host_payload.strict_json(build_raw)
     Contract._build(built, snapshot["files"], {"version":built.get("requested_version")}, image)
     output.mkdir(mode=0o700)
@@ -290,18 +355,18 @@ def execute(archive, reference, source, build, output, storage):
     try:
         runtime.local()
         runtime_ready = True
-        installed = runtime.inspect("image",image["config_digest"])
-        if (installed.get("Id") != image["config_digest"] or installed.get("Architecture")!="amd64" or installed.get("Os")!="linux"
-                or installed.get("Config",{}).get("Entrypoint") != ["nebulalog"]
-                or installed.get("Config",{}).get("User") != "10001:10001"
-                or installed.get("Config",{}).get("Labels",{}).get("io.nebulalog.application-source-sha256") != image["application_source_sha256"]):
-            raise Refused("Already loaded application differs from verified OCI configuration")
+        installed = loaded_image(runtime, image)
+        image["runtime_image_id"] = installed["Id"]
         record["installed_image"] = installed
         reserve(storage,output)
-        runtime.call(["network","create","--internal","--label",LABEL+"="+run_id,network])
+        runtime.call(["network","create","--internal","--label",LABEL+"="+run_id,
+                      *(["--subnet",fixture_subnet] if fixture_subnet else []),network])
         net = runtime.inspect("network",network)
         if net.get("Internal") is not True or net.get("Labels",{}).get(LABEL)!=run_id:
             raise Refused("Fixture network is not owned and internal")
+        if fixture_subnet and [x.get("Subnet") for x in net.get("IPAM",{}).get("Config",[])] != [fixture_subnet]:
+            raise Refused("Fixture network subnet differs from the requested isolated range")
+        record["fixture_subnet"] = fixture_subnet
         runtime.call(["volume","create","--label",LABEL+"="+run_id,volume])
         fixture = output/"public-fixture"; fixture.mkdir(mode=0o755)
         with tempfile.TemporaryDirectory(prefix="private-keys-", dir=output) as keys:
@@ -315,10 +380,10 @@ def execute(archive, reference, source, build, output, storage):
                 (fixture/name).write_bytes(raw); (fixture/name).chmod(0o444)
             common = ["--pull=never","--label",LABEL+"="+run_id,"--network",network,"--read-only","--cap-drop=ALL",
                       "--security-opt=no-new-privileges","--pids-limit=64","--memory=256m",
-                      "--log-driver=local","--log-opt=max-size=1m","--log-opt=max-file=1"]
+                      "--log-driver=local","--log-opt=max-size=1m","--log-opt=max-file=1","--log-opt=compress=false"]
             runtime.call(["container","create","--name",names[0],*common,"--network-alias=issuer","--user=0:0","--entrypoint=/usr/bin/python3",
                           "--mount","type=bind,src="+str(fixture)+",dst=/fixture,readonly",
-                          "--mount","type=volume,src="+volume+",dst=/gate",image["config_digest"],"/fixture/issuer.py"])
+                          "--mount","type=volume,src="+volume+",dst=/gate",image["runtime_image_id"],"/fixture/issuer.py"])
             runtime.call(["container","start",names[0]])
             until = time.monotonic()+45
             while True:
@@ -330,26 +395,29 @@ def execute(archive, reference, source, build, output, storage):
             environment = {"OIDC_ISSUER":ISSUER,"OIDC_CLIENT_ID":CLIENT,"OIDC_BACKCHANNEL_URL":"","OIDC_TOKEN_NOT_BEFORE":str(cutoff),
                 "PG_DSN":"postgresql://fixture@127.0.0.1:1/fixture?sslmode=disable&connect_timeout=1","CH_URL":"http://127.0.0.1:1",
                 "REQUIRE_FIPS":"true","STORAGE_MAINTENANCE_PATH":GATE+"/gate.json","API_LISTEN":":8080"}
-            args=["container","create","--name",names[1],*common,"--publish=127.0.0.1::8080",
+            args=["container","create","--name",names[1],*common,"--network-alias=api",
                   "--tmpfs=/var/lib/nebulalog/exports:rw,nosuid,nodev,noexec,size=16m,uid=10001,gid=10001,mode=0700",
                   "--mount","type=volume,src="+volume+",dst="+GATE+",readonly"]
             for key,value in environment.items(): args.extend(["--env",key+"="+value])
             reserve(storage,output)
-            runtime.call([*args,image["config_digest"],"serve"])
+            runtime.call([*args,image["runtime_image_id"],"serve"])
             runtime.call(["container","start",names[1]])
             target = runtime.inspect("container",names[1])
-            port, observed = target_identity(target,image,network,cutoff,run_id,volume)
             record["target_before"] = target
+            port, observed = target_identity(target,image,network,cutoff,run_id,volume)
+            def client(port, token=None):
+                return internal_request(runtime,names[0],port,token)
             until=time.monotonic()+60
             while True:
                 try:
-                    status, _, _ = request(port)
+                    status, _, _ = client(port)
                     if status != 401: raise Refused("Normal API did not require authentication")
                     break
                 except (OSError,http.client.HTTPException):
                     if time.monotonic()>=until: raise Refused("Normal API did not become ready")
                     time.sleep(.25)
-            report=collect(port,signer,image,cutoff,observed,record["observations"])
+            report=collect(port,signer,image,cutoff,observed,record["observations"],requester=client)
+            record["http_client"] = "same-image-isolated-network-stdin"
             after=runtime.inspect("container",names[1])
             if target_identity(after,image,network,cutoff,run_id,volume)!=(port,observed) or after.get("Id")!=target.get("Id"):
                 raise Refused("Normal API identity changed during HTTP cases")
@@ -385,7 +453,7 @@ def execute(archive, reference, source, build, output, storage):
                 value=host_payload.strict_json(seen.stdout)
                 if not isinstance(value,list) or len(value)!=1: raise Refused("Cleanup identity is ambiguous")
                 labels=value[0].get("Config",{}).get("Labels",{}) if kind=="container" else value[0].get("Labels",{})
-                if labels.get(LABEL)!=run_id or kind=="container" and value[0].get("Image")!=image["config_digest"]:
+                if labels.get(LABEL)!=run_id or kind=="container" and value[0].get("Image")!=image.get("runtime_image_id"):
                     raise Refused("Cleanup refuses a foreign resource")
                 runtime.call([kind,"rm",*(["--force"] if kind=="container" else []),name])
                 check=runtime.call([kind,"inspect",name],check=False)
@@ -407,9 +475,10 @@ def main():
     for name in ("archive","reference","source-manifest","build-receipt","output"):
         parser.add_argument("--"+name,required=True)
     parser.add_argument("--storage-root",default="/Volumes/T9")
+    parser.add_argument("--fixture-subnet",help="Optional unused /28 or /29 in 198.18.0.0/15 for the internal test network")
     args=parser.parse_args()
     try:
-        execute(args.archive,args.reference,args.source_manifest,args.build_receipt,args.output,args.storage_root)
+        execute(args.archive,args.reference,args.source_manifest,args.build_receipt,args.output,args.storage_root,args.fixture_subnet)
     except (Refused,OSError,ValueError) as exc:
         parser.exit(1,str(exc)+"\n")
     print("Normal API HTTP boundary cases passed; native restore/update/rollback acceptance remains pending.")
