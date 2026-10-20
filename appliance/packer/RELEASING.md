@@ -1,5 +1,45 @@
 # Release assembly and guarded prerelease publication
 
+## Application build and owned cache cleanup
+
+The application helper requires an explicit local Docker context, a mounted
+storage root, and an already cached immutable official BuildKit image. Verify
+that Docker's actual backing disk also resides on the approved development
+volume before running; checking the receipt filesystem does not prove that.
+
+```sh
+python3 appliance/packer/build_application.py \
+  --source /Volumes/T9/qualification/source \
+  --tag nebulalog/application:qualification \
+  --receipt /Volumes/T9/qualification/application-build.json \
+  --storage-root /Volumes/T9 --docker-context desktop-linux \
+  --buildkit-image 'moby/buildkit@sha256:<reviewed cached image digest>'
+```
+
+Each invocation creates a private buildx configuration beside the receipt, a
+unique builder and node, and a labelled cache volume. It preserves the captured
+source contract, uses `--builder` and `--load`, and never changes the default
+builder. Buildx bootstrap can contact the registry for that immutable BuildKit
+digest even when its bytes are cached. The application build has a one-hour
+deadline and periodically checks the 150 GiB free-space reserve on the selected
+volume. CLI process groups are reaped on failure or interruption; daemon work is
+separately stopped and inspected before cleanup.
+
+On success, failure, timeout, Ctrl-C or CLI SIGTERM, cleanup verifies the exact
+BuildKit container/image/nonce/mount and recorded volume identity, stops and
+removes that container, removes its unreferenced cache volume, checks their
+absence, and deletes the private buildx scratch. It retains loaded output images,
+prior receipts and all release/recovery artifacts. No shared cache or image
+prune is used. The successful build receipt is published only after cleanup.
+Private `application-build-evidence-*` sidecars retain intent, ownership and
+separate build/cleanup outcomes; an uncertain identity or failed readback leaves
+resources and configuration for inspection and makes the invocation fail.
+An outcome-write failure is reported without replacing the primary build error.
+Resolve incomplete cleanup before another image build. SIGKILL, power loss and
+daemon unavailability cannot guarantee immediate cleanup; retained identity
+evidence requires explicit reconciliation. Programmatic callers keep their own
+signal policy; only the CLI temporarily installs a SIGTERM handler.
+
 ## Restored-token HTTP proof for the first supported factory
 
 The fresh schema-3 factory and same-schema component candidates use

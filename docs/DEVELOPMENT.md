@@ -26,9 +26,18 @@ The commands below are validation steps inside that managed run. They do not
 provide storage admission or post-run cleanup by themselves. Container builds
 also require a verified builder with its backing storage on the development
 volume and an owned cache lifecycle; setting host `TMPDIR` does not relocate
-Docker's cache. `build_application.py` removes its own captured tar context from
-the receipt directory after success or failure, but does not prune Docker's
-shared cache.
+Docker's cache. `build_application.py` uses a unique buildx builder and labelled
+cache volume with private configuration/scratch under the receipt directory.
+Pass an explicit `--storage-root` (on this workstation `/Volumes/T9`),
+`--docker-context`, and cached immutable `--buildkit-image`; independently verify
+the daemon's backing storage. It settles its exact owned container and removes
+its cache after success, failure, timeout or CLI interruption, while preserving
+loaded images and private outcome evidence. It never prunes shared caches.
+Incomplete cleanup fails the invocation and must be reconciled before another
+image build; SIGKILL and power loss cannot guarantee immediate cleanup. See
+[the release instructions](../appliance/packer/RELEASING.md) for the command and
+ownership/cleanup contract. These guarantees apply to this helper; other build
+entrypoints still require their own equivalent bounded cleanup.
 
 ```sh
 go test -race ./...
