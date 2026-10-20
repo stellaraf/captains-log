@@ -1,5 +1,60 @@
 # Release assembly and guarded prerelease publication
 
+## Restored-token HTTP proof for the first supported factory
+
+The fresh schema-3 factory and same-schema component candidates use
+`restored-jwt-issued-at-v1`. Before packaging that declaration, run the actual
+normal API image with `probe_restore_auth.py`; synthetic unit-test reports are
+not qualification evidence. The binary command is `nebulalog serve`.
+
+```sh
+python3 appliance/packer/probe_restore_auth.py \
+  --archive /Volumes/T9/qualification/nebulalog.oci.tar \
+  --reference 'nebulalog/application@sha256:<actual manifest digest>' \
+  --source-manifest /Volumes/T9/qualification/source-manifest.json \
+  --build-receipt /Volumes/T9/qualification/application-build.json \
+  --output /Volumes/T9/qualification/http-proof-new-run \
+  --storage-root /Volumes/T9
+```
+
+Inputs must describe the same captured source, real build receipt and verified
+Linux/amd64 OCI image, which must already be loaded in a local Unix-socket Docker
+daemon. The application image must include `/usr/bin/python3` for the separate
+public-JWKS fixture container. The probe never builds, imports or pulls an image.
+It refuses before runtime access when the storage volume has less than 150 GiB
+free. This check proves free space on the output volume; it does not discover or
+prove Docker Desktop's backing-disk location. Before an actual run, independently
+verify that the selected local runtime's backing storage is on T9 and retain that
+evidence with the execution receipt. The probe does not relocate runtime storage.
+
+Both temporary containers use that exact OCI configuration. The API retains its
+normal entrypoint, unprivileged user and `REQUIRE_FIPS=true`; a second container
+serves an isolated fixture issuer and creates a root-owned read-only storage
+maintenance gate. A private internal network prevents external egress. Only the
+API is published to an ephemeral `127.0.0.1` port. Database addresses point to
+closed ports on container loopback: this probe exercises `/api/me`, not database
+availability, browser login, MFA, native kernel FIPS or appliance health.
+
+The probe sends fresh RSA-signed fixture JWTs before, at and after a fixed issuance
+cutoff, plus missing-iat, wrong-issuer, wrong-audience, wrong-signature and expired
+controls. It records actual HTTP statuses, runtime image/configuration readback,
+source/build hashes and bounded response hashes. Tokens and private keys do not
+enter the report; temporary signing keys are removed. The expected 200 responses
+must identify the fixture viewer. Any unexpected result, timeout, identity change
+or unconfirmed cleanup prevents publication of `restore-auth-behavior.json`.
+`intent.json` and the private `execution.json` preserve failed attempts. Cleanup
+selects only this run's unique resource names, label and exact image identity.
+
+Review that execution before supplying `application-build.json` and
+`restore-auth-behavior.json` to `prepare_provenance.py --restore-auth-evidence` or
+the release assembler's evidence directory. Existing factory provenance and
+release signatures cover these inputs; no new trust key or loose-file adoption
+is introduced. Native restored-baseline login/MFA, A-to-B update, rollback and
+interrupted recovery remain release-promotion gates. The runtime's temporary
+restored-appliance update refusal stays in place until proof ownership, immutable
+restore markers and the running cutoff are integrated and qualified. Earlier
+schema-2/121-entry prototypes do not acquire this capability from a label.
+
 `assemble_release.py` produces local assets compatible with Captain's Log's existing signed updater. It has no network or GitHub operations. An assembled package is always `qualification: not_assessed`, including when its signature and all archives verify. The GitHub workflow is disabled until its explicit repository variable is enabled, and can publish only a prerelease.
 
 ## Inputs and assembly
@@ -28,7 +83,7 @@ The recipe explicitly records the publisher-approved release sequence, timestamp
 
 These values are illustrative, not a current qualified release. Include the actual measured factory host version in `from_versions` when supporting that factory image. Every release includes both host and application assets. The host version must advance, even when only OCI bytes change. Database changes may additionally select `postgresql`, `clickhouse`, and `keycloak`; unselected database images remain installed. PostgreSQL major changes are refused. ClickHouse requires `family`, `tested_minimum`, and `tested_maximum`, with both old and new versions inside that range. Preserve the full measured ClickHouse version, such as `25.3.8.30001.altinityfips`, in `version` and `from_versions`; range bounds are numeric, such as `25.3.8.30001`. Both the publisher and appliance verifier reject family changes, vendor suffix changes and endpoints outside that range. Automatic schema migrations are not accepted.
 
-The example targets the current application schema 2. `ApplicationSchema` in `image_bundle.py` binds the entire `migrations/` inventory to reviewed bytes; a schema-1 declaration with schema-2 SQL is rejected before assembly. The same binding is required by provenance capture and installed-release enrollment. The assembler can describe a reviewed additive transition for qualification, but the runtime still refuses schema changes until the executor and recovery path are accepted. A schema-1 bridge must retain schema-1 application source and image while updating the coordinator within the existing host file catalog. Keep these candidates out of stable release publication until both upgrade and rollback have passed installed-guest testing.
+The legacy example above targets prototype schema 2; the first supported factory targets schema 3. `ApplicationSchema` in `image_bundle.py` binds the entire `migrations/` inventory to reviewed bytes; a schema-1 declaration with schema-2 SQL is rejected before assembly. The same binding is required by provenance capture and installed-release enrollment. The historical schema-1-to-2 additive contract remains distinct from current schema-3 operation. These prototypes do not gain a supported schema-2-to-3 migration or restored-token capability from a declaration. Keep candidates out of stable release publication until their required installed-guest upgrade and rollback checks pass.
 
 Keycloak additionally requires `qualification_artifact` naming a JSON report with the existing lifecycle schema: exact image, source commit, and successful `real_browser` observations for local password/OTP, AD LDAPS/OTP, Okta SAML, Entra SAML, generic SAML and generic OIDC. Every referenced browser evidence artifact must be listed explicitly in `evidence_artifacts` and supplied in `--evidence-directory`. Only the selected, bounded JSON files are copied. Those browser artifacts become public release assets; supply reviewed, sanitized reports containing no tokens, cookies, passwords, private keys or personal data. The assembler checks schema and binding, not the truth of browser assertions or complete content redaction.
 

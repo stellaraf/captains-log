@@ -351,6 +351,16 @@ class Bootstrap:
             "api": {**shared, "COLLECTOR_TLS_CA_PATH": "/etc/nebulalog/tls/ca.crt", "COLLECTOR_TLS_CERT_PATH": "/etc/nebulalog/tls/server.crt", "OIDC_ISSUER": public + "/realms/nebulalog", "OIDC_BACKCHANNEL_URL": "https://keycloak:8443", "OIDC_URL": public, "OIDC_REALM": "nebulalog", "OIDC_CLIENT_ID": "nebulalog", "IDENTITY_ADMIN_URL": "https://keycloak:8443", "IDENTITY_CLIENT_ID": "nebulalog-identity-manager", "IDENTITY_CLIENT_SECRET": self.secret["identity_service"], "IDENTITY_ENABLE_WRITES": "true"},
             "ingest": {**shared, "SYSLOG_CERT": "/etc/nebulalog/tls/server.crt", "SYSLOG_KEY": "/etc/nebulalog/tls/server.key", "PANOS_TIMEZONE": self.setup["maintenance"]["timezone"]},
         }
+        restore_auth = self.bootstrap / "restore-auth.json"
+        if os.path.lexists(restore_auth):
+            cutoff = self._read(restore_auth)
+            if (not isinstance(cutoff, dict) or set(cutoff) != {"schema", "installation_id", "operation", "token_not_before"}
+                    or type(cutoff["schema"]) is not int or cutoff["schema"] != 1
+                    or cutoff["installation_id"] != self.setup["installation_id"]
+                    or not isinstance(cutoff["operation"], str) or not re.fullmatch(r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}", cutoff["operation"])
+                    or type(cutoff["token_not_before"]) is not int or not 1577836800 <= cutoff["token_not_before"] < 2**31):
+                raise Refused("Restored authentication cutoff differs from this appliance")
+            configs["api"]["OIDC_TOKEN_NOT_BEFORE"] = str(cutoff["token_not_before"])
         directory = self.configuration / "runtime"
         directory.mkdir(mode=0o700, exist_ok=True)
         for name, values in configs.items():
@@ -413,9 +423,9 @@ class Bootstrap:
         self.runner(["systemctl", "start", "nebulalog-clickhouse.service"], timeout=900)
         self._wait(lambda: self.runner(["podman", "exec", "--user", "101:101", "nebulalog-clickhouse", "clickhouse-client", "--config-file", "/etc/nebulalog/clickhouse-client.xml", "--secure", "--port", "9440", "--query", "SELECT 1"]))
 
-    def _migrate(self):
+    def _migrate(self, *, initialize_retention=True):
         self.runner(["podman", "run", "--rm", "--name", "nebulalog-initial-migrate", "--network", "nebulalog", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--volume", str(self.tls / "trust-bundle.pem") + ":/etc/nebulalog/tls/trust-bundle.pem:ro,z", "--env-file", str(self.configuration / "runtime/api.env"), self.pins["NEBULALOG_IMAGE"], "migrate"], timeout=900)
-        if "migrations" not in self.state["completed"]:
+        if initialize_retention and "migrations" not in self.state["completed"]:
             sql = "UPDATE settings SET value=jsonb_set(value, '{global_days}', '" + str(self.setup["retention_days"]) + "'::jsonb) WHERE key='retention';"
             self.runner(["podman", "exec", "-i", "nebulalog-postgresql", "psql", "--no-psqlrc", "--set", "ON_ERROR_STOP=1", "--username", "postgres", "--dbname", "nebulalog"], input=sql.encode())
 
@@ -697,8 +707,11 @@ class Bootstrap:
         return {"schema": 1, "installation_id": self.setup["installation_id"], "state": "setup-complete" if final and all(checks.values()) else "runtime-ready" if all(checks.values()) else "verification-pending", "checks": checks, "https_url": "https://" + self.setup["hostname"], **fingerprints}
 
     def prepare(self, setup_path, secrets_path):
+        from .restore_runtime import refuse_normal_provision
+        refuse_normal_provision(self.paths)
         self.firstboot.gate()
         with locked(self.bootstrap / "runtime.lock"):
+            refuse_normal_provision(self.paths)
             self._load(setup_path, secrets_path)
             for name, operation in (("directories", self._directories), ("storage-maintenance", self._storage_maintenance), ("certificates", self._certificates), ("images", self._images), ("environment", self._environment), ("realm", self._realm), ("postgresql", self._postgres), ("migrations", self._migrate), ("identity", self._identity), ("lifecycle", self._lifecycle), ("edge", self._edge), ("installed-release", self._installed_release)):
                 self._stage(name, operation)
@@ -711,6 +724,10 @@ class Bootstrap:
         self.firstboot.gate()
         with locked(self.bootstrap / "runtime.lock"):
             self._load(setup_path)
+            if self.state.get("kind") == "configuration-restore":
+                from .restore_runtime import valid_restored_state
+                if not valid_restored_state(self.state, self.paths):
+                    raise Refused("Restored runtime activation evidence is incomplete")
             if not self.state.get("identity_initialized"):
                 raise Refused("Application identity has not been initialized")
             return self._evidence(final=True)

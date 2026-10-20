@@ -166,7 +166,7 @@ func (s *Store) UpdateEmergencyPolicy(ctx context.Context, actor string, expecte
 		return ErrEmergencyRevision
 	}
 	var pending bool
-	if err = tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM storage_emergency_actions WHERE completed_at IS NULL)").Scan(&pending); err != nil {
+	if err = tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM storage_emergency_actions WHERE completed_at IS NULL) OR EXISTS(SELECT 1 FROM retention_actions WHERE completed_at IS NULL)").Scan(&pending); err != nil {
 		return err
 	}
 	if pending {

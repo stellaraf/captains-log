@@ -14,6 +14,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from prepare_provenance import application_hash, publisher_inputs, sha, source_snapshot
 from build_application import open_source
+from nebulalog_manager.image_bundle import ApplicationSchema, RestoredAuthContract
 
 PREFIXES = ("appliance/bin/", "appliance/nebulalog_manager/", "appliance/adapters/bin/",
             "appliance/adapters/nebulalog_adapters/", "appliance/systemd/", "appliance/quadlet/",
@@ -62,7 +63,7 @@ def captured(provenance):
     manifest, descriptor = strict_json(source), strict_json(release)
     fields = {"schema", "product", "sequence", "schema_revision", "source_commit", "source_dirty",
               "source_snapshot_sha256", "bundle_manifest_sha256", "qualification_status", "publisher"}
-    if (not isinstance(descriptor, dict) or set(descriptor) != fields or type(descriptor.get("schema")) is not int
+    if (not isinstance(descriptor, dict) or not fields <= set(descriptor) or set(descriptor) - fields - {"restore_auth"} or type(descriptor.get("schema")) is not int
             or descriptor["schema"] != 1 or descriptor["product"] != "nebulalog"
             or type(descriptor["sequence"]) is not int or not 0 <= descriptor["sequence"] < 2**63
             or not isinstance(descriptor["schema_revision"], str) or not re.fullmatch(r"[1-9][0-9]{0,8}", descriptor["schema_revision"])
@@ -72,6 +73,12 @@ def captured(provenance):
                    for name in ("source_snapshot_sha256", "bundle_manifest_sha256"))
             or descriptor["source_snapshot_sha256"] != sha(source)):
         raise ValueError("Source manifest must match the existing pending initial-release provenance")
+    if descriptor["schema_revision"] == ApplicationSchema.HOST_CHALLENGE_REVISION:
+        raise ValueError("Schema 4 packaging awaits fresh initialization, restored authentication, and image qualification")
+    if "restore_auth" in descriptor:
+        RestoredAuthContract.factory_descriptor(descriptor["restore_auth"])
+        if descriptor["schema_revision"] != "3":
+            raise ValueError("Restored authentication factory inputs require fresh schema 3")
     if (not isinstance(manifest, dict) or set(manifest) != {"schema", "files"}
             or type(manifest["schema"]) is not int or manifest["schema"] != 1
             or not isinstance(manifest["files"], dict) or not 1 <= len(manifest["files"]) <= MAX_FILES):
@@ -83,6 +90,20 @@ def captured(provenance):
             raise ValueError("Unsafe source manifest entry")
     publisher_inputs.binding(descriptor["publisher"], manifest["files"])
     return manifest, descriptor, source, release
+
+
+def restore_auth_files(root, descriptor):
+    if "restore_auth" not in descriptor:
+        return {}
+    value = RestoredAuthContract.factory_descriptor(descriptor["restore_auth"])
+    result = {}
+    for name, expected in value["artifacts"].items():
+        relative = "restore-auth/" + name
+        raw = read_bounded(root, relative, RestoredAuthContract.MAX_RECEIPT)
+        if {"bytes": len(raw), "sha256": sha(raw)} != expected or PRIVATE_KEY.search(raw):
+            raise ValueError("Factory restored authentication evidence changed or contains private key material")
+        result[relative] = raw
+    return result
 
 
 def selected_files(manifest):
@@ -156,6 +177,7 @@ def verify(output: Path, *, _unpublished_record=None):
             or stat.S_IMODE(root_info.st_mode) != 0o700):
         raise ValueError("Staging root must remain a private directory owned by the invoking user")
     manifest, descriptor, source, release = captured(output)
+    auth_files = restore_auth_files(output, descriptor)
     selected = selected_files(manifest)
     record = (_unpublished_record if _unpublished_record is not None
               else strict_json(read_bounded(output, "staging-receipt.json", 4 * 1024**2)))
@@ -174,8 +196,8 @@ def verify(output: Path, *, _unpublished_record=None):
         raise ValueError("Staging receipt differs from its captured source and fixed path/mode contract")
     files, directories = inventory(output)
     metadata = METADATA - {"staging-receipt.json"} if _unpublished_record is not None else METADATA
-    expected_files = set(selected) | metadata
-    expected_dirs = {str(parent) for name in selected for parent in Path(name).parents if str(parent) != "."}
+    expected_files = set(selected) | metadata | set(auth_files)
+    expected_dirs = {str(parent) for name in selected for parent in Path(name).parents if str(parent) != "."} | {"restore-auth"}
     if files != expected_files or directories != expected_dirs:
         raise ValueError("Staged file/directory inventory changed or includes unlisted inputs")
     total = 0
@@ -190,6 +212,9 @@ def verify(output: Path, *, _unpublished_record=None):
     for name in metadata:
         if stat.S_IMODE((output / name).lstat().st_mode) != 0o400:
             raise ValueError("Staging metadata must remain read-only")
+    for name in auth_files:
+        if stat.S_IMODE((output / name).lstat().st_mode) != 0o400:
+            raise ValueError("Factory restored authentication evidence must remain read-only")
     if read_bounded(output, "frozen-sources.pkrvars.hcl", 65536) != varfile(variables(output, build_disk_id)):
         raise ValueError("Packer variable file differs from frozen paths")
     return {"status": "verified", **wanted}
@@ -201,6 +226,7 @@ def stage(root: Path, provenance: Path, output: Path):
     root, provenance = root.resolve(), provenance.resolve()
     output = output.parent.resolve(strict=True) / output.name
     manifest, descriptor, source, release = captured(provenance)
+    auth_files = restore_auth_files(provenance, descriptor)
     selected = selected_files(manifest)
     current, commit, dirty = source_snapshot(root)
     if current != manifest or commit != descriptor["source_commit"] or dirty != descriptor["source_dirty"]:
@@ -208,6 +234,9 @@ def stage(root: Path, provenance: Path, output: Path):
     # mkdir is exclusive: a partial/previous destination is never adopted/deleted.
     output.mkdir(mode=0o700)
     os.chmod(output, 0o700)
+    (output / "restore-auth").mkdir(mode=0o700)
+    for name, raw in auth_files.items():
+        write_new(output / name, raw, 0o400)
     total = 0
     for name, expected in sorted(selected.items()):
         raw = read_bounded(root, name, MAX_BYTES)

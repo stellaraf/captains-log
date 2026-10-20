@@ -12,6 +12,7 @@
   <tmp_path>/var/lib/clickhouse/tmp/</tmp_path>
   <user_files_path>/var/lib/clickhouse/user_files/</user_files_path>
   <format_schema_path>/var/lib/clickhouse/format_schemas/</format_schema_path>
+  <backups><allowed_path>/var/lib/clickhouse/backup-staging/</allowed_path></backups>
   <!-- Part metadata supports measured write-rate sizing; SQL query logging remains disabled. -->
   <part_log>
     <database>system</database><table>part_log</table>

@@ -20,6 +20,8 @@ import { HostStoragePlan } from "./HostStoragePlan";
 import { FreshHostObservation } from "./FreshHostObservation";
 import { SyslogTLSCertificate } from "./SyslogTLSCertificate";
 import { EmergencyStorage } from "./EmergencyStorage";
+import { RetentionPolicyForm } from "./RetentionPolicy";
+import type { RetentionPolicy } from "./RetentionPolicy";
 function useData<T>(path: string) {
   const [data, setData] = useState<T>();
   const [error, setError] = useState("");
@@ -429,20 +431,7 @@ function Firewalls({
 }
 function StoragePage({ user }: { user: User }) {
   const storage = useData<Storage>("/api/storage");
-  const retention = useData<{
-    global_days: number;
-    per_type: Record<string, number>;
-  }>("/api/retention");
-  const [policy, setPolicy] = useState<{
-    global_days: number;
-    per_type: Record<string, number>;
-  }>();
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
-  const [busy, setBusy] = useState(false);
-  useEffect(() => {
-    if (retention.data) setPolicy(retention.data);
-  }, [retention.data]);
+  const retention = useData<RetentionPolicy>("/api/retention");
   const data = storage.data;
   const utilization = data?.capacity_bytes
     ? (data.used_bytes / data.capacity_bytes) * 100
@@ -583,116 +572,10 @@ function StoragePage({ user }: { user: User }) {
       ) : null}
       <HostStoragePlan user={user} />
       <EmergencyStorage />
-      <section className="retention-section">
-        <div className="section-toolbar">
-          <div>
-            <h2>Retention policy</h2>
-            <p>
-              Changes apply to new arrivals. Existing events retain their
-              assigned expiry; background TTL merges reclaim expired data.
-            </p>
-          </div>
-        </div>
-        {retention.error && <ErrorNotice>{retention.error}</ErrorNotice>}
-        {policy && (
-          <form
-            onSubmit={async (e) => {
-              e.preventDefault();
-              setBusy(true);
-              setError("");
-              setNotice("");
-              try {
-                await api("/api/retention", json("PUT", policy));
-                await retention.load();
-                setNotice(
-                  "Retention policy saved. The new policy applies to future arrivals.",
-                );
-              } catch (err) {
-                setError((err as Error).message);
-              } finally {
-                setBusy(false);
-              }
-            }}
-          >
-            <fieldset disabled={user.role !== "ADMINISTRATOR" || busy}>
-              <div className="global-retention">
-                <label>
-                  Global retention
-                  <input
-                    aria-label="Global retention days"
-                    type="number"
-                    min="1"
-                    max="3650"
-                    required
-                    value={policy.global_days}
-                    onChange={(e) =>
-                      setPolicy({
-                        ...policy,
-                        global_days: Number(e.target.value),
-                      })
-                    }
-                  />
-                </label>
-                <span>days</span>
-                <div className="presets">
-                  {[30, 60, 90, 180, 365].map((days) => (
-                    <button
-                      type="button"
-                      key={days}
-                      className={policy.global_days === days ? "selected" : ""}
-                      onClick={() =>
-                        setPolicy({ ...policy, global_days: days })
-                      }
-                    >
-                      {days}d
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <div className="retention-grid">
-                {families
-                  .filter(([id]) => id !== "unified")
-                  .map(([id, label]) => (
-                    <label key={id}>
-                      <span>{label}</span>
-                      <div>
-                        <input
-                          type="number"
-                          min="1"
-                          max="3650"
-                          aria-label={`${label} retention days`}
-                          placeholder={String(policy.global_days)}
-                          value={policy.per_type[id] ?? ""}
-                          onChange={(e) => {
-                            const per_type = { ...policy.per_type };
-                            if (e.target.value === "") delete per_type[id];
-                            else per_type[id] = Number(e.target.value);
-                            setPolicy({ ...policy, per_type });
-                          }}
-                        />
-                        <span>days</span>
-                      </div>
-                    </label>
-                  ))}
-              </div>
-            </fieldset>
-            <p className="muted">
-              Leave a category blank to use the global policy.
-            </p>
-            {error && <ErrorNotice>{error}</ErrorNotice>}
-            {notice && (
-              <div role="status" className="notice success">
-                {notice}
-              </div>
-            )}
-            {user.role === "ADMINISTRATOR" && (
-              <button className="primary" disabled={busy}>
-                {busy ? "Saving…" : "Save retention policy"}
-              </button>
-            )}
-          </form>
-        )}
-      </section>
+      {retention.error && <ErrorNotice>{retention.error}</ErrorNotice>}
+      {retention.data && <RetentionPolicyForm value={retention.data} role={user.role}
+        onSave={async (request) => { await api("/api/retention", json("PUT", request)); await retention.load(); }} />}
+
     </>
   );
 }

@@ -41,7 +41,7 @@ POLICY = Path("/usr/share/nebulalog/aide/policy.conf")
 DEFAULT_CONFIG = Path("/etc/aide.conf")
 BINARY = Path("/usr/sbin/aide")
 DATA = Path("/var/lib/nebulalog")
-RUNTIME_STAGES = {"directories", "certificates", "images", "environment", "realm", "postgresql", "migrations", "identity", "lifecycle", "edge", "installed-release"}
+RUNTIME_STAGES = {"directories", "storage-maintenance", "certificates", "images", "environment", "realm", "postgresql", "migrations", "identity", "lifecycle", "edge", "installed-release"}
 FACTS = {"installation_id", "aide_version", "aide_package", "aide_binary_sha256", "policy_sha256",
          "default_config_sha256", "source_snapshot_sha256", "source_dirty", "installed_release_sha256", "runtime_ready_sha256", "runtime_configuration_sha256",
          "factory_kernel_manifest_sha256", "factory_kernel_inventory_sha256", "ordinary_boot_snapshot_sha256"}
@@ -136,6 +136,9 @@ def runtime_storage():
     device = DATA.stat().st_dev
     ready = strict_json(protected_bytes(Path("/etc/nebulalog/bootstrap/runtime-ready.json"), maximum=65536, private=True))
     state = strict_json(protected_bytes(DATA / "configuration/bootstrap/runtime-state.json", maximum=65536, private=True, device=device))
+    from .firstboot import Locations
+    from .restore_runtime import valid_restored_state
+    restored = valid_restored_state(state, Locations(data=DATA)) if isinstance(state, dict) and state.get("kind") == "configuration-restore" else False
     if (type(ready) is not dict or type(state) is not dict
             or type(ready.get("schema")) is not int or ready["schema"] != 1
             or type(state.get("schema")) is not int or state["schema"] != 1
@@ -145,7 +148,8 @@ def runtime_storage():
             or state.get("installation_id") != installation or state.get("identity_initialized") is not True
             or state.get("active_stage") is not None or type(state.get("completed")) is not list
             or any(type(stage) is not str for stage in state["completed"])
-            or len(state["completed"]) != len(RUNTIME_STAGES) or set(state["completed"]) != RUNTIME_STAGES):
+            or not restored and (len(state["completed"]) != len(RUNTIME_STAGES) or set(state["completed"]) != RUNTIME_STAGES)
+            or state.get("kind") == "configuration-restore" and not restored):
         raise Refused("aide_runtime_configuration_incomplete")
     return StorageIdentity(installation, DATA, device)
 

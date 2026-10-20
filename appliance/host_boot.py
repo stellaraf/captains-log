@@ -117,7 +117,7 @@ def factory():
     initial, source = decode(initial_raw), decode(source_raw)
     initial_fields = {"schema", "product", "sequence", "schema_revision", "source_commit", "source_dirty", "source_snapshot_sha256",
                       "bundle_manifest_sha256", "qualification_status", "publisher"}
-    if (not isinstance(initial, dict) or set(initial) != initial_fields or type(initial["schema"]) is not int or initial["schema"] != 1
+    if (not isinstance(initial, dict) or not initial_fields <= set(initial) or set(initial) - initial_fields - {"restore_auth"} or type(initial["schema"]) is not int or initial["schema"] != 1
             or initial["product"] != "nebulalog" or initial["qualification_status"] != "pending"
             or not isinstance(initial["schema_revision"], str) or not re.fullmatch(r"[1-9][0-9]{0,8}", initial["schema_revision"])
             or not isinstance(initial["source_commit"], str) or not re.fullmatch(r"[a-f0-9]{40}", initial["source_commit"])
@@ -129,6 +129,22 @@ def factory():
             or source.get("schema") != 1 or not isinstance(source.get("files"), dict) or not 1 <= len(source["files"]) <= 10000
             or not isinstance(record["fixed_files"], dict) or set(record["fixed_files"]) != set(FIXED)):
         raise Refused("Factory dispatch provenance changed")
+    if "restore_auth" in initial:
+        proof = initial["restore_auth"]
+        if (initial["schema_revision"] != "3" or not isinstance(proof, dict)
+                or set(proof) != {"schema", "contract", "version", "artifacts"}
+                or type(proof["schema"]) is not int or proof["schema"] != 1 or proof["contract"] != "restored-jwt-issued-at-v1"
+                or not isinstance(proof["version"], str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9][A-Za-z0-9.-]{0,100})?", proof["version"])
+                or not isinstance(proof["artifacts"], dict) or set(proof["artifacts"]) != {"application-build.json", "restore-auth-behavior.json"}):
+            raise Refused("Factory restored authentication descriptor is invalid")
+        for name, expected in proof["artifacts"].items():
+            if (not isinstance(expected, dict) or set(expected) != {"bytes", "sha256"}
+                    or type(expected["bytes"]) is not int or not 0 < expected["bytes"] <= 8 * 1024**2
+                    or not digest(expected["sha256"])):
+                raise Refused("Factory restored authentication artifact identity is invalid")
+            raw = read(SHARE / "restore-auth" / name, 8 * 1024**2)
+            if len(raw) != expected["bytes"] or sha(raw) != expected["sha256"]:
+                raise Refused("Factory restored authentication evidence changed")
     paths, sources = set(), {}
     for item in record["catalog"]:
         if (not isinstance(item, dict) or set(item) != {"source", "path", "mode"}

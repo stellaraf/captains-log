@@ -286,7 +286,15 @@ class TransactionTests(unittest.TestCase):
         atomic_json(state/"current.json",current)
         # Temporary filesystem fixtures retain real enrolled-key byte binding;
         # only appliance-root ownership/ancestry is replaced by test ownership.
-        for mocker in (patch("nebulalog_manager.update_enrollment._tree"), patch("nebulalog_manager.update_enrollment.ROOT_UID",os.getuid())):
+        def fixture_file(path):
+            info = path.lstat()
+            if (not path.is_relative_to(self.path) or path.is_symlink() or not path.is_file()
+                    or info.st_uid != os.getuid() or info.st_mode & 0o022):
+                raise Refused("Hook evidence is outside the protected test fixture")
+            return path
+        for mocker in (patch("nebulalog_manager.update_enrollment._tree"), patch("nebulalog_manager.update_enrollment.ROOT_UID",os.getuid()),
+                       patch("nebulalog_manager.host_payload._OWNER_UID", os.getuid()),
+                       patch("nebulalog_manager.host_dispatch.trusted_file", side_effect=fixture_file)):
             mocker.start();self.addCleanup(mocker.stop)
         atomic_json(state/"initial-enrollment.json",{"schema":1,"state":"enrolled","installation_id":"458a08e3-ef3b-4cd1-83e5-b402a2c1e913","current":current})
         atomic_json(state/"publisher-trust.json",{"schema":1,"state":"enrolled","installation_id":"458a08e3-ef3b-4cd1-83e5-b402a2c1e913","algorithm":"RSA-PSS-SHA256","rsa_bits":3072,

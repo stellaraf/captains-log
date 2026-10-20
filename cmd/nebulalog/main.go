@@ -62,8 +62,8 @@ func run() error {
 		fmt.Println(version)
 		return nil
 	}
-	if role != "all" && role != "serve" && role != "ingest" && role != "migrate" {
-		return fmt.Errorf("usage: nebulalog [all|serve|ingest|migrate|version]; host operations use appliance/nebulalog")
+	if role != "all" && role != "serve" && role != "ingest" && role != "migrate" && role != "migrate-retention" {
+		return fmt.Errorf("usage: nebulalog [all|serve|ingest|migrate|migrate-retention|version]; host operations use appliance/nebulalog")
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -78,14 +78,30 @@ func run() error {
 	defer pg.Close()
 	// The collector can durably spool while metadata or ClickHouse is offline.
 	// Only the explicit migration command requires immediate database readiness.
-	if role == "migrate" {
+	if role == "migrate" || role == "migrate-retention" {
 		if e = pg.Ping(ctx); e != nil {
 			return fmt.Errorf("PostgreSQL unavailable")
 		}
 	}
 	ch := store.NewClickHouse(env("CH_URL", "http://127.0.0.1:28123"), env("CH_USER", "nebulalog"), env("CH_PASSWORD", ""))
 	st := &store.Store{CH: ch, PG: pg}
-	if role == "migrate" {
+	storagePath := env("STORAGE_MAINTENANCE_PATH", "")
+	required, _ := strconv.ParseBool(env("REQUIRE_FIPS", "false"))
+	if role != "migrate" {
+		if e = store.ValidateStorageMaintenancePath(storagePath, required); e != nil {
+			return e
+		}
+	}
+	st.StorageMaintenancePath = storagePath
+	if role == "migrate-retention" {
+		attempt, stop := context.WithTimeout(ctx, 90*time.Second)
+		defer stop()
+		ctx = attempt
+		if e = st.CheckRetentionMigrationHold(ctx); e != nil {
+			return e
+		}
+	}
+	if role == "migrate" || role == "migrate-retention" {
 		b, e := os.ReadFile(env("PG_MIGRATION", "migrations/postgres.sql"))
 		if e != nil {
 			return e
@@ -104,15 +120,15 @@ func run() error {
 				}
 			}
 		}
-		slog.Info("database migrations applied")
+		if role == "migrate-retention" {
+			return st.MigrateRetention(ctx)
+		}
+		if e = st.InitializeRetention(ctx); e != nil {
+			return e
+		}
+		slog.Info("database migrations applied; normal retention identity verified")
 		return nil
 	}
-	storagePath := env("STORAGE_MAINTENANCE_PATH", "")
-	required, _ := strconv.ParseBool(env("REQUIRE_FIPS", "false"))
-	if e = store.ValidateStorageMaintenancePath(storagePath, required); e != nil {
-		return e
-	}
-	st.StorageMaintenancePath = storagePath
 	storageContext, stopStorage := context.WithCancel(ctx)
 	storageDone := make(chan struct{})
 	go func() { defer close(storageDone); st.RunEmergencyRetention(storageContext) }()
@@ -177,6 +193,9 @@ func run() error {
 	})
 	if e != nil {
 		return e
+	}
+	if err := auth.SetTokenNotBefore(a, env("OIDC_TOKEN_NOT_BEFORE", "")); err != nil {
+		return err
 	}
 	app := &api.Server{Store: st, Auth: a, DNS: dns.New(ctx, 4, env("DNS_RESOLVER", "")), Collector: collector, Config: api.Config{AuthURL: env("OIDC_URL", "http://127.0.0.1:18089"), Realm: env("OIDC_REALM", "nebulalog"), ClientID: clientID, WebDir: env("WEB_DIR", "web/dist"), ExportDir: env("EXPORT_DIR", ".local/exports"), Version: version, ExportMaxBytes: 512 << 20}}
 	app.Config.CollectorStatusPath = env("COLLECTOR_STATUS_PATH", "")

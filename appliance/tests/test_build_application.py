@@ -36,12 +36,15 @@ class ContextTests(unittest.TestCase):
         self.snapshot = patch.object(builder, "source_snapshot", return_value=(self.manifest, "a" * 40, True))
         self.snapshot.start()
         self.addCleanup(self.snapshot.stop)
-        self.commands, self.context_members = [], []
+        self.commands, self.context_members, self.stages = [], [], []
         self.image_id = "sha256:" + "b" * 64
 
     def runner(self, argv, **kwargs):
         self.commands.append(argv)
         if argv[:2] == ["docker", "build"]:
+            stage = Path(argv[argv.index("--iidfile") + 1]).parent
+            self.assertEqual(stage.parent, self.receipt.parent)
+            self.stages.append(stage)
             self.assertEqual(argv[-1], "-")
             self.assertEqual(argv[argv.index("--file") + 1], builder.CONTAINERFILE)
             stream = kwargs["stdin"]
@@ -73,6 +76,29 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(len(self.commands), 2)
         self.assertNotIn("docs/host-only.md", self.context_members)
         self.assertEqual(json.loads(self.receipt.read_text()), result)
+        self.assertTrue(self.stages)
+        self.assertTrue(all(not stage.exists() for stage in self.stages))
+
+    def test_failed_build_removes_only_its_owned_context(self):
+        previous = self.receipt.parent / "nebulalog-application-build-previous"
+        previous.mkdir()
+        retained = previous / "keep.txt"
+        retained.write_text("previous run evidence")
+        stages = []
+
+        def failed(argv, **kwargs):
+            stage = Path(argv[argv.index("--iidfile") + 1]).parent
+            self.assertEqual(stage.parent, self.receipt.parent)
+            self.assertTrue((stage / "context.tar").is_file())
+            stages.append(stage)
+            raise subprocess.CalledProcessError(1, argv)
+
+        with self.assertRaises(subprocess.CalledProcessError):
+            builder.build(self.source, "nebulalog/appliance-app:test", self.receipt, runner=failed)
+        self.assertEqual(len(stages), 1)
+        self.assertFalse(stages[0].exists())
+        self.assertEqual(retained.read_text(), "previous run evidence")
+        self.assertFalse(self.receipt.exists())
 
     def test_archive_is_deterministic_despite_live_modes_and_mtimes(self):
         first, second = self.root / "first.tar", self.root / "second.tar"

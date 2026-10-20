@@ -5,10 +5,12 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -17,6 +19,76 @@ from nebulalog_manager.common import Refused, atomic_json
 from test_host_payload import builder, fixture_source, fixture_tree
 
 APPLIANCE = Path(__file__).resolve().parents[1]
+
+
+def bounded_fixture(command, *, env, startup_timeout=45, operation_timeout=30):
+    """Separate test interpreter/import readiness from the actual fixed operation.
+
+    The child writes one R byte immediately before entering the fixed main.
+    These are fixture watchdogs; no production timeout or trust guard changes.
+    """
+    read_fd, write_fd = os.pipe()
+    started = time.monotonic()
+    process = None
+    phase = "startup"
+    try:
+        process = subprocess.Popen([*command, str(write_fd)], env=env, pass_fds=(write_fd,),
+                                   text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        os.close(write_fd); write_fd = None
+        if not select.select([read_fd], [], [], startup_timeout)[0]:
+            raise subprocess.TimeoutExpired(command, startup_timeout)
+        if os.read(read_fd, 1) != b"R":
+            out, err = process.communicate(timeout=operation_timeout)
+            raise AssertionError("Fixed fixture failed before readiness: " + err + out)
+        ready = time.monotonic()
+        phase = "fixed operation"
+        out, err = process.communicate(timeout=operation_timeout)
+        result = subprocess.CompletedProcess(command, process.returncode, out, err)
+        result.fixture_timing = {"startup_seconds": ready-started,
+                                 "operation_seconds": time.monotonic()-ready}
+        return result
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        out, err = process.communicate()
+        raise AssertionError(f"Fixed fixture {phase} exceeded its {exc.timeout}s bound; stdout={out!r}; stderr={err!r}") from exc
+    finally:
+        os.close(read_fd)
+        if write_fd is not None: os.close(write_fd)
+        if process is not None:
+            if process.poll() is None:
+                process.kill(); process.communicate()
+            for stream in (process.stdout, process.stderr):
+                if stream is not None: stream.close()
+
+
+class FixtureWatchdogTests(unittest.TestCase):
+    def test_startup_and_operation_are_distinguished_and_reaped(self):
+        # A sleeping child could finish while a loaded host deschedules this
+        # parent. Block until killed so the expected timeout has no such race.
+        for phase, code in (("startup", "import signal;signal.pause()"),
+                            ("fixed operation", "import os,sys,signal;os.write(int(sys.argv[1]),b'R');signal.pause()")):
+            with self.subTest(phase=phase):
+                children = []
+                original = subprocess.Popen
+                def spawn(*args, **kwargs):
+                    child = original(*args, **kwargs)
+                    children.append(child)
+                    return child
+                with patch.object(subprocess, "Popen", side_effect=spawn), self.assertRaisesRegex(AssertionError, phase):
+                    bounded_fixture([sys.executable, "-I", "-B", "-c", code], env={"PATH":"/usr/bin:/bin"},
+                                    startup_timeout=45 if phase=="fixed operation" else .05, operation_timeout=.05)
+                self.assertEqual(len(children), 1)
+                child = children[0]
+                self.assertIsNotNone(child.poll())
+                self.assertTrue(child.stdout.closed and child.stderr.closed)
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(child.pid, os.WNOHANG)
+
+    def test_ready_operation_preserves_output_and_measures_both_stages(self):
+        result = bounded_fixture([sys.executable, "-I", "-B", "-c",
+            "import os,sys;os.write(int(sys.argv[1]),b'R');print('done')"], env={"PATH":"/usr/bin:/bin"})
+        self.assertEqual((result.returncode,result.stdout),(0,"done\n"))
+        self.assertEqual(set(result.fixture_timing),{"startup_seconds","operation_seconds"})
 
 
 def load(name):
@@ -33,6 +105,7 @@ boot = load("host_boot")
 class FactoryHostTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
+        self.fixture_invocations = []
         self.root = Path(temporary.name).resolve()
         def cleanup():
             for current, directories, files in os.walk(self.root):
@@ -93,6 +166,27 @@ class FactoryHostTests(unittest.TestCase):
     def enroll(self):
         return factory.enroll(self.source / "appliance", self.source / "deploy/keycloak/realm.json", self.manager)
 
+    def test_fixed_boot_verifier_binds_optional_factory_auth_receipts(self):
+        from nebulalog_manager.image_bundle import RestoredAuthContract
+        (self.share / "restore-auth").mkdir(mode=0o700)
+        artifacts = {}
+        for name in RestoredAuthContract.EVIDENCE:
+            raw = b'{"fixed_boot_transfer_fixture":true}\n'
+            path = self.share / "restore-auth" / name
+            path.write_bytes(raw); path.chmod(0o600)
+            artifacts[name] = {"bytes": len(raw), "sha256": payload.digest(raw)}
+        self.descriptor.update(schema_revision="3", restore_auth={"schema": 1, "contract": RestoredAuthContract.CONTRACT,
+            "version": "1.0.0", "artifacts": artifacts})
+        atomic_json(self.share / "initial-release.json", self.descriptor)
+        self.manager.verify_build_inputs.return_value = {"descriptor": self.descriptor,
+            "descriptor_sha256": payload.digest((self.share / "initial-release.json").read_bytes())}
+        self.enroll()
+        _, descriptor = boot.factory()
+        self.assertEqual(descriptor["restore_auth"], self.descriptor["restore_auth"])
+        path.write_bytes(raw + b" ")
+        with self.assertRaisesRegex(boot.Refused, "authentication evidence changed"):
+            boot.factory()
+
     def accepted(self, host):
         current = {"sequence": 0, "version": "0.1.0", "components": {"host": host}}
         record = {"current": current, "initial_release_sha256": payload.digest((self.share / "initial-release.json").read_bytes())}
@@ -152,10 +246,13 @@ def protected(path):
   s=p.lstat()
   if not stat.S_ISDIR(s.st_mode) or s.st_uid!=os.getuid() or s.st_mode&0o022: raise m.Refused('fixture ancestry')
 m.tree=protected
+os.write(int(sys.argv[4]),b'R');os.close(int(sys.argv[4]))
 raise SystemExit(m.main([sys.argv[3]]))
 """
-        return subprocess.run([sys.executable, "-I", "-B", "-c", setup, str(APPLIANCE / "host_boot.py"), str(self.root), command],
-                              text=True, capture_output=True, timeout=15, env={"PATH": "/usr/bin:/bin", "PYTHONPATH": "/untrusted/ignored"})
+        result = bounded_fixture([sys.executable, "-I", "-B", "-c", setup, str(APPLIANCE / "host_boot.py"), str(self.root), command],
+                                 env={"PATH": "/usr/bin:/bin", "PYTHONPATH": "/untrusted/ignored"})
+        self.fixture_invocations.append({"command":command,**result.fixture_timing})
+        return result
 
     def test_factory_matches_canonical_builder_and_verifies_without_runtime(self):
         result = self.enroll()

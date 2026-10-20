@@ -60,14 +60,32 @@ def main(argv=None) -> int:
         p.add_argument("--bundle", type=Path, required=True)
         p.add_argument("--public-key", type=Path, default=Path("/etc/nebulalog/release-public.pem"))
     p = commands.add_parser("backup")
-    p.add_argument("--configuration", type=Path, default=Path("/var/lib/nebulalog/configuration"))
-    p.add_argument("--recipient-certificate", type=Path, required=True)
-    p.add_argument("--output", type=Path, required=True)
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--include-logs", action="store_true", help="Capture a complete configuration and native log recovery set with explicit capacity/time budgets")
+    mode.add_argument("--resume", metavar="UUID", help="Resume an existing full-backup transaction using retained inputs")
+    mode.add_argument("--status", metavar="UUID", help="Read retained full-backup progress without starting or resuming it")
+    mode.add_argument("--retire", metavar="UUID", help="Retire a settled unsuccessful full backup while preserving all recovery evidence")
+    p.add_argument("--configuration", type=Path)
+    p.add_argument("--recipient-certificate", type=Path)
+    p.add_argument("--output", type=Path)
+    for name in ("maximum-archive-bytes", "growth-reserve-bytes", "minimum-free-bytes", "deadline-seconds"):
+        p.add_argument("--" + name, type=int)
     p = commands.add_parser("restore")
-    p.add_argument("--backup", type=Path, required=True)
-    p.add_argument("--private-key", type=Path, required=True)
-    p.add_argument("--certificate", type=Path, required=True)
-    p.add_argument("--destination", type=Path, required=True)
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--apply-fresh", action="store_true", help="Recover a compatible fresh appliance after host/storage enrollment and before runtime provisioning")
+    mode.add_argument("--prepare-fresh", action="store_true", help="Authenticate and review local recovery inputs without changing the runtime")
+    mode.add_argument("--apply-plan", metavar="UUID", help="Apply an exact unexpired authenticated restore review")
+    mode.add_argument("--resume", metavar="UUID", help="Resume the retained recovery transaction without reapplying an uncertain database restore")
+    mode.add_argument("--status", action="store_true", help="Show redacted retained recovery progress without applying or resuming it")
+    p.add_argument("--backup", type=Path)
+    p.add_argument("--plan-digest", help="Exact review digest returned by --prepare-fresh; requires --apply-plan")
+    p.add_argument("--private-key", type=Path)
+    p.add_argument("--certificate", type=Path)
+    p.add_argument("--media", type=Path, help="Explicit /dev/srN configuration recovery ISO; requires --apply-fresh and an interactive protected passphrase prompt")
+    p.add_argument("--log-recovery-set", type=Path, help="Protected local native-log recovery set matching the configuration backup")
+    p.add_argument("--log-deadline-seconds", type=int)
+    p.add_argument("--log-minimum-free-bytes", type=int)
+    p.add_argument("--destination", type=Path, help="New staging directory for validation-only restore")
     args = parser.parse_args(argv)
     try:
         if args.command == "setup":
@@ -128,9 +146,79 @@ def main(argv=None) -> int:
             else:
                 result = manager.install(args.manifest, args.signature, args.bundle, args.public_key)
         elif args.command == "backup":
-            result = backup.create_backup(args.configuration, args.output, args.recipient_certificate)
+            budgets = {name: getattr(args, name) for name in ("maximum_archive_bytes", "growth_reserve_bytes", "minimum_free_bytes", "deadline_seconds")}
+            if args.resume is not None or args.status is not None or args.retire is not None:
+                if (any(value is not None for value in budgets.values())
+                        or any(value is not None for value in (args.configuration, args.output, args.recipient_certificate))):
+                    raise Refused("Full-backup status/resume/retire uses retained inputs and rejects every input or budget override")
+                from .recovery_set import FullBackupManager
+                manager = FullBackupManager()
+                if args.retire is not None:
+                    result = manager.retire(args.retire)
+                elif args.resume is not None:
+                    result = manager.resume(args.resume)
+                else:
+                    result = manager.status(args.status)
+            else:
+                configuration = args.configuration or Path("/var/lib/nebulalog/configuration")
+                if configuration != Path("/var/lib/nebulalog/configuration"):
+                    raise Refused("Backup requires the canonical appliance configuration directory")
+                if not args.output or not args.recipient_certificate:
+                    raise Refused("A new backup requires --output and --recipient-certificate")
+                if args.include_logs:
+                    if any(value is None for value in budgets.values()):
+                        raise Refused("Full backup requires --maximum-archive-bytes, --growth-reserve-bytes, --minimum-free-bytes and --deadline-seconds")
+                    from .recovery_set import FullBackupManager
+                    result = FullBackupManager().create(args.output, args.recipient_certificate, **budgets)
+                else:
+                    if any(value is not None for value in budgets.values()):
+                        raise Refused("Capacity/time budget flags require --include-logs")
+                    result = backup.create_backup(configuration, args.output, args.recipient_certificate)
         else:
-            result = backup.restore_backup(args.backup, args.private_key, args.certificate, args.destination)
+            log_options = {"log_recovery_set": args.log_recovery_set,
+                           "log_restore_deadline_seconds": args.log_deadline_seconds,
+                           "log_restore_minimum_free_bytes": args.log_minimum_free_bytes}
+            with_logs = any(value is not None for value in log_options.values())
+            if args.plan_digest and not args.apply_plan:
+                raise Refused("A review digest requires --apply-plan")
+            if with_logs and (not (args.apply_fresh or args.prepare_fresh) or args.media or any(value is None for value in log_options.values())):
+                raise Refused("Log recovery requires all three log-set/deadline/free-space options with --apply-fresh local files; media, status, resume and validation-only do not accept them")
+            if args.apply_plan:
+                if not args.plan_digest or any((args.backup, args.private_key, args.certificate, args.destination, args.media)):
+                    raise Refused("Apply-plan requires its exact digest and no input or destination overrides")
+                from .configuration_restore import ConfigurationRestore
+                result = ConfigurationRestore().apply_prepared(args.apply_plan, args.plan_digest)
+            elif args.status:
+                if any((args.backup, args.private_key, args.certificate, args.destination, args.media)):
+                    raise Refused("Recovery status does not accept input or destination overrides")
+                from .configuration_restore import ConfigurationRestore
+                result = ConfigurationRestore().status()
+            elif args.resume:
+                if any((args.backup, args.private_key, args.certificate, args.destination, args.media)):
+                    raise Refused("Resume uses its retained inputs; backup/key/certificate/destination overrides are not accepted")
+                from .configuration_restore import ConfigurationRestore
+                result = ConfigurationRestore().resume(args.resume)
+            elif args.media:
+                if not args.apply_fresh or any((args.backup, args.private_key, args.certificate, args.destination)):
+                    raise Refused("Recovery media requires --apply-fresh and does not accept file or destination overrides")
+                from .configuration_restore import ConfigurationRestore
+                from .recovery_media import restore_from_media
+                result = restore_from_media(ConfigurationRestore(), args.media,
+                                            write=lambda message: print(message, file=sys.stderr))
+            else:
+                if not all((args.backup, args.private_key, args.certificate)):
+                    raise Refused("Restore requires --backup, --private-key and --certificate")
+                if args.apply_fresh or args.prepare_fresh:
+                    if args.destination:
+                        raise Refused("Fresh restore uses managed encrypted staging; --destination is only for validation")
+                    from .configuration_restore import ConfigurationRestore
+                    recovery = ConfigurationRestore()
+                    action = recovery.prepare if args.prepare_fresh else recovery.start
+                    result = action(args.backup, args.private_key, args.certificate, **(log_options if with_logs else {}))
+                else:
+                    if not args.destination:
+                        raise Refused("Validation-only restore requires a new --destination, or select --apply-fresh")
+                    result = backup.restore_backup(args.backup, args.private_key, args.certificate, args.destination)
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     except (Refused, OSError, ValueError, KeyError) as exc:

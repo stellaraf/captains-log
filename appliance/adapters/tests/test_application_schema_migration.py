@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import unittest
 import uuid
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from nebulalog_adapters import lifecycle
 from nebulalog_manager.image_bundle import ApplicationSchema
@@ -22,10 +22,116 @@ class FixedSchemaSQLTests(unittest.TestCase):
     def test_exact_source_bytes_and_tamper_refusal(self):
         old, suffix, stepup = ApplicationSchema.reviewed_sql()
         root = Path(__file__).resolve().parents[3]
-        self.assertEqual((old + suffix).encode(), (root / 'migrations/postgres.sql').read_bytes())
+        self.assertEqual(hashlib.sha256((old + suffix).encode()).hexdigest(), ApplicationSchema.SCHEMAS['2']['migrations/postgres.sql'])
+        retention = ApplicationSchema.reviewed_retention_sql()
+        self.assertEqual((old + suffix + retention).encode(), (root / 'migrations/postgres.sql').read_bytes())
         self.assertEqual(stepup.encode(), (root / 'migrations/host_stepup.sql').read_bytes())
+        self.assertEqual(ApplicationSchema.reviewed_host_stepup_v2_sql().encode(),
+                         (root / 'migrations/host_stepup_v2.sql').read_bytes())
         with patch.object(ApplicationSchema, 'ADDITIVE_POSTGRES_SQL', suffix + '\n'):
             with self.assertRaises(Refused): ApplicationSchema.reviewed_sql()
+        with patch.object(ApplicationSchema, 'RETENTION_POSTGRES_SQL', retention + '\n'):
+            with self.assertRaises(Refused): ApplicationSchema.reviewed_retention_sql()
+
+    def test_schema_four_query_reconstructs_fixed_catalog_and_keeps_retention_fences(self):
+        manager = object.__new__(lifecycle.Lifecycle)
+        context = {'owner': 'nebulalog', 'operation': 'a' * 64}
+        query = manager._schema_query(context, catalog_only='4')
+        for sql in (*ApplicationSchema.reviewed_sql(), ApplicationSchema.reviewed_retention_sql(),
+                    ApplicationSchema.reviewed_host_stepup_v2_sql()):
+            self.assertIn(manager._schema_literal(sql), query)
+        self.assertIn("to_regclass('public.host_stepup_pending_v2') IS NULL", query)
+        self.assertIn("IF '4' IN ('3','4') AND profile<>'host-stepup'", query)
+        self.assertIn("('4'='4' AND actual IS DISTINCT FROM challenge_catalog)", query)
+        self.assertIn('FROM public.retention_actions WHERE completed_at IS NULL', query)
+        self.assertIn('FROM public.storage_emergency_actions WHERE completed_at IS NULL', query)
+        self.assertIn('FROM public.storage_emergency_inserts', query)
+        self.assertIn("IF revision IN ('3','4') THEN", query)
+        self.assertIn('IF false THEN', query)
+
+    def test_older_catalog_queries_never_execute_v2_ddl(self):
+        manager = object.__new__(lifecycle.Lifecycle)
+        v2 = manager._schema_literal(ApplicationSchema.reviewed_host_stepup_v2_sql())
+        for revision in ('1', '2', '3'):
+            with self.subTest(revision=revision):
+                query = manager._schema_query({'owner': 'nebulalog', 'operation': 'a' * 64}, catalog_only=revision)
+                self.assertNotIn(v2, query)
+                self.assertIn("revision := '" + revision + "'", query)
+
+    def test_catalog_requests_cannot_enable_migration(self):
+        manager = object.__new__(lifecycle.Lifecycle)
+        context = {'owner': 'nebulalog', 'operation': 'a' * 64}
+        for revision in ('1', '2', '3', '4'):
+            with self.subTest(revision=revision), self.assertRaisesRegex(Refused, 'catalog-only'):
+                manager._schema_query(context, catalog_only=revision, migrate=True)
+        with self.assertRaisesRegex(Refused, 'catalog-only'):
+            manager._schema_query(context, catalog_only='5')
+
+
+class FactoryCatalogSourceTests(unittest.TestCase):
+    """Pure catalog-result validation; no PostgreSQL or Podman execution."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.stage = self.root / 'manager/updates/releases/factory-four'
+        self.stage.mkdir(parents=True)
+        self.manager = lifecycle.Lifecycle({'schema_revision': '4'},
+            Mock(side_effect=AssertionError('No external command in source fixture')),
+            state=self.root / 'manager/updates', data=self.root, guard=lambda: None)
+        self.manager._schema_hold = Mock()
+        self.manager._schema_psql = Mock()
+        self.manager._retention_table = Mock(return_value={'table_uuid': 'synthetic-readback'})
+        self.observed = {'revision': '4', 'catalog': {'synthetic': True}, 'marker': None,
+                         'profile': 'host-stepup-v2', 'markers': []}
+
+    def observe(self):
+        self.manager._schema_psql.return_value = json.dumps(self.observed)
+        return self.manager.application_schema_catalog(self.stage, self.observed['revision'])
+
+    def test_exact_four_profile_requires_held_retention_readback(self):
+        result = self.observe()
+        operation = hashlib.sha256(str(self.stage).encode()).hexdigest()
+        self.manager._schema_hold.assert_called_once_with(self.stage, {'operation': operation, 'owner': 'nebulalog'})
+        self.manager._retention_table.assert_called_once_with(self.stage)
+        self.assertEqual(result['schema_revision'], '4')
+        self.assertEqual(result['schema_sha256'], ApplicationSchema.schema_digest('4'))
+        self.assertEqual(result['profile'], 'host-stepup-v2')
+        self.assertEqual(result['retention'], self.manager._retention_table.return_value)
+        self.assertEqual(result['markers'], [])
+        self.assertFalse((self.root / 'manager/application-schema.json').exists())
+
+    def test_four_refuses_base_or_legacy_stepup_profile(self):
+        for profile in ('base', 'host-stepup'):
+            self.observed['profile'] = profile
+            with self.subTest(profile=profile), self.assertRaisesRegex(Refused, 'catalog observation'):
+                self.observe()
+        self.manager._retention_table.assert_not_called()
+
+    def test_three_does_not_adopt_v2_profile(self):
+        self.observed['revision'] = '3'
+        with self.assertRaisesRegex(Refused, 'catalog observation'):
+            self.observe()
+        self.observed['profile'] = 'host-stepup'
+        self.assertEqual(self.observe()['schema_revision'], '3')
+
+    def test_four_refuses_unowned_migration_marker(self):
+        self.observed['markers'] = [{'key': 'application_schema_migration:' + 'b' * 64, 'value': {'schema': 1}}]
+        with self.assertRaisesRegex(Refused, 'unowned migration'):
+            self.observe()
+        self.manager._retention_table.assert_not_called()
+
+    def test_four_cannot_pass_without_delivery_hold_or_retention_identity(self):
+        self.manager._schema_hold.side_effect = Refused('delivery hold differs')
+        with self.assertRaisesRegex(Refused, 'delivery hold'):
+            self.observe()
+        self.manager._schema_psql.assert_not_called()
+        self.manager._schema_hold.side_effect = None
+        self.manager._retention_table.side_effect = Refused('retention UUID changed')
+        with self.assertRaisesRegex(Refused, 'retention UUID'):
+            self.observe()
+        self.assertFalse((self.root / 'manager/application-schema.json').exists())
 
 
 @unittest.skipUnless(os.environ.get('CAPTAINSLOG_GATE_TEST_CONTAINER'), 'isolated PostgreSQL fixture not selected')
@@ -335,6 +441,121 @@ class ApplicationSchemaPostgresTests(unittest.TestCase):
         self.assertEqual(new['schema_revision'], '2'); self.assertEqual(new['markers'], [])
         self.assertFalse((self.stage / 'adapter-application-schema.json').exists())
         with self.assertRaises(Refused): self.migrate()
+        self.assertEqual(self.dispatched, 0)
+
+    def fresh_three(self):
+        self.psql(ApplicationSchema.reviewed_sql()[1] + ApplicationSchema.reviewed_retention_sql() + ApplicationSchema.reviewed_sql()[2])
+        self.table_uuid = 'cfafbf54-552a-40ad-aa6b-2ea96e5f4460'
+        self.psql("UPDATE settings SET value='" + json.dumps({'schema': 1, 'mode': 'partition', 'table_uuid': self.table_uuid}) + "' WHERE key='retention_engine'")
+        self.manager.config['schema_revision'] = '3'
+        self.manager.ch = lambda *args, **kwargs: json.dumps({'uuid': self.table_uuid, 'engine': 'MergeTree',
+            'partition_key': '(log_type, toDate(ingested_at))', 'create_table_query': 'CREATE TABLE nebulalog.events ENGINE = MergeTree PARTITION BY (log_type, toDate(ingested_at))'})
+
+    def test_real_fresh_three_catalog_preserves_factory_authority_and_never_migrates(self):
+        self.fresh_three()
+        result = self.manager.application_schema_check(self.stage)
+        self.assertEqual(result['schema_revision'], '3')
+        self.assertEqual(result['markers'], [])
+        self.assertEqual(result['retention']['table_uuid'], self.table_uuid)
+        self.assertEqual(self.manager.application_schema_current(), {'revision': '3', 'state': None})
+        self.assertEqual(self.psql("SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'captainslog_probe_%'"), '0')
+        with self.assertRaises(Refused): self.migrate()
+        self.assertEqual(self.dispatched, 0)
+
+    def test_real_three_pending_retention_or_migration_refuses_catalog(self):
+        self.fresh_three()
+        self.psql("INSERT INTO retention_actions(id,state,plan) VALUES(gen_random_uuid(),'uncertain','{}')")
+        with self.assertRaisesRegex(Refused, 'Unsettled retention'): self.manager.application_schema_catalog(self.stage, '3')
+        self.psql("DELETE FROM retention_actions; UPDATE settings SET value=jsonb_set(value,'{mode}','\"migrating\"') WHERE key='retention_engine'")
+        with self.assertRaisesRegex(Refused, 'Unsettled retention'): self.manager.application_schema_catalog(self.stage, '3')
+        self.assertEqual(self.dispatched, 0)
+
+    def fresh_four(self):
+        # Fixture construction is explicit. Production catalog observation must
+        # never add v2 to an existing schema-three installation.
+        self.fresh_three()
+        self.psql(ApplicationSchema.reviewed_host_stepup_v2_sql())
+        self.manager.config['schema_revision'] = '4'
+
+    def test_real_four_catalog_preserves_both_pending_tables_and_factory_authority(self):
+        self.fresh_four()
+        self.psql("INSERT INTO firewalls(serial,notes) VALUES('four-sentinel','preserve me')")
+        identities = self.psql("SELECT jsonb_build_object('legacy','public.host_stepup_pending'::regclass::oid,'v2','public.host_stepup_pending_v2'::regclass::oid)")
+        gate = self.gate.read_bytes()
+        first = self.manager.application_schema_check(self.stage)
+        again = self.manager.application_schema_check(self.stage)
+        self.assertEqual(first, again)
+        self.assertEqual(first['schema_revision'], '4')
+        self.assertEqual(first['schema_sha256'], ApplicationSchema.schema_digest('4'))
+        self.assertEqual(first['profile'], 'host-stepup-v2')
+        self.assertEqual(first['retention']['table_uuid'], self.table_uuid)
+        self.assertEqual(first['markers'], [])
+        self.assertEqual(self.manager.application_schema_current(), {'revision': '4', 'state': None})
+        self.assertEqual(self.psql("SELECT jsonb_build_object('legacy','public.host_stepup_pending'::regclass::oid,'v2','public.host_stepup_pending_v2'::regclass::oid)"), identities)
+        self.assertEqual(self.psql("SELECT notes FROM firewalls WHERE serial='four-sentinel'"), 'preserve me')
+        self.assertEqual(self.gate.read_bytes(), gate)
+        self.assertEqual(self.psql("SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'captainslog_probe_%'"), '0')
+        self.assertFalse((self.root / 'manager/application-schema.json').exists())
+        self.assertFalse((self.stage / 'adapter-application-schema-intent.json').exists())
+        with self.assertRaises(Refused): self.migrate()
+        self.assertEqual(self.dispatched, 0)
+
+    def test_real_three_cannot_masquerade_as_four_or_create_v2(self):
+        self.fresh_three()
+        self.manager.config['schema_revision'] = '4'
+        gate = self.gate.read_bytes()
+        with self.assertRaisesRegex(Refused, 'host-stepup-v2'):
+            self.manager.application_schema_check(self.stage)
+        self.assertEqual(self.psql("SELECT to_regclass('public.host_stepup_pending_v2') IS NULL"), 't')
+        self.assertEqual(self.gate.read_bytes(), gate)
+        self.assertEqual(self.dispatched, 0)
+
+    def test_real_four_legacy_pending_catalog_drift_refuses(self):
+        self.fresh_four()
+        self.psql('ALTER TABLE host_stepup_pending ALTER COLUMN nonce DROP NOT NULL')
+        with self.assertRaises(Refused): self.manager.application_schema_catalog(self.stage, '4')
+        self.assertTrue(json.loads(self.gate.read_text())['delivery_held'])
+        self.assertEqual(self.dispatched, 0)
+
+    def test_real_four_v2_pending_catalog_drift_refuses(self):
+        self.fresh_four()
+        self.psql('ALTER TABLE host_stepup_pending_v2 ALTER COLUMN challenge_id DROP NOT NULL')
+        with self.assertRaises(Refused): self.manager.application_schema_catalog(self.stage, '4')
+        self.assertTrue(json.loads(self.gate.read_text())['delivery_held'])
+        self.assertEqual(self.dispatched, 0)
+
+    def test_real_four_pending_deletions_and_migrating_engine_keep_hold(self):
+        self.fresh_four()
+        gate = self.gate.read_bytes()
+        for table, message in (
+            ('retention_actions', 'Unsettled retention evidence prevents schema observation'),
+            ('storage_emergency_actions', 'Unresolved storage evidence prevents schema recovery'),
+        ):
+            self.psql('INSERT INTO ' + table + "(id,state,plan) VALUES(gen_random_uuid(),'uncertain','{}')")
+            with self.subTest(table=table), self.assertRaisesRegex(Refused, message):
+                self.manager.application_schema_catalog(self.stage, '4')
+            self.psql('DELETE FROM ' + table)
+        self.psql("UPDATE settings SET value=jsonb_set(value,'{mode}','\"migrating\"') WHERE key='retention_engine'")
+        with self.assertRaisesRegex(Refused, 'Unsettled retention'):
+            self.manager.application_schema_catalog(self.stage, '4')
+        self.assertEqual(self.gate.read_bytes(), gate)
+        self.assertEqual(self.dispatched, 0)
+
+    def test_real_four_foreign_table_identity_keeps_hold(self):
+        self.fresh_four()
+        self.psql("UPDATE settings SET value=jsonb_set(value,'{table_uuid}','\"afafbf54-552a-40ad-aa6b-2ea96e5f4460\"') WHERE key='retention_engine'")
+        with self.assertRaises(Refused): self.manager.application_schema_catalog(self.stage, '4')
+        self.assertTrue(json.loads(self.gate.read_text())['delivery_held'])
+        self.assertEqual(self.dispatched, 0)
+
+    def test_real_four_does_not_adopt_three_profile_or_foreign_marker(self):
+        self.fresh_four()
+        with self.assertRaises(Refused): self.manager.application_schema_catalog(self.stage, '3')
+        self.psql("INSERT INTO settings(key,value) VALUES('application_schema_migration:" + 'f' * 64 + "','{}')")
+        with self.assertRaisesRegex(Refused, 'unowned migration'):
+            self.manager.application_schema_catalog(self.stage, '4')
+        self.assertTrue(json.loads(self.gate.read_text())['delivery_held'])
+        self.assertFalse((self.root / 'manager/application-schema.json').exists())
         self.assertEqual(self.dispatched, 0)
 
     def test_real_backup_restore_retains_host_hold_and_rearms_database_gate(self):

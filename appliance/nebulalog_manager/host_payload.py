@@ -38,13 +38,13 @@ PLATFORM = {"os": "linux", "distribution": "rocky", "major": 9, "architecture": 
 # files require a reviewed catalog change. Customer/trust inputs never belong here.
 MANAGER_MODULES = (
     "__init__.py", "aide.py", "aide_report.py", "aide_updates.py", "backup.py", "baseline.py", "bootstrap.py", "cli.py",
-    "bootloader.py", "common.py", "console.py", "enrollment.py", "firstboot.py", "github_updates.py", "guest_validation.py",
-    "host_activation.py", "host_dispatch.py", "host_identity.py", "host_job_storage.py", "host_jobs.py", "host_operations.py", "host_payload.py",
-    "host_plan_socket.py", "host_plans.py", "image_bundle.py", "image_seal_network.py", "livepatch.py", "os_payload.py", "os_updates.py",
+    "bootloader.py", "common.py", "console.py", "enrollment.py", "firstboot.py", "fresh_database.py", "github_updates.py", "guest_validation.py",
+    "host_activation.py", "host_challenges.py", "host_dispatch.py", "host_identity.py", "host_job_storage.py", "host_jobs.py", "host_operations.py", "host_payload.py",
+    "host_plan_socket.py", "host_plans.py", "image_bundle.py", "image_seal_network.py", "livepatch.py", "log_backup.py", "log_recovery_set.py", "os_payload.py", "os_updates.py",
     "kernel_boot.py", "kernel_integrity.py", "kernel_retention.py", "kernel_retention_generation.py", "kernel_retention_integration.py", "kernel_rollback.py", "kernel_updates.py",
     "ordinary_boot.py", "ordinary_boot_state.py", "ordinary_boot_metadata.py",
     "boot_metadata_native.py", "boot_metadata_proof.py", "boot_metadata_lineage.py",
-    "publisher_inputs.py", "security.py", "setup_integrity.py", "sizing.py", "status_snapshot.py", "storage.py", "update_enrollment.py", "updates.py",
+    "publisher_inputs.py", "configuration_restore.py", "recovery_media.py", "recovery_plans.py", "recovery_recipients.py", "recovery_set.py", "recovery_transfer.py", "restore_database.py", "restore_runtime.py", "security.py", "setup_integrity.py", "sizing.py", "status_snapshot.py", "storage.py", "update_enrollment.py", "updates.py",
 )
 ADAPTER_MODULES = ("__init__.py", "auth.py", "cli.py", "commands.py", "host_runtime.py", "lifecycle.py")
 COMMANDS = ("bootstrap-runtime", "enroll-installed-release", "load-image-bundle", "nebulalog", "nebulalog-aide",

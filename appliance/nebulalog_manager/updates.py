@@ -226,6 +226,20 @@ class UpdateManager:
                  hooks: Path = Path("/usr/libexec/nebulalog"), runner: Callable = run):
         self.state, self.hooks, self.runner = state, hooks, runner
 
+    def _require_restore_update_compatibility(self):
+        """Do not select software that may ignore a recovered host's JWT floor.
+
+        Schema compatibility alone says nothing about token verification. Until
+        an exact host/image update and rollback pair is qualified, any retained
+        restore marker blocks component selection. Even a malformed or dangling
+        marker must refuse, so this guard does not parse or adopt its contents.
+        The restore workflow preserves these markers after completed setup.
+        """
+        markers = (self.state.parent / "restore.json",
+                   self.state.parent.parent / "configuration/bootstrap/restore-auth.json")
+        if any(os.path.lexists(path) for path in markers):
+            raise Refused("Component updates and rollback on restored appliances require a qualified host/image pair that preserves the token issuance cutoff; compatibility is not yet qualified")
+
     def status(self) -> dict:
         current = self.state / "current.json"
         transaction = self.state / "transaction.json"
@@ -343,6 +357,7 @@ class UpdateManager:
             raise Refused("Measured host runtime does not match the durable selected generation")
 
     def _restore_host(self, transaction: dict, stage: Path):
+        self._require_restore_update_compatibility()
         self._guard_hooks(transaction, stage)
         if transaction.get("host_update") is True:
             host_activation.restore_previous(stage)
@@ -416,8 +431,10 @@ class UpdateManager:
 
     def install(self, manifest: Path, signature: Path, bundle: Path, public_key: Path) -> dict:
         require_linux_root()
+        self._require_restore_update_compatibility()
         trusted_file(public_key)
         with locked(self.state.parent / "transaction.lock"), locked(self.state / "transaction.lock"):
+            self._require_restore_update_compatibility()
             livepatch.require_settled(self.state)
             enrolled_key(self.state, public_key)
             status = self.status()
@@ -565,8 +582,10 @@ class UpdateManager:
     def rollback(self, public_key: Path) -> dict:
         """Roll back the last committed reversible release using retained evidence."""
         require_linux_root()
+        self._require_restore_update_compatibility()
         trusted_file(public_key)
         with locked(self.state.parent / "transaction.lock"), locked(self.state / "transaction.lock"):
+            self._require_restore_update_compatibility()
             livepatch.require_settled(self.state)
             enrolled_key(self.state, public_key)
             status = self.status()
@@ -612,8 +631,10 @@ class UpdateManager:
         already staged recovery, but retained signature and journal identity bind.
         """
         require_linux_root()
+        self._require_restore_update_compatibility()
         trusted_file(public_key)
         with locked(self.state.parent / "transaction.lock"), locked(self.state / "transaction.lock"):
+            self._require_restore_update_compatibility()
             livepatch.require_settled(self.state)
             enrolled_key(self.state, public_key)
             status = self.status()

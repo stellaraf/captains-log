@@ -39,6 +39,9 @@ func emergencyRealTable(t *testing.T, s *Store, ctx context.Context) {
 	if e = s.CH.Exec(ctx, "ALTER TABLE nebulalog.events MODIFY SETTING old_parts_lifetime=1, cleanup_delay_period=1, cleanup_delay_period_random_add=1", nil); e != nil {
 		t.Fatal(e)
 	}
+	if e = s.InitializeRetention(ctx); e != nil {
+		t.Fatal(e)
+	}
 }
 func emergencyEvent(id, kind, day, status string) map[string]any {
 	return map[string]any{"id": id, "ingested_at": day + "T12:00:00Z", "received_at": day + "T12:00:00Z", "expires_at": "2099-01-01T00:00:00Z", "log_type": kind, "parse_status": status, "raw": "preserved " + id, "raw_base64": base64.StdEncoding.EncodeToString([]byte("preserved " + id))}

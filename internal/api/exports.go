@@ -34,6 +34,10 @@ func (s *Server) downloadTicket(w http.ResponseWriter, r *http.Request) {
 		databaseError(w, e)
 		return
 	}
+	if e = s.exportRetention(r.Context(), id); e != nil {
+		problem(w, 409, "Retention policy changed or is unavailable; create a new export")
+		return
+	}
 	token := uuid() + uuid()
 	s.mu.Lock()
 	if s.tickets == nil {
@@ -63,6 +67,10 @@ func (s *Server) redeemDownload(w http.ResponseWriter, r *http.Request) {
 		problem(w, 404, "Download ticket expired or already used")
 		return
 	}
+	if err := s.exportRetention(r.Context(), ticket.ID); err != nil {
+		problem(w, 409, "Retention policy changed or is unavailable; create a new export")
+		return
+	}
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename=nebulalog-"+ticket.ID+".csv")
 	http.ServeFile(w, r, filepath.Join(s.Config.ExportDir, ticket.ID+".csv"))
@@ -85,6 +93,13 @@ func (s *Server) createExport(w http.ResponseWriter, r *http.Request) {
 		problem(w, 400, e.Error())
 		return
 	}
+	policy, predicate, bound, e := s.retained(r.Context(), time.Now().UTC())
+	if e != nil {
+		databaseError(w, e)
+		return
+	}
+	in.RetentionRevision = policy.Revision
+	where = retentionWhere(where, params, predicate, bound)
 	if len(in.Columns) == 0 {
 		in.Columns = []string{"received_at", "serial", "src_ip", "dst_ip", "app", "action", "rule"}
 	}
@@ -196,6 +211,9 @@ func (s *Server) runExport(id string, in Search, where string, params map[string
 			e = errors.New("export disk quota reached")
 		}
 		if e == nil {
+			e = s.exportRetention(ctx, id)
+		}
+		if e == nil {
 			e = os.Rename(path+".partial", path)
 		}
 	}
@@ -237,9 +255,34 @@ func (s *Server) downloadExport(w http.ResponseWriter, r *http.Request) {
 		problem(w, 409, "Export is not ready")
 		return
 	}
+	if e = s.exportRetention(r.Context(), id); e != nil {
+		problem(w, 409, "Retention policy changed or is unavailable; create a new export")
+		return
+	}
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename=nebulalog-"+id+".csv")
 	http.ServeFile(w, r, filepath.Join(s.Config.ExportDir, id+".csv"))
+}
+
+// Export files are snapshots with their existing 24-hour lifetime. A subsequent
+// policy change invalidates them, including already-issued download tickets.
+func (s *Server) exportRetention(ctx context.Context, id string) error {
+	var raw []byte
+	if err := s.Store.PG.QueryRow(ctx, "SELECT request FROM export_jobs WHERE id::text=$1 AND expires_at>now()", id).Scan(&raw); err != nil {
+		return err
+	}
+	var request Search
+	if err := json.Unmarshal(raw, &request); err != nil {
+		return err
+	}
+	p, _, _, err := s.retained(ctx, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	if request.RetentionRevision < 1 || request.RetentionRevision != p.Revision {
+		return store.ErrRetentionRevision
+	}
+	return nil
 }
 func (s *Server) RecoverExports(ctx context.Context) error {
 	if e := os.MkdirAll(s.Config.ExportDir, 0700); e != nil {

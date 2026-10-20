@@ -103,6 +103,15 @@ if [ -f /tmp/nebulalog-image-bundle/initial-release.json ] || [ -f /tmp/nebulalo
     fi
   done
   install -m 0600 /tmp/nebulalog-image-bundle/source-manifest.json /usr/share/nebulalog/source-manifest.json
+  # Only the fixed bounded evidence names are copied. Enrollment verifies their
+  # exact hashes against the initial descriptor before granting any capability.
+  install -d -m 0700 /usr/share/nebulalog/restore-auth
+  for proof in application-build.json restore-auth-behavior.json; do
+    if [ -e "/tmp/nebulalog-image-bundle/restore-auth/$proof" ] || [ -L "/tmp/nebulalog-image-bundle/restore-auth/$proof" ]; then
+      [ -f "/tmp/nebulalog-image-bundle/restore-auth/$proof" ] && [ ! -L "/tmp/nebulalog-image-bundle/restore-auth/$proof" ] || exit 1
+      install -m 0600 "/tmp/nebulalog-image-bundle/restore-auth/$proof" "/usr/share/nebulalog/restore-auth/$proof"
+    fi
+  done
   # Build only from the captured installer/realm bytes, before first boot. This
   # helper retains the parent's /etc lock and cannot run on enrolled appliances.
   PYTHONPATH=/usr/lib/nebulalog python3 "$APPLIANCE_SOURCE/factory_host.py" --source "$APPLIANCE_SOURCE"

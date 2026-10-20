@@ -6,9 +6,11 @@ restore decisions through the production lifecycle, not native acceptance.
 """
 import hashlib
 import json
+import os
+import stat
 from pathlib import Path
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import test_lifecycle as fixture
 from nebulalog_manager.common import Refused, atomic_json
@@ -21,6 +23,17 @@ class SchemaCoordinatorTests(unittest.TestCase):
 
     def setUp(self):
         fixture.LifecycleTests.setUp(self)
+        # Map only native root ownership to this fixture's host UID. Keep the
+        # real HookJournal protocol, manifest hash and file-type/mode guards.
+        from nebulalog_manager import host_dispatch
+        def trusted_fixture(path):
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+                raise Refused('Unsafe synthetic hook fixture')
+            return path
+        for guard in (patch.object(host_dispatch.payload, '_OWNER_UID', os.getuid()),
+                      patch.object(host_dispatch, 'trusted_file', side_effect=trusted_fixture)):
+            guard.start(); self.addCleanup(guard.stop)
         self.events = []
         self.db_revision = "1"
         self.operation = hashlib.sha256(str(self.stage).encode()).hexdigest()
@@ -107,7 +120,16 @@ class SchemaCoordinatorTests(unittest.TestCase):
         self.assertTrue(json.loads(self.gate_path.read_text())["delivery_held"])
 
     def test_only_bound_gate_aware_image_can_keep_receiving(self):
-        app = {"schema_revision": "2", "schema_sha256": ApplicationSchema.schema_digest("2"), "image": fixture.OLD}
+        self.bound_gate_aware_image("2")
+
+    def test_bound_schema_three_image_keeps_receiving_with_same_fence_checks(self):
+        self.bound_gate_aware_image("3")
+
+    def test_bound_schema_four_image_keeps_receiving_with_same_fence_checks(self):
+        self.bound_gate_aware_image("4")
+
+    def bound_gate_aware_image(self, revision):
+        app = {"schema_revision": revision, "schema_sha256": ApplicationSchema.schema_digest(revision), "image": fixture.OLD}
         atomic_json(self.manager.state / "current.json", {"components": {"nebulalog": app}})
         command = self.manager.cmd
         running = "d" * 64
@@ -385,6 +407,53 @@ class SchemaCoordinatorTests(unittest.TestCase):
         with self.assertRaisesRegex(Refused, "unowned migration provenance"):
             self.manager.application_schema_check(self.stage)
         self.assertFalse((self.root / "manager/application-schema.json").exists())
+
+    def test_factory_three_cannot_adopt_old_migration_pointer(self):
+        self.factory_rejects_migration_pointer('3')
+
+    def test_factory_four_cannot_adopt_old_migration_pointer(self):
+        self.factory_rejects_migration_pointer('4')
+
+    def factory_rejects_migration_pointer(self, revision):
+        self.manager.config['schema_revision'] = revision
+        atomic_json(self.root / 'manager/application-schema.json', {'schema': 1, 'revision': '2'})
+        with self.assertRaisesRegex(Refused, 'unqualified migration pointer'):
+            self.manager.application_schema_current()
+
+    def test_same_three_backup_activation_and_rollback_preserve_factory_authority(self):
+        self.same_retention_schema_preserves_factory_authority('3')
+
+    def test_same_four_backup_activation_and_rollback_preserve_factory_authority(self):
+        self.same_retention_schema_preserves_factory_authority('4')
+
+    def same_retention_schema_preserves_factory_authority(self, revision):
+        self.db_revision = self.manager.config['schema_revision'] = revision
+        self.manifest['components']['nebulalog'].update(ApplicationSchema.declaration(ApplicationSchema.SCHEMAS[revision], revision))
+        atomic_json(self.stage / 'manifest.json', self.manifest)
+        self.transaction['manifest_sha256'] = digest_file(self.stage / 'manifest.json')
+        atomic_json(self.manager.state / 'transaction.json', self.transaction)
+        self.manager.application_schema_migrate = Mock(side_effect=AssertionError('Same revision cannot execute migration'))
+        self.manager.ch = Mock(return_value='1')
+        original = self.commands.feed
+        def restored_retention_schema(argv, source, **kwargs):
+            value = original(argv, source, **kwargs)
+            if '--dbname=nebulalog' in argv: self.db_revision = revision
+            return value
+        self.commands.feed = restored_retention_schema
+        self.manager.backup(self.stage)
+        self.assertEqual(self.manager.checked_backup(self.stage)['application_schema'], {'revision': revision, 'state': None})
+        self.manager.prepare(self.stage)
+        self.manager.activate(self.stage)
+        self.manager.rollback(self.stage)
+        self.assertEqual(self.manager.application_schema_current(), {'revision': revision, 'state': None})
+        self.manager.application_schema_migrate.assert_not_called()
+        self.assertFalse((self.root / 'manager/application-schema.json').exists())
+        # Catalog mocks still require all API/ingest/identity writers inactive;
+        # Physical CH must be up before each retention-schema observation.
+        for index, event in enumerate(self.events):
+            if event == ('catalog', revision):
+                latest = [item for item in self.events[:index] if item[0] in ('start', 'stop') and 'clickhouse' in item[1]]
+                self.assertEqual(latest[-1][0], 'start')
 
     def test_finalization_does_not_open_http_if_storage_release_fails(self):
         self.manager.backup(self.stage)

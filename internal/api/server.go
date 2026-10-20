@@ -40,6 +40,21 @@ type Server struct {
 	activeExports int
 	exportsReady  bool
 	tickets       map[string]downloadTicket
+	retentionRead func(context.Context, time.Time) (store.Retention, string, map[string]string, error)
+}
+
+func (s *Server) retained(ctx context.Context, at time.Time) (store.Retention, string, map[string]string, error) {
+	if s.retentionRead != nil {
+		return s.retentionRead(ctx, at)
+	}
+	return s.Store.RetainedPredicate(ctx, at)
+}
+
+func retentionWhere(where string, params map[string]string, predicate string, bound map[string]string) string {
+	for key, value := range bound {
+		params[key] = value
+	}
+	return "(" + where + ") AND " + predicate
 }
 
 func (s *Server) Handler() http.Handler {

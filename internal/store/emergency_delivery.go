@@ -60,6 +60,17 @@ func (s *Store) insertEmergencyGuarded(ctx context.Context, rows []map[string]an
 	if gate.DeliveryHeld {
 		return errors.New("Host maintenance is holding delivery; durable spool is retained")
 	}
+	engine, err := requireRetentionEngine(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if err = verifyRetentionTable(ctx, s.CH, engine.TableUUID); err != nil {
+		return err
+	}
+	normal, err := pendingRetention(ctx, conn)
+	if err != nil {
+		return err
+	}
 	state, err := readEmergencyStatus(ctx, conn)
 	if err != nil {
 		return err
@@ -98,6 +109,11 @@ func (s *Store) insertEmergencyGuarded(ctx context.Context, rows []map[string]an
 			return errors.New("invalid insertion category")
 		}
 		partitions[emergencyInsertPartition{kind, ts.UTC().Format("2006-01-02")}] = true
+	}
+	// A lost normal-removal acknowledgement fences only its selected days. A
+	// delayed old WAL batch cannot recreate a partition after DROP has started.
+	if err = retentionInsertionFence(normal, partitions); err != nil {
+		return err
 	}
 	ordered := make([]emergencyInsertPartition, 0, len(partitions))
 	for p := range partitions {

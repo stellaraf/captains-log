@@ -232,6 +232,10 @@ UPLOAD
     source      = "${var.provenance_directory}/source-manifest.json"
     destination = "/tmp/nebulalog-image-bundle/source-manifest.json"
   }
+  provisioner "file" {
+    source      = "${var.provenance_directory}/restore-auth"
+    destination = "/tmp/nebulalog-image-bundle/restore-auth"
+  }
   provisioner "shell" {
     inline = [
       var.uefi == null ? "test ! -d /sys/firmware/efi" : "test -d /sys/firmware/efi && test \"$(uname -m)\" = x86_64 && mountpoint -q /boot/efi",

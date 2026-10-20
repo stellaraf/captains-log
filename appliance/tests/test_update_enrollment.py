@@ -362,6 +362,35 @@ class InstalledReleaseTests(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("openssl"), "Real OpenSSL public-key verification required")
+class FactoryRestoreProofTests(unittest.TestCase):
+    from test_restore_auth_contract import FactoryContractTests as _Fixture
+    setUp = _Fixture.setUp
+    rewrite = _Fixture.rewrite
+    factory = _Fixture.factory
+
+    def test_initial_proof_is_bound_to_descriptor_host_source_and_exact_offline_image(self):
+        self.factory()
+        manager = enrollment.UpdateEnrollment(share=self.share)
+        host = {"generation": self.factory_host["archive_sha256"]}
+        verified = {"images": {"NEBULALOG_IMAGE": self.image}}
+        with patch.object(enrollment, "ROOT_UID", os.getuid()), patch.object(enrollment, "_tree"), \
+                patch.object(host_payload, "_OWNER_UID", os.getuid()), \
+                patch("nebulalog_manager.host_dispatch.protected_json", return_value=self.factory_host["metadata"]):
+            self.assertIsNone(manager._factory_restore_auth(self.descriptor, verified, None))
+            proof = manager._factory_restore_auth(self.descriptor, verified, host)
+            self.assertEqual(proof["subject"]["host_generation"], host["generation"])
+            self.assertFalse(proof["native_qualified"])
+            path = self.share / "restore-auth/restore-auth-behavior.json"
+            path.write_bytes(path.read_bytes() + b" ")
+            with self.assertRaises(Refused): manager._factory_restore_auth(self.descriptor, verified, host)
+
+    def test_absent_factory_descriptor_never_adopts_loose_receipts(self):
+        self.factory()
+        manager = enrollment.UpdateEnrollment(share=self.share)
+        with patch.object(enrollment, "_read", side_effect=AssertionError("must not read loose evidence")):
+            self.assertIsNone(manager._factory_restore_auth({}, {}, None))
+
+
 class PublisherTrustTests(unittest.TestCase):
     runner = InstalledReleaseTests.runner
     @classmethod

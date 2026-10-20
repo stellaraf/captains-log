@@ -19,7 +19,7 @@ import uuid
 
 from .common import Refused, atomic_json, audit, locked, require_linux_root, run
 from .firstboot import FirstBoot
-from .image_bundle import ApplicationSchema as application_schema, ImageBundleLoader, run_private, strict_json, verify_bundle
+from .image_bundle import ApplicationSchema as application_schema, RestoredAuthContract, ImageBundleLoader, run_private, strict_json, verify_bundle
 from . import publisher_inputs
 from .baseline import ContentUpdate
 
@@ -215,13 +215,19 @@ class UpdateEnrollment:
         value = strict_json(raw)
         fields = {"schema", "product", "sequence", "schema_revision", "source_commit", "source_dirty",
                   "source_snapshot_sha256", "bundle_manifest_sha256", "qualification_status", "publisher"}
-        if (not isinstance(value, dict) or set(value) != fields or type(value.get("schema")) is not int or value["schema"] != 1
+        if (not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"restore_auth"} or type(value.get("schema")) is not int or value["schema"] != 1
                 or value.get("product") != "nebulalog" or type(value.get("sequence")) is not int or not 0 <= value["sequence"] < 2**63
                 or not isinstance(value.get("schema_revision"), str) or not re.fullmatch(r"[1-9][0-9]{0,8}", value["schema_revision"])
                 or not re.fullmatch(r"[a-f0-9]{40}", str(value.get("source_commit", "")))
                 or type(value.get("source_dirty")) is not bool or value.get("qualification_status") != "pending"
                 or any(not SHA256.fullmatch(str(value.get(key, ""))) for key in ("source_snapshot_sha256", "bundle_manifest_sha256"))):
             raise Refused("Initial release provenance is missing explicit build identity or has unsupported claims")
+        if value["schema_revision"] == application_schema.HOST_CHALLENGE_REVISION:
+            raise Refused("Schema 4 activation awaits fresh initialization, restored authentication, and image qualification")
+        if "restore_auth" in value:
+            RestoredAuthContract.factory_descriptor(value["restore_auth"])
+            if value["schema_revision"] != "3":
+                raise Refused("Factory restored authentication requires the supported fresh schema 3 baseline")
         source = _read(self.share / "source-manifest.json", 8 * 1024**2)
         manifest = strict_json(source)
         if (_hash(source) != value["source_snapshot_sha256"] or not isinstance(manifest, dict)
@@ -316,10 +322,32 @@ class UpdateEnrollment:
             raise Refused("Application image does not match the captured release source")
         publisher = self._publisher(descriptor, require_factory=require_factory)
         host = self._factory_host(descriptor) if include_host else None
+        auth_proof = self._factory_restore_auth(descriptor, verified, host)
         return {"descriptor": descriptor, "descriptor_sha256": descriptor_sha,
                 "application_source_sha256": application_source, "bundle": verified,
                 "host": host,
+                "restore_auth": auth_proof,
                 "publisher": {key: value for key, value in publisher.items() if key != "public"}}
+
+    def _factory_restore_auth(self, descriptor, verified, host=None):
+        """Validate descriptor-covered receipts; loose files never grant support."""
+        if "restore_auth" not in descriptor:
+            return None
+        from . import host_dispatch, host_payload
+        factory = RestoredAuthContract.factory_descriptor(descriptor["restore_auth"])
+        source = strict_json(_read(self.share / RestoredAuthContract.SOURCE, host_payload.MAX_SOURCE_MANIFEST))
+        raw = {name: _read(self.share / "restore-auth" / name, RestoredAuthContract.MAX_RECEIPT)
+               for name in RestoredAuthContract.EVIDENCE}
+        if any({"bytes": len(raw[name]), "sha256": _hash(raw[name])} != expected for name, expected in factory["artifacts"].items()):
+            raise Refused("Factory restored authentication receipt differs from initial provenance")
+        image = verified["images"]["NEBULALOG_IMAGE"]
+        if RestoredAuthContract.factory_capture(source["files"], image, raw[RestoredAuthContract.BUILD], raw[RestoredAuthContract.BEHAVIOR]) != factory:
+            raise Refused("Factory restored authentication receipts differ from measured image inputs")
+        if host is None:
+            return None  # Pristine installer checks precede generation creation.
+        metadata = host_dispatch.protected_json(host_payload.GENERATIONS / host["generation"] / "host-payload.json")
+        return RestoredAuthContract.verify_factory(descriptor, self.share,
+            {"archive_sha256": host["generation"], "metadata": metadata}, image)
 
     def _container(self, name, expected):
         value = strict_json(self.runner(["podman", "container", "inspect", "nebulalog-" + name], timeout=30))
@@ -381,6 +409,7 @@ class UpdateEnrollment:
             verified = verify_bundle(bundle, pins, root_owned=True)
             if verified["images"]["NEBULALOG_IMAGE"].get("application_source_sha256") != application_source:
                 raise Refused("Verified application image source label is missing or differs from the captured application source")
+            auth_proof = self._factory_restore_auth(descriptor, verified, host)
             loaded = _json(self.state.parent / "image-bundle-receipt.json")
             if not isinstance(loaded, dict) or type(loaded.get("schema")) is not int or loaded["schema"] != 1 or loaded.get("status") != "loaded" or loaded.get("network_used") is not False:
                 raise Refused("Verified offline image load receipt is required")
@@ -414,6 +443,10 @@ class UpdateEnrollment:
             receipt = {"schema": 1, "state": "enrolled", "installation_id": identity, "initial_release_sha256": descriptor_sha,
                        "provenance": descriptor, "application_source_sha256": application_source,
                        "current": current, "measurements": measurements}
+            if auth_proof is not None:
+                if components["nebulalog"]["version"] != descriptor["restore_auth"]["version"]:
+                    raise Refused("Running application version differs from the factory restored-authentication build")
+                receipt["restore_auth"] = auth_proof
             publisher_trust = "not_enrolled"
             if (self.state / "publisher-trust.json").exists() or (self.state / "publisher-trust.json").is_symlink():
                 enrolled_key(self.state, self.etc / "release-public.pem")

@@ -270,6 +270,14 @@ func eligibleEmergencyPartitions(rows []map[string]any, p EmergencyPolicy, now t
 const emergencyPartsSQL = `SELECT partition_id,partition,name,disk_name,rows,bytes_on_disk FROM system.parts WHERE database='nebulalog' AND table='events' AND active ORDER BY partition_id,name LIMIT 65537`
 
 func inspectEmergencyPartitions(ctx context.Context, ch emergencyClickHouse, p EmergencyPolicy, now time.Time) ([]EmergencyPartition, error) {
+	combined, err := inspectPartitionGroups(ctx, ch)
+	if err != nil {
+		return nil, err
+	}
+	return eligibleEmergencyPartitions(combined, p, now)
+}
+
+func inspectPartitionGroups(ctx context.Context, ch emergencyClickHouse) ([]map[string]any, error) {
 	rows, err := ch.Rows(ctx, emergencyPartsSQL, nil)
 	if err != nil {
 		return nil, err
@@ -323,7 +331,7 @@ func inspectEmergencyPartitions(ctx context.Context, ch emergencyClickHouse, p E
 	for _, g := range grouped {
 		combined = append(combined, g)
 	}
-	return eligibleEmergencyPartitions(combined, p, now)
+	return combined, nil
 }
 
 func verifyEmergencyRows(ctx context.Context, ch emergencyClickHouse, c EmergencyPartition) (bool, error) {

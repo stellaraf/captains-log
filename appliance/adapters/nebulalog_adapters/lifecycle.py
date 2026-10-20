@@ -234,6 +234,8 @@ class Lifecycle:
         path = self.data / "manager/application-schema.json"
         if not os.path.lexists(path):
             return {"revision": initial, "state": None}
+        if initial in ApplicationSchema.RETENTION_REVISIONS:
+            raise Refused("Factory retention schema cannot adopt an unqualified migration pointer")
         value = strict_json(trusted_file(path).read_bytes())
         if (not isinstance(value, dict) or set(value) != {"schema", "revision", "stage", "receipt_sha256"}
                 or type(value["schema"]) is not int or value["schema"] != 1 or value["revision"] != "2"
@@ -265,7 +267,7 @@ class Lifecycle:
         """Verify live catalog against factory or retained migration authority."""
         value = snapshot if snapshot is not None else self.application_schema_current()
         if (not isinstance(value, dict) or set(value) != {"revision", "state"}
-                or value["revision"] not in ("1", "2")):
+                or not isinstance(value["revision"], str) or value["revision"] not in ApplicationSchema.SCHEMAS):
             raise Refused("Invalid retained application schema snapshot")
         if value["state"] is None:
             if value["revision"] != self.config["schema_revision"]:
@@ -314,13 +316,14 @@ class Lifecycle:
         return ApplicationSchema.transition(change, revision)
 
     def storage_gate_aware_ingest(self):
-        """Only a bound schema-2 application can keep receiving during backup."""
+        """Only a bound schema-2/3/4 application can receive during backup."""
         path = self.state / "current.json"
         if not os.path.lexists(path):
             return False
         current = strict_json(trusted_file(path).read_bytes())
         app = current.get("components", {}).get("nebulalog", {})
-        if app.get("schema_revision") != "2" or app.get("schema_sha256") != ApplicationSchema.schema_digest("2"):
+        revision = app.get("schema_revision")
+        if revision not in ("2", *ApplicationSchema.RETENTION_REVISIONS) or app.get("schema_sha256") != ApplicationSchema.schema_digest(revision):
             return False
         image = app.get("image")
         if (not isinstance(image, str) or not IMAGE.fullmatch(image)
@@ -395,8 +398,14 @@ class Lifecycle:
         The caller holds the existing lifecycle transaction lock throughout.
         """
         self.guard()
+        log_stage = stage.parent == self.data / "manager/log-backups"
+        if log_stage:
+            # Only an existing protected native-backup journal extends the
+            # fixed operation catalog. Arbitrary manager paths remain refused.
+            from nebulalog_manager.log_backup import owned_stage
+            owned_stage(stage, self.data)
         if (not stage.is_absolute() or stage.is_symlink()
-                or stage.resolve().parent not in ((self.state / "releases").resolve(),
+                or not log_stage and stage.resolve().parent not in ((self.state / "releases").resolve(),
                                                   (self.data / "manager/os-updates").resolve())):
             raise Refused("Storage maintenance needs a protected lifecycle operation")
         if type(held) is not bool or type(delivery_held) is not bool or not held and delivery_held:
@@ -463,7 +472,9 @@ class Lifecycle:
             return {"ok": True, "action": "storage-host-fence", "operation": operation,
                     "gate": conservative, "database_barrier": False}
         encoded = json.dumps(desired, separators=(",", ":"))
-        allow_missing = "true" if self.application_schema_current()["revision"] == "1" else "false"
+        revision = self.application_schema_current()["revision"]
+        allow_missing = "true" if revision == "1" else "false"
+        require_retention = "true" if revision in ApplicationSchema.RETENTION_REVISIONS else "false"
         # Operation is generated hex; desired JSON contains only fixed keys,
         # booleans, null and that hex. No caller SQL, paths or hooks are executed.
         query = f"""
@@ -471,7 +482,7 @@ SET LOCAL search_path=public,pg_catalog;
 SET LOCAL lock_timeout='60s';
 SET LOCAL statement_timeout='90s';
 DO $gate$
-DECLARE gate jsonb; n bigint;
+DECLARE gate jsonb; engine jsonb; n bigint;
 BEGIN
  PERFORM pg_advisory_xact_lock({STORAGE_LOCK});
  SELECT value INTO gate FROM public.settings WHERE key='storage_emergency_maintenance' FOR UPDATE;
@@ -497,6 +508,19 @@ BEGIN
   SELECT count(*) INTO n FROM public.storage_emergency_inserts;
   IF n != 0 THEN RAISE EXCEPTION 'Unresolved insertion prevents lifecycle metadata changes'; END IF;
  ELSIF NOT {allow_missing} THEN RAISE EXCEPTION 'Missing emergency insertion evidence'; END IF;
+ IF to_regclass('public.retention_actions') IS NOT NULL THEN
+  SELECT count(*) INTO n FROM public.retention_actions WHERE completed_at IS NULL;
+  IF n != 0 THEN RAISE EXCEPTION 'Pending retention removal prevents lifecycle metadata changes'; END IF;
+ ELSIF {require_retention} THEN RAISE EXCEPTION 'Missing retention action evidence'; END IF;
+ SELECT value INTO engine FROM public.settings WHERE key='retention_engine';
+ IF engine IS NOT NULL THEN
+  IF jsonb_typeof(engine) IS DISTINCT FROM 'object' OR engine->'schema' IS DISTINCT FROM '1'::jsonb
+   OR engine->>'mode' IS NULL OR engine->>'mode' NOT IN ('uninitialized','partition')
+  THEN RAISE EXCEPTION 'Unresolved retention engine prevents lifecycle metadata changes'; END IF;
+ ELSIF {require_retention} OR to_regclass('public.retention_actions') IS NOT NULL
+ THEN RAISE EXCEPTION 'Missing retention engine evidence'; END IF;
+ IF {require_retention} AND engine->>'mode' IS DISTINCT FROM 'partition'
+ THEN RAISE EXCEPTION 'Retention engine is not initialized'; END IF;
  INSERT INTO public.settings(key,value) VALUES('storage_emergency_maintenance','{encoded}'::jsonb)
  ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value;
  INSERT INTO public.audit_events(actor,action,target,detail)
@@ -510,8 +534,72 @@ SELECT value::text FROM public.settings WHERE key='storage_emergency_maintenance
             input=query.encode(), timeout=120)
         if storage_gate_value(strict_json(result.encode())) != desired:
             raise Refused("Storage maintenance readback differs; host hold remains in force")
+        retention = self._retention_table(stage) if revision in ApplicationSchema.RETENTION_REVISIONS else None
         atomic_file(path, (json.dumps(desired) + "\n").encode(), 0o644)
-        return self.receipt(stage, "storage-maintenance", state="complete", operation=operation, gate=desired)
+        return self.receipt(stage, "storage-maintenance", state="complete", operation=operation, gate=desired,
+                            **({"retention": retention} if retention is not None else {}))
+
+    def _retention_table(self, stage):
+        """Bind a retention schema to its unchanged TTL-free physical table.
+
+        The host fence remains conservative across both database observations.
+        This is a readback only; an uninitialized/migrating engine is never adopted.
+        """
+        expected_gate = {"schema": 1, "held": True, "delivery_held": True,
+                         "operation": hashlib.sha256(str(stage.resolve()).encode()).hexdigest()}
+        path = self.data / "manager/storage-maintenance/gate.json"
+        if storage_gate_value(strict_json(trusted_file(path).read_bytes())) != expected_gate:
+            raise Refused("Retention table verification requires the exact host delivery fence")
+        query = "SELECT value::text FROM public.settings WHERE key='retention_engine';"
+        engine = strict_json(self._schema_psql(query).encode())
+        identifier = engine.get("table_uuid") if isinstance(engine, dict) else None
+        if (not isinstance(engine, dict) or type(engine.get("schema")) is not int or engine["schema"] != 1
+                or engine.get("mode") != "partition" or not isinstance(identifier, str)
+                or not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", identifier)
+                or identifier == "00000000-0000-0000-0000-000000000000"):
+            raise Refused("Retention engine has no settled physical table identity")
+        raw = self.ch("SELECT toString(uuid) AS uuid,engine,partition_key,create_table_query FROM system.tables "
+                      "WHERE database='nebulalog' AND name='events' FORMAT JSONEachRow")
+        if len(raw.encode()) > 65536:
+            raise Refused("Oversized retention table evidence")
+        rows = [strict_json(line.encode()) for line in raw.splitlines() if line.strip()]
+        if (len(rows) != 1 or not isinstance(rows[0], dict)
+                or set(rows[0]) != {"uuid", "engine", "partition_key", "create_table_query"}
+                or rows[0]["uuid"] != identifier or rows[0]["engine"] != "MergeTree"
+                or rows[0]["partition_key"] != "(log_type, toDate(ingested_at))"
+                or not isinstance(rows[0]["create_table_query"], str) or not rows[0]["create_table_query"].strip()
+                or re.search(r"\bTTL\b", rows[0]["create_table_query"], flags=re.IGNORECASE)):
+            raise Refused("Retention table changed or legacy TTL remains; host hold is retained")
+        if (strict_json(self._schema_psql(query).encode()) != engine
+                or storage_gate_value(strict_json(trusted_file(path).read_bytes())) != expected_gate):
+            raise Refused("Retention ownership changed during physical table verification")
+        return {"table_uuid": identifier, "mode": "partition", "ttl": False,
+                "ddl_sha256": hashlib.sha256(rows[0]["create_table_query"].encode()).hexdigest()}
+
+    def _schema_read_dependencies(self, stage):
+        """Start the selected CH dependency under the existing writer hold."""
+        if self.application_schema_current()["revision"] not in ApplicationSchema.RETENTION_REVISIONS:
+            return
+        expected = {"schema": 1, "held": True, "delivery_held": True,
+                    "operation": hashlib.sha256(str(stage.resolve()).encode()).hexdigest()}
+        path = self.data / "manager/storage-maintenance/gate.json"
+        if storage_gate_value(strict_json(trusted_file(path).read_bytes())) != expected:
+            raise Refused("Schema dependency startup requires the exact host delivery fence")
+        self.service("start", ("clickhouse",))
+        deadline = time.monotonic() + 120
+        while True:
+            try:
+                if self.ch("SELECT 1") == "1":
+                    return
+            except (CommandFailed, Refused, OSError):
+                pass
+            if time.monotonic() >= deadline:
+                raise Refused("ClickHouse did not become ready for held schema verification")
+            time.sleep(1)
+
+    def _schema_stop_dependencies(self):
+        if self.application_schema_current()["revision"] in ApplicationSchema.RETENTION_REVISIONS:
+            self.service("stop", ("clickhouse",))
 
     @staticmethod
     def _schema_catalog(namespace):
@@ -638,7 +726,7 @@ SELECT value::text FROM public.settings WHERE key='storage_emergency_maintenance
         return hashlib.sha256(raw).hexdigest()
 
     def _schema_query(self, context, *, migrate=False, gate_operation=None, catalog_only=None):
-        if catalog_only not in (None, "1", "2") or migrate and catalog_only:
+        if catalog_only not in (None, "1", "2", "3", "4") or migrate and catalog_only:
             raise Refused("Invalid catalog-only schema request")
         legacy, additive, stepup = ApplicationSchema.reviewed_sql()
         owner = context["owner"]
@@ -653,16 +741,18 @@ SELECT value::text FROM public.settings WHERE key='storage_emergency_maintenance
         old_sql = self._schema_literal(legacy)
         new_sql = self._schema_literal(additive)
         step_sql = self._schema_literal(stepup)
+        retention_sql = self._schema_literal(ApplicationSchema.reviewed_retention_sql()) if catalog_only in ApplicationSchema.RETENTION_REVISIONS else "NULL"
+        challenge_sql = self._schema_literal(ApplicationSchema.reviewed_host_stepup_v2_sql()) if catalog_only == "4" else "NULL"
         expected_query = self._schema_literal(self._schema_catalog(probe))
         actual_query = self._schema_literal(self._schema_catalog("public"))
-        # A fresh transaction reconstructs both allowed profiles from fixed SQL.
+        # A fresh transaction reconstructs the allowed profiles from fixed SQL.
         # It never uses live catalog output as the expected schema.
         return f"""
 SET LOCAL search_path=pg_catalog;
 SET LOCAL lock_timeout='30s'; SET LOCAL statement_timeout='120s';
 CREATE TEMP TABLE captainslog_schema_result(value jsonb) ON COMMIT DROP;
 DO $migration$
-DECLARE old_catalog jsonb; new_catalog jsonb; actual jsonb; found jsonb; profile text; revision text; item record;
+DECLARE old_catalog jsonb; new_catalog jsonb; retention_catalog jsonb; challenge_catalog jsonb; engine jsonb; actual jsonb; found jsonb; profile text; revision text; item record;
 BEGIN
  PERFORM pg_advisory_xact_lock({STORAGE_LOCK});
  IF current_setting('server_version_num')::integer / 10000 != 17 THEN RAISE EXCEPTION 'Unqualified PostgreSQL major'; END IF;
@@ -686,20 +776,39 @@ BEGIN
   EXECUTE format('LOCK TABLE public.%I IN ACCESS EXCLUSIVE MODE',item.relname);
  END LOOP;
  profile := CASE WHEN to_regclass('public.host_stepup_pending') IS NULL THEN 'base' ELSE 'host-stepup' END;
+ IF '{catalog_only or ''}' IN ('3','4') AND profile<>'host-stepup'
+ THEN RAISE EXCEPTION 'Retention schema requires the fixed host-stepup profile'; END IF;
+ IF '{catalog_only or ''}'='4' THEN
+  IF to_regclass('public.host_stepup_pending_v2') IS NULL
+  THEN RAISE EXCEPTION 'Schema 4 requires the fixed host-stepup-v2 profile'; END IF;
+  profile := 'host-stepup-v2';
+ END IF;
  EXECUTE 'CREATE SCHEMA {probe} AUTHORIZATION "{owner}"';
  EXECUTE 'SET LOCAL ROLE "{owner}"';
  EXECUTE 'SET LOCAL search_path={probe},pg_catalog';
  EXECUTE {old_sql};
- IF profile='host-stepup' THEN EXECUTE {step_sql}; END IF;
+ IF profile IN ('host-stepup','host-stepup-v2') THEN EXECUTE {step_sql}; END IF;
  EXECUTE 'SET LOCAL search_path=pg_catalog';
  EXECUTE {expected_query} INTO old_catalog;
  EXECUTE 'SET LOCAL search_path={probe},pg_catalog';
  EXECUTE {new_sql};
  EXECUTE 'SET LOCAL search_path=pg_catalog';
  EXECUTE {expected_query} INTO new_catalog;
+ IF '{catalog_only or ''}' IN ('3','4') THEN
+  EXECUTE 'SET LOCAL search_path={probe},pg_catalog';
+  EXECUTE {retention_sql};
+  EXECUTE 'SET LOCAL search_path=pg_catalog';
+  EXECUTE {expected_query} INTO retention_catalog;
+ END IF;
+ IF '{catalog_only or ''}'='4' THEN
+  EXECUTE 'SET LOCAL search_path={probe},pg_catalog';
+  EXECUTE {challenge_sql};
+  EXECUTE 'SET LOCAL search_path=pg_catalog';
+  EXECUTE {expected_query} INTO challenge_catalog;
+ END IF;
  EXECUTE 'DROP SCHEMA {probe} CASCADE';
  EXECUTE {actual_query} INTO actual;
- IF actual IS DISTINCT FROM old_catalog AND actual IS DISTINCT FROM new_catalog
+ IF actual IS DISTINCT FROM old_catalog AND actual IS DISTINCT FROM new_catalog AND actual IS DISTINCT FROM retention_catalog AND actual IS DISTINCT FROM challenge_catalog
  THEN RAISE EXCEPTION 'Application catalog differs before reading any application data'; END IF;
  IF (SELECT value FROM public.settings WHERE key='storage_emergency_maintenance') IS DISTINCT FROM {gate}
  THEN RAISE EXCEPTION 'Database delivery hold differs'; END IF;
@@ -718,9 +827,11 @@ BEGIN
    VALUES('host-lifecycle','application.schema.migrate','{operation}',{marker});
   found := {marker};
  END IF;
- IF '{catalog_only or ''}' IN ('1','2') THEN
+ IF '{catalog_only or ''}' IN ('1','2','3','4') THEN
   IF ('{catalog_only or ''}'='1' AND actual IS DISTINCT FROM old_catalog)
    OR ('{catalog_only or ''}'='2' AND actual IS DISTINCT FROM new_catalog)
+   OR ('{catalog_only or ''}'='3' AND actual IS DISTINCT FROM retention_catalog)
+   OR ('{catalog_only or ''}'='4' AND actual IS DISTINCT FROM challenge_catalog)
   THEN RAISE EXCEPTION 'Catalog differs from the requested fixed schema'; END IF;
   revision := '{catalog_only or ''}';
  ELSIF actual=new_catalog AND found={marker} THEN
@@ -734,7 +845,7 @@ BEGIN
  ELSE RAISE EXCEPTION 'Schema outcome is foreign, partial, or unproven'; END IF;
  IF revision='1' AND EXISTS(SELECT FROM public.settings WHERE key='storage_emergency' OR key LIKE 'application_schema_migration:%')
  THEN RAISE EXCEPTION 'Legacy catalog contains foreign or partial migration evidence'; END IF;
- IF revision='2' THEN
+ IF revision IN ('2','3','4') THEN
   IF NOT EXISTS(SELECT FROM public.settings WHERE key='storage_emergency')
    OR (SELECT count(*) FROM public.storage_emergency_state) != 1
   THEN RAISE EXCEPTION 'Target schema lacks required emergency policy/state'; END IF;
@@ -742,13 +853,21 @@ BEGIN
    OR EXISTS(SELECT FROM public.storage_emergency_inserts)
   THEN RAISE EXCEPTION 'Unresolved storage evidence prevents schema recovery'; END IF;
  END IF;
+ IF revision IN ('3','4') THEN
+  SELECT value INTO engine FROM public.settings WHERE key='retention_engine';
+  IF jsonb_typeof(engine) IS DISTINCT FROM 'object' OR engine->'schema' IS DISTINCT FROM '1'::jsonb
+   OR engine->>'mode' IS DISTINCT FROM 'partition'
+   OR NOT EXISTS(SELECT FROM public.settings WHERE key='retention_status')
+   OR EXISTS(SELECT FROM public.retention_actions WHERE completed_at IS NULL)
+  THEN RAISE EXCEPTION 'Unsettled retention evidence prevents schema observation'; END IF;
+ END IF;
  IF (SELECT count(*) FROM public.settings WHERE key LIKE 'application_schema_migration:%') > 128
   OR EXISTS(SELECT FROM public.settings WHERE key LIKE 'application_schema_migration:%' AND octet_length(value::text)>8192)
  THEN RAISE EXCEPTION 'Oversized migration marker inventory'; END IF;
  RESET ROLE;
  INSERT INTO pg_temp.captainslog_schema_result VALUES(jsonb_build_object('revision',revision,
   'catalog',actual,'marker',found,'profile',profile) ||
-  CASE WHEN '{catalog_only or ''}' IN ('1','2') THEN jsonb_build_object('markers',
+  CASE WHEN '{catalog_only or ''}' IN ('1','2','3','4') THEN jsonb_build_object('markers',
    (SELECT COALESCE(jsonb_agg(jsonb_build_object('key',key,'value',value) ORDER BY key),'[]'::jsonb)
     FROM public.settings WHERE key LIKE 'application_schema_migration:%')) ELSE '{{}}'::jsonb END);
 END $migration$;
@@ -885,7 +1004,8 @@ END $fence$; SELECT 'fenced';"""
         source or a checked backup. This method cannot authorize SQL migration.
         """
         self.guard()
-        if (revision not in ("1", "2") or not stage.is_absolute() or stage.is_symlink() or stage.resolve() != stage
+        if (not isinstance(revision, str) or revision not in ApplicationSchema.SCHEMAS
+                or not stage.is_absolute() or stage.is_symlink() or stage.resolve() != stage
                 or stage.parent not in ((self.state / "releases").resolve(),
                                         (self.data / "manager/os-updates").resolve())):
             raise Refused("Invalid schema catalog observation scope")
@@ -897,8 +1017,9 @@ END $fence$; SELECT 'fenced';"""
         context = {"operation": hashlib.sha256(str(stage).encode()).hexdigest(), "owner": owner}
         self._schema_hold(stage, context)
         observed = strict_json(self._schema_psql(self._schema_query(context, catalog_only=revision)).encode())
+        profiles = ("host-stepup-v2",) if revision == "4" else ("host-stepup",) if revision == "3" else ("base", "host-stepup")
         if (not isinstance(observed, dict) or set(observed) != {"revision","catalog","marker","profile","markers"}
-                or observed["revision"] != revision or observed["profile"] not in ("base", "host-stepup")
+                or observed["revision"] != revision or observed["profile"] not in profiles
                 or not isinstance(observed["markers"], list) or len(observed["markers"]) > 128):
             raise Refused("Unrecognized schema catalog observation")
         markers = []
@@ -908,13 +1029,15 @@ END $fence$; SELECT 'fenced';"""
                 raise Refused("Malformed retained migration marker")
             markers.append({"key": item["key"], "sha256": hashlib.sha256(json.dumps(item["value"], sort_keys=True,
                             separators=(",", ":")).encode()).hexdigest()})
-        if revision == "1" and markers:
-            raise Refused("Restored legacy schema contains migration completion evidence")
+        if revision in ("1", *ApplicationSchema.RETENTION_REVISIONS) and markers:
+            raise Refused("Factory schema contains unowned migration completion evidence")
+        retention = self._retention_table(stage) if revision in ApplicationSchema.RETENTION_REVISIONS else None
         return {"ok": True, "schema_revision": revision, "schema_sha256": ApplicationSchema.schema_digest(revision),
                 "sql_sha256": ApplicationSchema.SCHEMAS[revision]["migrations/postgres.sql"],
                 "stage": str(stage), "operation": context["operation"], "owner": owner,
                 "profile": observed["profile"], "markers": markers,
-                "catalog_sha256": hashlib.sha256(json.dumps(observed["catalog"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()}
+                "catalog_sha256": hashlib.sha256(json.dumps(observed["catalog"], sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                **({"retention": retention} if retention is not None else {})}
 
     def _schema_client_ready(self):
         raw = self._schema_psql("SELECT jsonb_build_object('listen',current_setting('listen_addresses'),'rules',"
@@ -1201,6 +1324,7 @@ END $fence$; SELECT 'fenced';"""
         self.pg_ready()
         # Unknown INSERT/removal outcomes still refuse this barrier. A failed
         # backup is not authority to clear an unsettled storage operation.
+        self._schema_read_dependencies(stage)
         self.storage_maintenance(stage, held=True, delivery_held=True)
         self.application_schema_check(stage, snapshot["application_schema"])
         if snapshot != self.preactivation_context(stage):
@@ -1351,7 +1475,9 @@ END $fence$; SELECT 'fenced';"""
         verify_inventory(stage / "prepared-quadlets", preparation["files"])
         self.storage_maintenance(stage, held=True, delivery_held=True)
         self.service("stop", tuple(name for name in reversed(self.services) if name != "postgresql"))
+        self._schema_read_dependencies(stage)
         self.application_schema_check(stage, backup["application_schema"])
+        self._schema_stop_dependencies()
         self.service("stop", ("postgresql",))
         self.cmd(["sync", "-f", str(self.data)], timeout=120)
         # Fixed file set; no Exec/volume/env changes are accepted from downloaded artifacts.
@@ -1366,6 +1492,7 @@ END $fence$; SELECT 'fenced';"""
         self.cmd(["systemctl", "daemon-reload"])
         self.service("start", ("postgresql",))
         self.pg_ready()
+        self._schema_read_dependencies(stage)
         application = release["components"].get("nebulalog")
         migration = self.application_schema_transition(application, backup["application_schema"]["revision"]) if application else "none"
         if migration == ApplicationSchema.ADDITIVE_UPGRADE:
@@ -1403,6 +1530,7 @@ END $fence$; SELECT 'fenced';"""
             # database lock. An orphan client may still be about to connect.
             self.application_schema_fence(stage)
         if not (restoring and not restored):
+            self._schema_read_dependencies(stage)
             self.storage_maintenance(stage, held=True, delivery_held=True)
             if os.path.lexists(migration_intent) and not historical and not restored:
                 outcome = self.application_schema_recover(stage)
@@ -1410,6 +1538,7 @@ END $fence$; SELECT 'fenced';"""
                     raise Refused("Unproven migration outcome cannot authorize database restore")
             else:
                 self.application_schema_check(stage, evidence["application_schema"] if restored else None)
+        self._schema_stop_dependencies()
         self.service("stop", ("postgresql",))
         host = HostRuntime(self, stage) if "host" in release["components"] else None
         if host:
@@ -1430,6 +1559,7 @@ END $fence$; SELECT 'fenced';"""
             self.cmd(["systemctl", "daemon-reload"])
             self.service("start", ("postgresql",))
             self.pg_ready()
+            self._schema_read_dependencies(stage)
             self.application_schema_check(stage)
             self.service("start", tuple(name for name in self.services if name != "postgresql"))
             self.storage_maintenance(stage, held=True, delivery_held=False)
@@ -1471,6 +1601,7 @@ END $fence$; SELECT 'fenced';"""
                 self.cmd.feed(["podman", "exec", "-i", "--user", "999:999", "nebulalog-postgresql", "pg_restore",
                                "--username=postgres", "--exit-on-error", "--single-transaction", "--dbname=" + database],
                               stage / "recovery" / (database + ".dump"), timeout=600)
+        self._schema_read_dependencies(stage)
         self.application_schema_restore(stage, evidence["application_schema"])
         self._schema_record(stage / "adapter-database-restore-complete.json", restore_context)
         self.service("start", tuple(name for name in self.services if name != "postgresql"))
@@ -2027,6 +2158,7 @@ END $fence$; SELECT 'fenced';"""
                 self.service("stop", tuple(name for name in reversed(self.services) if name != "postgresql"))
                 self.service("start", ("postgresql",))
                 self.pg_ready()
+                self._schema_read_dependencies(stage)
                 self.storage_maintenance(stage, held=True, delivery_held=True)
                 self.application_schema_check(stage, proof["context"]["application_schema"])
                 if proof["context"] != self._os_preflight_context():

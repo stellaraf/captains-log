@@ -21,6 +21,7 @@ import tempfile
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from nebulalog_manager import host_payload as payload, image_bundle, publisher_inputs
 from nebulalog_manager.image_bundle import ApplicationSchema as application_schema
+from nebulalog_manager.image_bundle import RestoredAuthContract as restored_auth
 from nebulalog_manager.common import Refused, run
 from nebulalog_manager.baseline import ContentUpdate
 from nebulalog_manager.updates import verify_release, _utc, CLICKHOUSE_VERSION, validate_clickhouse_change
@@ -84,12 +85,14 @@ def write_json(path, value):
 
 def validate_recipe(value, now=None):
     fields = {"schema", "repository", "sequence", "version", "issued_at", "expires_at", "schema_revision", "source_commit", "components", "evidence_artifacts"}
-    if (not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"database_migration", "content_enrollment"} or type(value["schema"]) is not int or value["schema"] != 1
+    if (not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"database_migration", "content_enrollment", "restore_auth"} or type(value["schema"]) is not int or value["schema"] != 1
             or value["repository"] != REPOSITORY or type(value["sequence"]) is not int or not 0 < value["sequence"] < 2**63
             or not isinstance(value["version"], str) or not payload.VERSION.fullmatch(value["version"])
             or not isinstance(value["schema_revision"], str) or not re.fullmatch(r"[1-9][0-9]{0,8}", value["schema_revision"])
             or not isinstance(value["source_commit"], str) or not re.fullmatch(r"[a-f0-9]{40}", value["source_commit"])):
         raise Refused("Release recipe identity, sequence or schema is invalid")
+    if value["schema_revision"] == application_schema.HOST_CHALLENGE_REVISION:
+        raise Refused("Schema 4 packaging awaits fresh initialization, restored authentication, and image qualification")
     migration = value.get("database_migration", "none")
     if migration not in ("none", application_schema.ADDITIVE_UPGRADE) or migration == application_schema.ADDITIVE_UPGRADE and value["schema_revision"] != "2":
         raise Refused("Release recipe has no reviewed application migration")
@@ -128,6 +131,10 @@ def validate_recipe(value, now=None):
             or any(not isinstance(name, str) or not NAME.fullmatch(name) or not name.endswith(".json") for name in evidence)
             or len(set(evidence)) != len(evidence)):
         raise Refused("Only explicit bounded JSON qualification artifacts may accompany components")
+    if "restore_auth" in value and (value["restore_auth"] != restored_auth.CONTRACT
+            or value["schema_revision"] != "3" or migration != "none"
+            or not restored_auth.EVIDENCE <= set(evidence)):
+        raise Refused("Restored authentication requires schema 3 and exact captured-build and API-behavior evidence")
     return value
 
 
@@ -138,13 +145,16 @@ def verify_source(source, snapshot):
 
 
 def check_identity(recipe, stage, manifest):
+    evidence_names = set(recipe["evidence_artifacts"])
+    if "restore_auth" in recipe:
+        evidence_names -= restored_auth.EVIDENCE
     change = manifest["components"].get("keycloak")
     if change is None:
-        if recipe["evidence_artifacts"]:
+        if evidence_names:
             raise Refused("Unreferenced qualification artifacts are not published")
         return
     name = change["qualification_artifact"]
-    if name not in recipe["evidence_artifacts"]:
+    if name not in evidence_names:
         raise Refused("Keycloak requires the explicit browser qualification artifact")
     value = read_json(stage / name)
     if (not isinstance(value, dict) or type(value.get("schema")) is not int or value["schema"] != 1 or value.get("keycloak_image") != change["image"]
@@ -154,10 +164,10 @@ def check_identity(recipe, stage, manifest):
     for gate in IDENTITY_GATES:
         record = value["checks"].get(gate)
         if (not isinstance(record, dict) or record.get("status") != "passed" or record.get("method") != "real_browser"
-                or record.get("evidence_artifact") not in recipe["evidence_artifacts"] or record["evidence_artifact"] == name):
+                or record.get("evidence_artifact") not in evidence_names or record["evidence_artifact"] == name):
             raise Refused("Candidate-specific real browser qualification is incomplete")
         used.add(record["evidence_artifact"])
-    if used != set(recipe["evidence_artifacts"]):
+    if used != evidence_names:
         raise Refused("Unreferenced browser evidence is not published")
 
 
@@ -208,6 +218,12 @@ def assemble(source, source_manifest, image_directory, recipe_path, output, *, s
         if "content_enrollment" in recipe:
             manifest["content_enrollment"] = recipe["content_enrollment"]
         artifacts = {"host.tar": file_info(stage / "host.tar")}
+        if "restore_auth" in recipe:
+            manifest["restore_auth"] = restored_auth.declaration()
+            with (stage / restored_auth.SOURCE).open("xb") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(source_raw); stream.flush(); os.fsync(stream.fileno())
+            artifacts[restored_auth.SOURCE] = {"bytes": len(source_raw), "sha256": payload.digest(source_raw)}
         for name, spec in sorted(recipe["components"].items()):
             component = {**spec, "rollback_safe": True}
             if name == "host":
@@ -244,8 +260,16 @@ def assemble(source, source_manifest, image_directory, recipe_path, output, *, s
                 raise Refused("Qualification artifact changed after its content check")
         check_identity(recipe, stage, manifest)
         manifest["artifacts"] = [{"name": name, **value} for name, value in sorted(artifacts.items())]
+        if "restore_auth" in recipe:
+            # Binds reviewed image behavior, not native update/rollback acceptance.
+            # The latter remains a separate release-promotion gate below.
+            restored_auth.verify(manifest, stage, host=host, image=images["NEBULALOG_IMAGE"])
         write_json(stage / "manifest.json", manifest)
         for name, raw in (("source-manifest.json", source_raw), ("publisher-public.spki", public_raw), ("publisher-trust.json", descriptor_raw)):
+            if name == restored_auth.SOURCE and "restore_auth" in recipe:
+                if payload.read_regular(stage / name, payload.MAX_SOURCE_MANIFEST) != raw:
+                    raise Refused("Signed restored-authentication source snapshot changed")
+                continue
             with (stage / name).open("xb") as stream:
                 os.fchmod(stream.fileno(), 0o600)
                 stream.write(raw); stream.flush(); os.fsync(stream.fileno())
@@ -310,10 +334,14 @@ def verify_package(package, *, expected_manifest, expected_commit, source_tree=N
     recipe = {"schema": 1, "repository": REPOSITORY, "source_commit": expected_commit,
         **{key: manifest[key] for key in ("version", "sequence", "issued_at", "expires_at")},
         "schema_revision": manifest["components"]["nebulalog"]["schema_revision"],
-        "components": {}, "evidence_artifacts": [item["name"] for item in manifest["artifacts"] if item["name"] not in referenced]}
+        "components": {}, "evidence_artifacts": [item["name"] for item in manifest["artifacts"] if item["name"] not in referenced
+            and not ("restore_auth" in manifest and item["name"] == restored_auth.SOURCE)]}
     recipe["database_migration"] = manifest["components"]["nebulalog"]["database_migration"]
     if "content_enrollment" in manifest:
         recipe["content_enrollment"] = manifest["content_enrollment"]
+    if "restore_auth" in manifest:
+        restored_auth.validate_metadata(manifest)
+        recipe["restore_auth"] = restored_auth.CONTRACT
     application_schema.bind_source(source["files"], recipe["schema_revision"])
     for name, change in manifest["components"].items():
         if name == "baseline":
@@ -342,6 +370,8 @@ def verify_package(package, *, expected_manifest, expected_commit, source_tree=N
         image = image_bundle.verify_oci_archive(package / change["artifact"], change["image"])
         if name == "nebulalog" and image["application_source_sha256"] != record["application_source_sha256"]:
             raise Refused("OCI application differs from the frozen package source")
+    if "restore_auth" in manifest:
+        restored_auth.verify(manifest, package, host=host)
     return {"status": "artifacts_verified", "native_qualified": False, "manifest": manifest, "provenance": record}
 
 

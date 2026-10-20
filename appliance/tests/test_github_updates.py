@@ -378,6 +378,20 @@ class PollTests(unittest.TestCase):
         self.assertEqual(len(self.transport_calls.requests), 3)
         self.assertEqual(self.calls, [])
 
+    def test_restored_target_polls_metadata_without_downloading_or_installing_components(self):
+        marker = self.manager.state.parent / "restore.json"
+        marker.write_text("retained restore evidence")
+        current = (self.manager.state / "current.json").read_bytes()
+        for _ in range(2):
+            result = self.poll()
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["reason"], "restored_appliance_compatibility_pending")
+            self.assertEqual(result["next_check_at"], "2026-09-09T20:15:00+00:00")
+            self.assertEqual(len(self.transport_calls.requests), 3)
+            self.assertEqual(self.calls, [])
+            self.assertEqual((self.manager.state / "current.json").read_bytes(), current)
+            self.assertEqual(list((self.manager.state / "downloads").iterdir()), [])
+
     def test_tag_conflict_or_invalid_tag_type_never_installs(self):
         for tag in ("v0.1.2", "v0.1.1-rc1", None, 123):
             with self.subTest(tag=tag):

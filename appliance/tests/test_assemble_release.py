@@ -15,9 +15,11 @@ from unittest.mock import patch
 
 from nebulalog_manager import host_payload as payload, publisher_inputs
 from nebulalog_manager.common import Refused
+from nebulalog_manager.image_bundle import ApplicationSchema, RestoredAuthContract
 import test_host_payload as hosts
 import test_image_bundle as images
 import test_manager as manager
+from test_restore_auth_contract import build_receipt, behavior_receipt
 
 PACKER = Path(__file__).resolve().parents[1] / "packer"
 sys.path.insert(0, str(PACKER))
@@ -64,10 +66,17 @@ class ReleaseTests(unittest.TestCase):
         der = subprocess.check_output(["openssl", "pkey", "-pubin", "-in", str(self.public), "-pubout", "-outform", "DER"], stderr=subprocess.DEVNULL)
         descriptor = {"schema": 1, "publisher": "Test fixture", "repository": release.REPOSITORY, "key_id": "fixture",
                       "algorithm": "RSA-PSS-SHA256", "spki_sha256": payload.digest(der)}
+        legacy, additive, stepup = ApplicationSchema.reviewed_sql()
+        # These existing tests exercise the immutable schema-2 release contract.
+        # Current source migrations now describe fresh schema 3.
+        migrations = {"postgres.sql": (legacy + additive).encode(), "host_stepup.sql": stepup.encode(),
+                      "clickhouse.sql": (PACKER.parents[1] / "migrations/clickhouse.sql").read_bytes()}
+        migrations["clickhouse.sql"] = migrations["clickhouse.sql"].replace(
+            b"SETTINGS index_granularity=8192;", b"TTL expires_at DELETE\nSETTINGS index_granularity=8192;")
+        self.assertEqual(payload.digest(migrations["clickhouse.sql"]), ApplicationSchema.SCHEMAS["2"]["migrations/clickhouse.sql"])
         for name, raw in ((publisher_inputs.PUBLIC_SOURCE, raw_public), (publisher_inputs.DESCRIPTOR_SOURCE, payload.encoded(descriptor)),
                           ("go.mod", b"module fixture\n"), ("cmd/nebulalog/main.go", b"package main\n"),
-                          *(("migrations/" + name, (PACKER.parents[1] / "migrations" / name).read_bytes())
-                            for name in ("postgres.sql", "clickhouse.sql", "host_stepup.sql"))):
+                          *(("migrations/" + name, raw) for name, raw in migrations.items())):
             path = self.source / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(raw)
@@ -171,6 +180,48 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertFalse(payload.PRIVATE_KEY.search(path.read_bytes()))
         self.assertFalse(result["network_used"])
+
+    def restored_auth(self):
+        snapshot = json.loads(self.snapshot_path.read_bytes())
+        for name in RestoredAuthContract.REQUIRED_SOURCE | set(ApplicationSchema.SCHEMAS["3"]):
+            raw = ((PACKER.parents[1] / name).read_bytes() if name.startswith("migrations/") else (name + " fixture\n").encode())
+            path = self.source / name
+            path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(raw)
+            snapshot["files"][name] = payload.digest(raw)
+        self.snapshot_path.write_bytes(payload.encoded(snapshot))
+        shutil.rmtree(self.images)  # Only this test's generated tiny OCI fixture.
+        self.pins, self.image_manifest, _ = images.fixture_bundle(self.images, application_source_sha256=release.application_hash(snapshot))
+        image = release.image_bundle.verify_bundle(self.images, self.pins)["images"]["NEBULALOG_IMAGE"]
+        self.recipe.update(schema_revision="3", restore_auth=RestoredAuthContract.CONTRACT,
+                           evidence_artifacts=sorted(RestoredAuthContract.EVIDENCE))
+        for name, value in ((RestoredAuthContract.BUILD, build_receipt(snapshot, image, self.recipe["version"])),
+                            (RestoredAuthContract.BEHAVIOR, behavior_receipt(image, self.pins["NEBULALOG_IMAGE"]))):
+            (self.evidence / name).write_bytes(payload.encoded(value))
+
+    def test_restored_auth_source_and_behavior_are_signed_without_native_acceptance_claim(self):
+        self.restored_auth()
+        self.assemble()
+        result = self.verify()
+        manifest = result["manifest"]
+        self.assertEqual(manifest["restore_auth"], RestoredAuthContract.declaration())
+        self.assertTrue({RestoredAuthContract.SOURCE, *RestoredAuthContract.EVIDENCE} <= {item["name"] for item in manifest["artifacts"]})
+        self.assertFalse(result["native_qualified"])
+        self.assertFalse(RestoredAuthContract.verify(manifest, self.output)["execution_verified_by_tool"])
+
+    def test_restored_auth_failed_behavior_and_unbound_build_refuse_before_signature(self):
+        self.restored_auth()
+        path = self.evidence / RestoredAuthContract.BEHAVIOR
+        value = json.loads(path.read_bytes())
+        value["cases"]["before_cutoff"]["http_status"] = 200
+        path.write_bytes(payload.encoded(value))
+        with self.assertRaisesRegex(Refused, "boundary case"): self.assemble()
+        self.assertFalse(self.output.exists())
+        self.restored_auth()
+        path = self.evidence / RestoredAuthContract.BUILD
+        value = json.loads(path.read_bytes()); value["local_image_id"] = "sha256:" + "f" * 64
+        path.write_bytes(payload.encoded(value))
+        with self.assertRaisesRegex(Refused, "build receipt"): self.assemble()
+        self.assertFalse(self.output.exists())
 
     def test_unsigned_package_cannot_pass_publication_verification(self):
         result = self.assemble(signed=False)

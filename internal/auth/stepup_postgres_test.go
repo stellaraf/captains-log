@@ -1,14 +1,19 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,14 +25,192 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// This is an operator-owned fixture description, never a browser input or a
+// production DSN. It pins an already-running test service and contains a private
+// fixture credential. Do not include its contents in test output or receipts.
+type stepUpPGFixtureTarget struct {
+	ContainerID string `json:"container_id"`
+	ImageID     string `json:"image_id"`
+	DataPath    string `json:"data_path"`
+	Port        uint16 `json:"port"`
+	Password    string `json:"password"`
+	SystemID    string `json:"system_id"`
+}
+
+func readStepUpPGFixtureTarget(path string) (stepUpPGFixtureTarget, error) {
+	var target stepUpPGFixtureTarget
+	bad := errors.New("private PostgreSQL fixture target is invalid")
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return target, bad
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil || resolved != path {
+		return target, bad
+	}
+	parent, err := os.Lstat(filepath.Dir(path))
+	if err != nil || !parent.IsDir() || parent.Mode().Perm() != 0700 {
+		return target, bad
+	}
+	before, err := os.Lstat(path)
+	if err != nil || !before.Mode().IsRegular() || before.Mode().Perm() != 0600 || before.Size() > 8192 {
+		return target, bad
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return target, bad
+	}
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil || !os.SameFile(before, opened) {
+		return target, bad
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, 8193))
+	after, statErr := os.Lstat(path)
+	if err != nil || statErr != nil || len(raw) > 8192 || !os.SameFile(before, after) || before.Size() != after.Size() || before.ModTime() != after.ModTime() {
+		return target, bad
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&target) != nil || decoder.Decode(new(any)) != io.EOF ||
+		!regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(target.ContainerID) ||
+		!regexp.MustCompile(`^sha256:[a-f0-9]{64}$`).MatchString(target.ImageID) ||
+		!regexp.MustCompile(`^[0-9]{1,20}$`).MatchString(target.SystemID) ||
+		!filepath.IsAbs(target.DataPath) || target.Port == 0 || target.Port == 25432 || len(target.Password) == 0 || len(target.Password) > 1024 {
+		return stepUpPGFixtureTarget{}, bad
+	}
+	resolved, err = filepath.EvalSymlinks(target.DataPath)
+	if err != nil || resolved != target.DataPath {
+		return stepUpPGFixtureTarget{}, bad
+	}
+	return target, nil
+}
+
+func pinnedStepUpPGFixture(t *testing.T, path string) (*pgxpool.Config, string) {
+	t.Helper()
+	target, err := readStepUpPGFixtureTarget(path)
+	if err != nil {
+		t.Fatal("protected PostgreSQL fixture target unavailable")
+	}
+	// Inspect only nonsecret fields, and never restart, create or pull a service.
+	format := `{"id":{{json .Id}},"image":{{json .Image}},"running":{{json .State.Running}},"label":{{json (index .Config.Labels "captainslog.fixture")}},"memory":{{json .HostConfig.Memory}},"cpu":{{json .HostConfig.NanoCpus}},"mounts":{{json .Mounts}},"ports":{{json .NetworkSettings.Ports}}}`
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	raw, err := exec.CommandContext(ctx, "docker", "inspect", "--format", format, target.ContainerID).Output()
+	var observed struct {
+		ID, Image, Label string
+		Running          bool
+		Memory, CPU      int64
+		Mounts           []struct {
+			Type, Source, Destination string
+			RW                        bool
+		}
+		Ports map[string][]struct {
+			HostIP   string `json:"HostIp"`
+			HostPort string
+		}
+	}
+	if err != nil || len(raw) > 16384 || json.Unmarshal(raw, &observed) != nil ||
+		observed.ID != target.ContainerID || observed.Image != target.ImageID || !observed.Running ||
+		observed.Label != "emergency-destructive" || observed.Memory <= 0 || observed.Memory > 384<<20 || observed.CPU <= 0 || observed.CPU > 1e9 ||
+		len(observed.Mounts) != 1 || observed.Mounts[0].Type != "bind" || observed.Mounts[0].Source != target.DataPath || observed.Mounts[0].Destination != "/var/lib/postgresql/data" || !observed.Mounts[0].RW ||
+		len(observed.Ports) != 1 || len(observed.Ports["5432/tcp"]) != 1 || observed.Ports["5432/tcp"][0].HostIP != "127.0.0.1" || observed.Ports["5432/tcp"][0].HostPort != strconv.Itoa(int(target.Port)) {
+		t.Fatal("existing PostgreSQL fixture identity differs from its protected target")
+	}
+	config, err := pgxpool.ParseConfig("postgres://127.0.0.1:" + strconv.Itoa(int(target.Port)) + "/emergency_test?sslmode=disable")
+	if err != nil {
+		t.Fatal("isolated PostgreSQL fixture configuration invalid")
+	}
+	config.ConnConfig.User, config.ConnConfig.Password = "emergency_test", target.Password
+	config.ConnConfig.RuntimeParams = map[string]string{"application_name": "captainslog-stepup-fixture", "statement_timeout": "5000", "lock_timeout": "1000", "idle_in_transaction_session_timeout": "10000", "temp_file_limit": "16384", "work_mem": "1MB"}
+	return config, target.SystemID
+}
+
+func TestPostgresStepUpFixtureTargetAdmission(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0700); err != nil {
+		t.Fatal("fixture directory unavailable")
+	}
+	path := filepath.Join(root, "target.json")
+	target := stepUpPGFixtureTarget{ContainerID: strings.Repeat("a", 64), ImageID: "sha256:" + strings.Repeat("b", 64), DataPath: root, Port: 58002, Password: "synthetic-fixture-only", SystemID: "1"}
+	write := func(value stepUpPGFixtureTarget, mode os.FileMode) {
+		t.Helper()
+		raw, _ := json.Marshal(value)
+		if os.WriteFile(path, raw, 0600) != nil || os.Chmod(path, mode) != nil {
+			t.Fatal("fixture target write failed")
+		}
+	}
+	write(target, 0600)
+	if got, err := readStepUpPGFixtureTarget(path); err != nil || got != target {
+		t.Fatal("private exact fixture target refused")
+	}
+	for name, mutate := range map[string]func(*stepUpPGFixtureTarget){
+		"live dev port":           func(v *stepUpPGFixtureTarget) { v.Port = 25432 },
+		"missing credential":      func(v *stepUpPGFixtureTarget) { v.Password = "" },
+		"container name":          func(v *stepUpPGFixtureTarget) { v.ContainerID = "postgres" },
+		"mutable image":           func(v *stepUpPGFixtureTarget) { v.ImageID = "postgres:latest" },
+		"relative mount":          func(v *stepUpPGFixtureTarget) { v.DataPath = "data" },
+		"missing server identity": func(v *stepUpPGFixtureTarget) { v.SystemID = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			other := target
+			mutate(&other)
+			write(other, 0600)
+			if _, err := readStepUpPGFixtureTarget(path); err == nil {
+				t.Fatal("unsafe fixture target accepted")
+			}
+		})
+	}
+	write(target, 0644)
+	if _, err := readStepUpPGFixtureTarget(path); err == nil {
+		t.Fatal("readable credential accepted")
+	}
+	write(target, 0600)
+	link := filepath.Join(root, "link.json")
+	if os.Symlink(path, link) != nil {
+		t.Fatal("fixture symlink unavailable")
+	}
+	if _, err := readStepUpPGFixtureTarget(link); err == nil {
+		t.Fatal("symlink target accepted")
+	}
+	if os.WriteFile(path, []byte(strings.Repeat("x", 8193)), 0600) != nil {
+		t.Fatal("fixture write failed")
+	}
+	if _, err := readStepUpPGFixtureTarget(path); err == nil {
+		t.Fatal("oversized fixture target accepted")
+	}
+}
+
+func TestPostgresStepUpFixtureSelectorNeverFallsBack(t *testing.T) {
+	if os.Getenv("NEBULALOG_STEPUP_FIXTURE_REFUSAL_CHILD") == "1" {
+		postgresStepUpTestPool(t)
+		t.Fatal("invalid selected fixture reached a database")
+	}
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal("test executable unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binary, "-test.run=^TestPostgresStepUpFixtureSelectorNeverFallsBack$")
+	cmd.Env = append(os.Environ(), "NEBULALOG_STEPUP_FIXTURE_REFUSAL_CHILD=1", "NEBULALOG_STEPUP_POSTGRES_TEST=1", "NEBULALOG_STEPUP_POSTGRES_FIXTURE_CONFIG=")
+	raw, err := cmd.CombinedOutput()
+	if err == nil || ctx.Err() != nil || !strings.Contains(string(raw), "protected PostgreSQL fixture target unavailable") || strings.Contains(string(raw), "local PostgreSQL configuration") {
+		t.Fatal("invalid fixture selector did not refuse before legacy fallback")
+	}
+}
+
 func postgresStepUpFixture() stepUpPending {
-	now := time.Now().UTC().Truncate(time.Microsecond)
-	return stepUpPending{
+	now := time.Now().UTC().Truncate(time.Second)
+	p := stepUpPending{
 		StateHash: strings.Repeat("1", 64), Nonce: strings.Repeat("n", 43), Verifier: strings.Repeat("v", 43), PolicyDigest: strings.Repeat("2", 64),
 		Actor:     stepUpActor{Issuer: "https://issuer.example/realms/nebulalog", Subject: "synthetic-subject", ClientID: "nebulalog", SessionDigest: strings.Repeat("3", 64)},
 		Binding:   StepUpBinding{InstallationID: "11111111-2222-3333-4444-555555555555", Operation: "storage.grow", PlanID: "66666666-7777-8888-9999-aaaaaaaaaaaa", PlanDigest: strings.Repeat("4", 64), ResourceRevision: strings.Repeat("5", 64), ExpiresAt: now.Add(2 * time.Minute)},
 		CreatedAt: now, ExpiresAt: now.Add(2 * time.Minute),
 	}
+	p.Binding.Challenge = syntheticStepUpChallenge(p.Binding, p.Actor.Issuer, p.Actor.ClientID, p.Actor.Subject, "synthetic-original-session", now)
+	p.Nonce = p.Binding.Challenge.Nonce
+	p.Actor.SessionDigest = p.Binding.Challenge.SessionDigest
+	return p
 }
 
 func TestPostgresStepUpRefusesInvalidPendingBeforeDatabaseAccess(t *testing.T) {
@@ -51,10 +234,22 @@ func TestPostgresStepUpRefusesInvalidPendingBeforeDatabaseAccess(t *testing.T) {
 			p.ExpiresAt = p.CreatedAt.Add(121 * time.Second)
 			p.Binding.ExpiresAt = p.ExpiresAt
 		},
-		"expired binding":    func(p *stepUpPending) { p.Binding.ExpiresAt = p.ExpiresAt.Add(-time.Microsecond) },
-		"creation precision": func(p *stepUpPending) { p.CreatedAt = p.CreatedAt.Add(time.Nanosecond) },
-		"expiry precision":   func(p *stepUpPending) { p.ExpiresAt = p.ExpiresAt.Add(-time.Nanosecond) },
-		"binding precision":  func(p *stepUpPending) { p.Binding.ExpiresAt = p.Binding.ExpiresAt.Add(time.Nanosecond) },
+		"expired binding":                  func(p *stepUpPending) { p.Binding.ExpiresAt = p.ExpiresAt.Add(-time.Microsecond) },
+		"creation precision":               func(p *stepUpPending) { p.CreatedAt = p.CreatedAt.Add(time.Nanosecond) },
+		"expiry precision":                 func(p *stepUpPending) { p.ExpiresAt = p.ExpiresAt.Add(-time.Nanosecond) },
+		"binding precision":                func(p *stepUpPending) { p.Binding.ExpiresAt = p.Binding.ExpiresAt.Add(time.Nanosecond) },
+		"missing host challenge":           func(p *stepUpPending) { p.Binding.Challenge = HostChallenge{} },
+		"local substituted nonce":          func(p *stepUpPending) { p.Nonce = strings.Repeat("x", 43) },
+		"challenge subject":                func(p *stepUpPending) { p.Binding.Challenge.SubjectDigest = strings.Repeat("e", 64) },
+		"challenge session":                func(p *stepUpPending) { p.Binding.Challenge.SessionDigest = strings.Repeat("e", 64) },
+		"challenge installation":           func(p *stepUpPending) { p.Binding.Challenge.InstallationID = "aaaaaaaa-2222-3333-4444-555555555555" },
+		"challenge operation":              func(p *stepUpPending) { p.Binding.Challenge.Operation = "backup.create" },
+		"challenge plan":                   func(p *stepUpPending) { p.Binding.Challenge.PlanID = "aaaaaaaa-7777-8888-9999-aaaaaaaaaaaa" },
+		"challenge digest":                 func(p *stepUpPending) { p.Binding.Challenge.PlanDigest = strings.Repeat("e", 64) },
+		"challenge revision":               func(p *stepUpPending) { p.Binding.Challenge.ResourceRevision = strings.Repeat("e", 64) },
+		"challenge policy":                 func(p *stepUpPending) { p.Binding.Challenge.PolicyGeneration = "missing" },
+		"challenge issued after creation":  func(p *stepUpPending) { p.Binding.Challenge.IssuedAt++ },
+		"challenge expires before pending": func(p *stepUpPending) { p.Binding.Challenge.ExpiresAt-- },
 	}
 	store := NewPostgresStepUpStore(nil)
 	for name, mutate := range mutations {
@@ -99,31 +294,46 @@ func postgresStepUpTestPool(t *testing.T) *pgxpool.Pool {
 	if os.Getenv("NEBULALOG_STEPUP_POSTGRES_TEST") != "1" {
 		t.Skip("opt-in isolated local PostgreSQL integration")
 	}
-	b, err := os.ReadFile(filepath.Join("..", "..", ".local", "dev.env"))
-	if err != nil {
-		t.Fatal("local PostgreSQL configuration unavailable")
-	}
-	var password string
-	for _, line := range strings.Split(string(b), "\n") {
-		if key, value, ok := strings.Cut(line, "="); ok && key == "PG_PASSWORD" {
-			password = value
+	var config *pgxpool.Config
+	var expectedSystemID string
+	if path, selected := os.LookupEnv("NEBULALOG_STEPUP_POSTGRES_FIXTURE_CONFIG"); selected {
+		// A selected but invalid fixture must never fall back to the live dev DB.
+		config, expectedSystemID = pinnedStepUpPGFixture(t, path)
+	} else {
+		b, err := os.ReadFile(filepath.Join("..", "..", ".local", "dev.env"))
+		if err != nil {
+			t.Fatal("local PostgreSQL configuration unavailable")
 		}
+		var password string
+		for _, line := range strings.Split(string(b), "\n") {
+			if key, value, ok := strings.Cut(line, "="); ok && key == "PG_PASSWORD" {
+				password = value
+			}
+		}
+		if password == "" {
+			t.Fatal("local PostgreSQL credential unavailable")
+		}
+		config, err = pgxpool.ParseConfig("postgres://127.0.0.1:25432/nebulalog?sslmode=disable")
+		if err != nil {
+			t.Fatal("local PostgreSQL configuration invalid")
+		}
+		config.ConnConfig.User, config.ConnConfig.Password = "nebulalog", password
 	}
-	if password == "" {
-		t.Fatal("local PostgreSQL credential unavailable")
-	}
-	config, err := pgxpool.ParseConfig("postgres://127.0.0.1:25432/nebulalog?sslmode=disable")
-	if err != nil {
-		t.Fatal("local PostgreSQL configuration invalid")
-	}
-	config.ConnConfig.User, config.ConnConfig.Password = "nebulalog", password
 	config.ConnConfig.ConnectTimeout = 3 * time.Second
-	config.MaxConns = 12
+	config.MaxConns = 4
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	admin, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		t.Fatal("local PostgreSQL connection unavailable")
+	}
+	if expectedSystemID != "" {
+		var systemID, database, user, version string
+		err = admin.QueryRow(ctx, "SELECT system_identifier::text,current_database(),current_user,current_setting('server_version_num') FROM pg_control_system()").Scan(&systemID, &database, &user, &version)
+		if err != nil || systemID != expectedSystemID || database != "emergency_test" || user != "emergency_test" || version != "170006" {
+			admin.Close()
+			t.Fatal("connected PostgreSQL server differs from the isolated fixture")
+		}
 	}
 	var suffix [12]byte
 	if _, err := rand.Read(suffix[:]); err != nil {
@@ -156,13 +366,15 @@ func postgresStepUpTestPool(t *testing.T) *pgxpool.Pool {
 		t.Fatal("isolated test connection unavailable")
 	}
 	t.Cleanup(pool.Close)
-	migration, err := os.ReadFile(filepath.Join("..", "..", "migrations", "host_stepup.sql"))
-	if err != nil {
-		t.Fatal("step-up migration unavailable")
-	}
 	for range 2 {
-		if _, err := pool.Exec(ctx, string(migration)); err != nil {
-			t.Fatal("step-up migration failed in isolated schema")
+		for _, name := range []string{"host_stepup.sql", "host_stepup_v2.sql"} {
+			migration, err := os.ReadFile(filepath.Join("..", "..", "migrations", name))
+			if err != nil {
+				t.Fatal("explicit step-up migration unavailable")
+			}
+			if _, err := pool.Exec(ctx, string(migration)); err != nil {
+				t.Fatal("explicit step-up migration failed in isolated schema")
+			}
 		}
 	}
 	return pool
@@ -182,7 +394,7 @@ func TestPostgresStepUpAtomicIntegration(t *testing.T) {
 	defer cancel()
 	clear := func(t *testing.T) {
 		t.Helper()
-		if _, err := pool.Exec(ctx, "TRUNCATE host_stepup_pending"); err != nil {
+		if _, err := pool.Exec(ctx, "TRUNCATE host_stepup_pending_v2"); err != nil {
 			t.Fatal("isolated table cleanup failed")
 		}
 	}
@@ -190,6 +402,8 @@ func TestPostgresStepUpAtomicIntegration(t *testing.T) {
 	t.Run("all bindings refuse without consuming", func(t *testing.T) {
 		clear(t)
 		p := postgresStepUpFixture()
+		p.Binding.Challenge.ExpiresAt--
+		p.ExpiresAt = p.ExpiresAt.Add(-time.Second)
 		insertPostgresStepUpFixture(t, pool, p)
 		mutations := map[string]func(*stepUpPending){
 			"state":          func(p *stepUpPending) { p.StateHash = strings.Repeat("a", 64) },
@@ -215,6 +429,16 @@ func TestPostgresStepUpAtomicIntegration(t *testing.T) {
 				}
 			})
 		}
+		for name, mutate := range stepUpChallengeMutations() {
+			t.Run("host challenge "+name, func(t *testing.T) {
+				other := p
+				mutate(&other.Binding.Challenge)
+				got, err := store.Consume(ctx, other.StateHash, other.Actor, other.Binding, other.PolicyDigest, p.CreatedAt)
+				if !errors.Is(err, ErrStepUpTransaction) || got != (stepUpPending{}) {
+					t.Fatal("changed host challenge returned database evidence")
+				}
+			})
+		}
 		got, err := store.Consume(ctx, p.StateHash, p.Actor, p.Binding, p.PolicyDigest, p.CreatedAt)
 		if err != nil || got != p {
 			t.Fatal("matching transaction did not survive mismatches or failed exact round trip")
@@ -225,12 +449,36 @@ func TestPostgresStepUpAtomicIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("legacy rows remain inert without promotion", func(t *testing.T) {
+		clear(t)
+		p := postgresStepUpFixture()
+		insertPostgresStepUpFixture(t, pool, p)
+		_, err := pool.Exec(ctx, `INSERT INTO host_stepup_pending
+ SELECT state_hash, nonce, pkce_verifier, policy_digest,
+ actor_issuer, actor_subject, actor_client_id, actor_session_digest,
+ installation_id, operation, plan_id, plan_digest, resource_revision,
+ binding_expires_at, created_at, expires_at FROM host_stepup_pending_v2`)
+		if err != nil {
+			t.Fatal("legacy synthetic transaction seed failed")
+		}
+		clear(t)
+		got, err := store.Consume(ctx, p.StateHash, p.Actor, p.Binding, p.PolicyDigest, p.CreatedAt)
+		if !errors.Is(err, ErrStepUpTransaction) || got != (stepUpPending{}) {
+			t.Fatal("legacy pending row gained host-challenge authority")
+		}
+		var legacy int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM host_stepup_pending").Scan(&legacy); err != nil || legacy != 1 {
+			t.Fatal("legacy authority evidence was not retained separately")
+		}
+	})
+
 	t.Run("duplicate state does not replace transaction", func(t *testing.T) {
 		clear(t)
 		p := postgresStepUpFixture()
 		insertPostgresStepUpFixture(t, pool, p)
 		other := p
 		other.Nonce = strings.Repeat("o", 43)
+		other.Binding.Challenge.Nonce = other.Nonce
 		if err := store.Insert(ctx, other); !errors.Is(err, ErrStepUpUnavailable) {
 			t.Fatal("duplicate state replaced pending evidence or exposed database details")
 		}
@@ -288,13 +536,16 @@ func TestPostgresStepUpAtomicIntegration(t *testing.T) {
 		p := postgresStepUpFixture()
 		insertPostgresStepUpFixture(t, pool, p)
 		for _, assignment := range []string{
+			"record_schema = 1", "challenge_schema = 0", "challenge_id = 'invalid'", "challenge_subject_digest = 'invalid'",
+			"challenge_operation_schema = 0", "challenge_action = '../run'", "challenge_request_digest = 'invalid'", "challenge_policy_generation = 'invalid'",
+			"challenge_issued_at = -1", "challenge_expires_at = challenge_issued_at", "challenge_expires_at = challenge_issued_at + 121",
 			"state_hash = 'raw-state'", "nonce = 'short'", "pkce_verifier = 'short'", "policy_digest = 'bad'",
 			"actor_subject = ''", "actor_issuer = ''", "actor_client_id = ''", "actor_session_digest = 'raw-session'",
 			"installation_id = 'bad'", "operation = '../run'", "plan_id = 'bad'", "plan_digest = 'bad'", "resource_revision = 'bad'",
 			"expires_at = created_at", "expires_at = created_at + interval '121 seconds'", "binding_expires_at = created_at",
 			"created_at = '-infinity'", "expires_at = 'infinity'", "binding_expires_at = 'infinity'",
 		} {
-			_, err := pool.Exec(ctx, "UPDATE host_stepup_pending SET "+assignment)
+			_, err := pool.Exec(ctx, "UPDATE host_stepup_pending_v2 SET "+assignment)
 			var pgErr *pgconn.PgError
 			if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
 				t.Fatal("database accepted malformed transaction")
@@ -306,19 +557,21 @@ func TestPostgresStepUpAtomicIntegration(t *testing.T) {
 		clear(t)
 		p := postgresStepUpFixture()
 		insertPostgresStepUpFixture(t, pool, p)
-		_, err := pool.Exec(ctx, `INSERT INTO host_stepup_pending
- SELECT lpad(to_hex(n),64,'0'), nonce, pkce_verifier, policy_digest,
+		_, err := pool.Exec(ctx, `INSERT INTO host_stepup_pending_v2
+ SELECT 2, lpad(to_hex(n),64,'0'), nonce, pkce_verifier, policy_digest,
  actor_issuer, actor_subject, actor_client_id, actor_session_digest,
  installation_id, operation, plan_id, plan_digest, resource_revision,
- binding_expires_at - interval '5 minutes', created_at - interval '5 minutes', expires_at - interval '5 minutes'
- FROM host_stepup_pending CROSS JOIN generate_series(1,$1) AS n`, stepUpRetentionBatch+9)
+ binding_expires_at - interval '5 minutes', created_at - interval '5 minutes', expires_at - interval '5 minutes',
+ challenge_schema, challenge_id, challenge_subject_digest, challenge_operation_schema,
+ challenge_action, challenge_request_digest, challenge_policy_generation, challenge_issued_at - 300, challenge_expires_at - 300
+ FROM host_stepup_pending_v2 CROSS JOIN generate_series(1,$1) AS n`, stepUpRetentionBatch+9)
 		if err != nil {
 			t.Fatal("expired synthetic transaction seed failed")
 		}
 		p.StateHash = strings.Repeat("e", 64)
 		insertPostgresStepUpFixture(t, pool, p)
 		var expired, live int
-		if err := pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE expires_at <= statement_timestamp()), count(*) FILTER (WHERE expires_at > statement_timestamp()) FROM host_stepup_pending`).Scan(&expired, &live); err != nil || expired != 9 || live != 2 {
+		if err := pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE expires_at <= statement_timestamp()), count(*) FILTER (WHERE expires_at > statement_timestamp()) FROM host_stepup_pending_v2`).Scan(&expired, &live); err != nil || expired != 9 || live != 2 {
 			t.Fatal("retention exceeded batch bound or erased pending transaction")
 		}
 	})

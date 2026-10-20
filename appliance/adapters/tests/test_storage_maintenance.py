@@ -4,6 +4,7 @@ Opt in with CAPTAINSLOG_GATE_TEST_CONTAINER naming the isolated, labelled
 emergency fixture. These are host-source/SQL tests, not native Podman acceptance.
 """
 import hashlib
+import copy
 import json
 import os
 from pathlib import Path
@@ -29,6 +30,122 @@ class GateShapeTests(unittest.TestCase):
                       {**IDLE, "held": True}, {**IDLE, "held": True, "operation": "a" * 64 + "\n"}):
             with self.subTest(value=value), self.assertRaises(Refused):
                 lifecycle.storage_gate_value(value)
+
+
+class NativeBackupStageTests(unittest.TestCase):
+    """Only the owned log-backup leaf extends the existing stage allowlist."""
+    def setUp(self):
+        from nebulalog_manager import log_backup
+        self.native = log_backup
+        temporary = tempfile.TemporaryDirectory(); self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.stage = self.root / "manager/log-backups" / str(uuid.uuid4())
+        self.stage.mkdir(parents=True, mode=0o700)
+        self.value = {"schema": 1, "kind": "log-backup", "id": self.stage.name, "stage": str(self.stage),
+                      "mode": "backup", "state": "holding"}
+        self.save()
+        self.gate = self.root / "manager/storage-maintenance/gate.json"
+        self.gate.parent.mkdir(mode=0o755)
+        self.gate.parent.chmod(0o755)
+        self.gate.write_text(json.dumps(IDLE)); self.gate.chmod(0o644)
+        self.calls = []
+        self.manager = lifecycle.Lifecycle({"schema_revision": "3"}, self.command,
+            state=self.root / "manager/updates", data=self.root, guard=lambda: None)
+        self.manager._retention_table = lambda stage: {"table_uuid": "cfafbf54-552a-40ad-aa6b-2ea96e5f4460", "mode": "partition", "ttl": False}
+        def directory(path, **kwargs):
+            if not path.is_dir() or path.is_symlink() or path.stat().st_mode & 0o077:
+                raise Refused("Unsafe synthetic stage")
+        for item in (patch.object(lifecycle, "STORAGE_OWNER_UID", os.getuid()),
+                     patch.object(lifecycle, "STORAGE_OWNER_GID", os.getgid()),
+                     patch.object(lifecycle, "trusted_file", side_effect=lambda p: p),
+                     patch.object(log_backup, "trusted_file", side_effect=lambda p: p),
+                     patch.object(log_backup, "_directory", side_effect=directory)):
+            item.start(); self.addCleanup(item.stop)
+
+    def save(self):
+        path = self.stage / "native.json"
+        path.write_text(json.dumps(self.value)); path.chmod(0o600)
+
+    def command(self, argv, *, input, timeout):
+        self.calls.append((argv, input))
+        self.assertIn(b"Pending retention removal", input)
+        self.assertIn(b"Pending removal", input)
+        return json.dumps({"schema": 1, "held": True, "delivery_held": False,
+                           "operation": hashlib.sha256(str(self.stage).encode()).hexdigest()})
+
+    def test_exact_owned_stage_crosses_existing_barrier(self):
+        result = self.manager.storage_maintenance(self.stage, held=True)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(result["gate"]["held"], True)
+        self.assertEqual(result["gate"]["delivery_held"], False)
+
+    def test_wrong_owner_kind_mode_or_state_refuses_before_host_fence(self):
+        original = copy.deepcopy(self.value)
+        for field, value in (("id", str(uuid.uuid4())), ("stage", str(self.root)), ("kind", "other"),
+                             ("mode", "restore"), ("state", "unknown"), ("schema", True)):
+            self.value = {**original, field: value}; self.save()
+            with self.subTest(field=field), self.assertRaises(Refused):
+                self.manager.storage_maintenance(self.stage, held=True)
+            self.assertEqual(json.loads(self.gate.read_text()), IDLE)
+        self.assertFalse(self.calls)
+
+    def test_missing_linked_and_noncanonical_stage_refuse(self):
+        (self.stage / "native.json").unlink()
+        with self.assertRaises((Refused, FileNotFoundError)):
+            self.manager.storage_maintenance(self.stage, held=True)
+        self.save()
+        alias = self.stage.parent / str(uuid.uuid4()); alias.symlink_to(self.stage, target_is_directory=True)
+        with self.assertRaises(Refused): self.manager.storage_maintenance(alias, held=True)
+        other = self.root / "manager/unrelated" / self.stage.name; other.mkdir(parents=True)
+        with self.assertRaises(Refused): self.manager.storage_maintenance(other, held=True)
+        self.assertFalse(self.calls)
+
+
+class RetentionIdentityTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(); self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.stage = self.root / 'manager/updates/releases/three'; self.stage.mkdir(parents=True)
+        self.gate = self.root / 'manager/storage-maintenance/gate.json'; self.gate.parent.mkdir()
+        self.gate.write_text(json.dumps({**IDLE, 'held': True, 'delivery_held': True,
+            'operation': hashlib.sha256(str(self.stage.resolve()).encode()).hexdigest()}))
+        self.engine = {'schema': 1, 'mode': 'partition', 'table_uuid': 'cfafbf54-552a-40ad-aa6b-2ea96e5f4460'}
+        self.row = {'uuid': self.engine['table_uuid'], 'engine': 'MergeTree', 'partition_key': '(log_type, toDate(ingested_at))',
+                    'create_table_query': 'CREATE TABLE nebulalog.events ENGINE=MergeTree PARTITION BY (log_type, toDate(ingested_at))'}
+        self.manager = lifecycle.Lifecycle({'schema_revision': '3'}, data=self.root, state=self.root / 'manager/updates', guard=lambda: None)
+        self.manager._schema_psql = lambda query: json.dumps(self.engine)
+        self.manager.ch = lambda query: json.dumps(self.row)
+        guard = patch.object(lifecycle, 'trusted_file', side_effect=lambda p: p); guard.start(); self.addCleanup(guard.stop)
+
+    def test_matching_table_requires_stable_engine_and_exact_hold(self):
+        self.assertEqual(self.manager._retention_table(self.stage)['table_uuid'], self.engine['table_uuid'])
+        def changed(query):
+            raw = json.dumps(self.row); self.engine['mode'] = 'migrating'; return raw
+        self.manager.ch = changed
+        with self.assertRaisesRegex(Refused, 'ownership changed'): self.manager._retention_table(self.stage)
+        self.engine['mode'] = 'partition'; self.gate.write_text(json.dumps(IDLE))
+        with self.assertRaisesRegex(Refused, 'exact host'): self.manager._retention_table(self.stage)
+
+    def test_wrong_identity_ttl_engine_partition_and_missing_rows_refuse(self):
+        original = copy.deepcopy(self.row)
+        for key, value in (('uuid', '11111111-1111-4111-8111-111111111111'), ('engine', 'ReplacingMergeTree'),
+                           ('partition_key', 'toDate(ingested_at)'), ('create_table_query', 'CREATE TABLE events TTL received_at'),
+                           ('create_table_query', ''), ('create_table_query', None)):
+            with self.subTest(key=key, value=value):
+                self.row = {**original, key: value}
+                with self.assertRaises(Refused): self.manager._retention_table(self.stage)
+        for raw in ('', json.dumps(original) + '\n' + json.dumps(original), '[]'):
+            self.manager.ch = lambda query, raw=raw: raw
+            with self.subTest(raw=raw), self.assertRaises(Refused): self.manager._retention_table(self.stage)
+
+    def test_unsettled_or_malformed_engine_refuses_before_clickhouse(self):
+        def forbidden(query): raise AssertionError('ClickHouse must not run for an unsettled engine')
+        self.manager.ch = forbidden
+        for value in ({**self.engine, 'mode': 'migrating'}, {**self.engine, 'mode': 'uninitialized'},
+                      {**self.engine, 'mode': 'unknown'}, {**self.engine, 'schema': True},
+                      {**self.engine, 'table_uuid': '00000000-0000-0000-0000-000000000000'}):
+            self.manager._schema_psql = lambda query, value=value: json.dumps(value)
+            with self.subTest(value=value), self.assertRaises(Refused): self.manager._retention_table(self.stage)
 
 
 @unittest.skipUnless(os.environ.get("CAPTAINSLOG_GATE_TEST_CONTAINER"), "isolated PostgreSQL fixture not selected")
@@ -151,6 +268,25 @@ class StorageMaintenancePostgresTests(unittest.TestCase):
         self.assertTrue(self.read()["delivery_held"])
         self.assertEqual(self.db_gate(), IDLE)
         self.assertEqual(self.psql("SELECT count(*) FROM audit_events"), "0")
+
+    def test_pending_normal_retention_keeps_host_fence_and_rolls_back_sql(self):
+        self.psql("INSERT INTO retention_actions(id,state,plan) VALUES(gen_random_uuid(),'uncertain','{}')")
+        with self.assertRaises(subprocess.CalledProcessError): self.hold(delivery_held=True)
+        self.assertTrue(self.read()['delivery_held'])
+        self.assertEqual(self.db_gate(), IDLE)
+        self.assertEqual(self.psql('SELECT count(*) FROM audit_events'), '0')
+
+    def test_migrating_unknown_or_missing_retention_engine_cannot_release_hold(self):
+        self.hold(delivery_held=True)
+        before = self.db_gate()
+        for mode in ('migrating', 'unknown'):
+            self.psql("UPDATE settings SET value=jsonb_set(value,'{mode}','\"" + mode + "\"') WHERE key='retention_engine'")
+            with self.subTest(mode=mode), self.assertRaises(subprocess.CalledProcessError):
+                self.manager.storage_maintenance(self.stage, held=False)
+            self.assertTrue(self.read()['delivery_held']); self.assertEqual(self.db_gate(), before)
+        self.psql("DELETE FROM settings WHERE key='retention_engine'")
+        with self.assertRaises(subprocess.CalledProcessError): self.manager.storage_maintenance(self.stage, held=False)
+        self.assertTrue(self.read()['delivery_held']); self.assertEqual(self.db_gate(), before)
 
     def test_lost_commit_acknowledgement_retains_stronger_file_fence(self):
         self.hold(delivery_held=True)

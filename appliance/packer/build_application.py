@@ -149,7 +149,10 @@ def build(source: Path, tag: str, receipt: Path, *, version="0.2.0-appliance-can
     source_sha = application_hash(manifest)
     # Docker receives a completed private tar as stdin, not the source directory.
     # No .dockerignore, live workspace files, SSH keys or secret flags are added.
-    with tempfile.TemporaryDirectory(prefix="nebulalog-application-build-") as temporary:
+    # Keep the captured context beside its requested receipt on build storage,
+    # even when the invoking shell has a system/default TMPDIR. Only this
+    # invocation's context is removed; Docker's shared cache is not ours.
+    with tempfile.TemporaryDirectory(prefix="nebulalog-application-build-", dir=receipt.parent) as temporary:
         stage = Path(temporary)
         context, iid = stage / "context.tar", stage / "image.id"
         evidence = write_context(source, selected, context)

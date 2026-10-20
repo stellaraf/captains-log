@@ -14,6 +14,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from nebulalog_manager import publisher_inputs
 from nebulalog_manager.image_bundle import ApplicationSchema as application_schema
+from nebulalog_manager.image_bundle import RestoredAuthContract as restored_auth, verify_bundle
+from nebulalog_manager import host_payload
 
 
 def sha(data):
@@ -96,7 +98,10 @@ def publisher_provenance(root, files, *, private_unsealed=False):
     return value
 
 
-def capture(root: Path, bundle: Path, output: Path, *, sequence: int, schema_revision: str, private_unsealed=False):
+def capture(root: Path, bundle: Path, output: Path, *, sequence: int, schema_revision: str, private_unsealed=False,
+            restore_auth_evidence: Path | None = None):
+    if schema_revision == application_schema.HOST_CHALLENGE_REVISION:
+        raise ValueError("Schema 4 packaging awaits fresh initialization, restored authentication, and image qualification")
     root, bundle = root.resolve(), bundle.resolve()
     if type(sequence) is not int or not 0 <= sequence < 2**63 or not re.fullmatch(r"[1-9][0-9]{0,8}", schema_revision):
         raise ValueError("Explicit sequence and schema revision are required")
@@ -114,9 +119,27 @@ def capture(root: Path, bundle: Path, output: Path, *, sequence: int, schema_rev
                   "source_dirty": dirty, "source_snapshot_sha256": sha(source),
                   "bundle_manifest_sha256": sha(bundle_manifest.read_bytes()),
                   "qualification_status": "pending", "publisher": publisher}
+    auth_raw = {}
+    if restore_auth_evidence is not None:
+        if schema_revision != "3":
+            raise ValueError("Restored authentication evidence requires the supported fresh schema 3 baseline")
+        restore_auth_evidence = Path(restore_auth_evidence).absolute()
+        for name in sorted(restored_auth.EVIDENCE):
+            auth_raw[name] = host_payload.read_regular(restore_auth_evidence / name, restored_auth.MAX_RECEIPT)
+        pins = host_payload.strict_json(host_payload.read_regular(bundle / "images.json", 1024**2))
+        image = verify_bundle(bundle, pins)["images"]["NEBULALOG_IMAGE"]
+        descriptor["restore_auth"] = restored_auth.factory_capture(manifest["files"], image,
+            auth_raw[restored_auth.BUILD], auth_raw[restored_auth.BEHAVIOR])
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".nebulalog-provenance-", dir=output.parent))
     try:
+        (staging / "restore-auth").mkdir(mode=0o700)
+        for name, raw in auth_raw.items():
+            with (staging / "restore-auth" / name).open("xb") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+            if host_payload.read_regular(restore_auth_evidence / name, restored_auth.MAX_RECEIPT) != raw:
+                raise ValueError("Restored authentication evidence changed during capture")
         for name, value in (("source-manifest.json", source), ("initial-release.json", (json.dumps(descriptor, sort_keys=True, indent=2)+"\n").encode())):
             path = staging / name
             with path.open("xb") as stream:
@@ -146,6 +169,7 @@ if __name__ == "__main__":
     parser.add_argument("--sequence", type=int)
     parser.add_argument("--schema-revision")
     parser.add_argument("--private-unsealed", action="store_true", help="Explicit non-distributable candidate without factory publisher trust; sealing is refused")
+    parser.add_argument("--restore-auth-evidence", type=Path, help="Reviewed exact-image build and normal-API behavior receipts; does not claim native acceptance")
     args = parser.parse_args()
     if args.application_hash_only:
         print(application_hash(source_snapshot(args.source)[0]))
@@ -153,4 +177,5 @@ if __name__ == "__main__":
         if any(value is None for value in (args.bundle, args.output, args.sequence, args.schema_revision)):
             parser.error("Capture requires --bundle, --output, --sequence and --schema-revision")
         print(json.dumps(capture(args.source, args.bundle, args.output, sequence=args.sequence,
-                                 schema_revision=args.schema_revision, private_unsealed=args.private_unsealed), indent=2, sort_keys=True))
+                                 schema_revision=args.schema_revision, private_unsealed=args.private_unsealed,
+                                 restore_auth_evidence=args.restore_auth_evidence), indent=2, sort_keys=True))

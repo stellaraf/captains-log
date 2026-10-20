@@ -3,10 +3,10 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from nebulalog_manager.common import Refused
-from nebulalog_manager.console import local_console, safe_error, sealed_state, serve
+from nebulalog_manager.console import host_ready_console, local_console, safe_error, sealed_state, serve
 from nebulalog_manager.firstboot import Locations
 
 APPLIANCE = Path(__file__).resolve().parents[1]
@@ -151,6 +151,123 @@ class ConsoleWorkflowTests(unittest.TestCase):
             return ""
         result = self.invoke(lambda manager: self.fail("completion occurred while waiting"), read)
         self.assertEqual(result["state"], "setup-complete")
+
+
+class RecoveryConsoleTests(unittest.TestCase):
+    def setUp(self):
+        from test_firstboot import CONFIG
+        self.config = CONFIG
+        self.manager = SimpleNamespace(
+            paths=Locations(), gate=Mock(return_value={"host_ready": True, "setup_complete": False}),
+            runner=Mock(), provision=Mock(return_value={"state": "runtime-ready"}))
+        self.recovery = SimpleNamespace(status=Mock(return_value={"state": "not_started"}),
+                                        start=Mock(), prepare=Mock(), apply_prepared=Mock(), resume=Mock(), runtime=SimpleNamespace(guard_fresh=Mock()))
+        self.output = []
+        self.operation = "11111111-2222-4333-8444-555555555555"
+        self.recovery.prepare.return_value = {"id": self.operation, "scope": "configuration", "source_installation_id": self.operation,
+            "target_installation_id": self.operation, "archive_sha256": "a" * 64, "expires_at": 1800000300, "review_digest": "b" * 64}
+        guard = patch("nebulalog_manager.setup_integrity.pending_console")
+        self.guard = guard.start()
+        self.addCleanup(guard.stop)
+
+    def retained(self, state="recovery_required", blocked=False):
+        return {"id": self.operation, "state": state, "databases": {"nebulalog": "restored", "keycloak": "restoring" if blocked else "not_started"},
+                "runtime_active_stage": None, "resume_blocked": blocked, "listener_hold_recorded": False}
+
+    def invoke(self, answers, **kwargs):
+        values = iter(answers)
+        return host_ready_console(self.manager, self.config, recovery=self.recovery,
+                                  read=lambda prompt: next(values), write=self.output.append, **kwargs)
+
+    def test_host_ready_later_and_status_never_provision_or_restore(self):
+        self.assertEqual(self.invoke(["STATUS", "LATER"]), {"state": "host-ready", "setup_complete": False})
+        self.manager.runner.assert_not_called()
+        self.manager.provision.assert_not_called()
+        self.recovery.start.assert_not_called()
+        self.recovery.resume.assert_not_called()
+
+    def test_new_requires_explicit_confirmation_and_uses_existing_provision(self):
+        with patch("nebulalog_manager.firstboot._runtime_console", return_value={"setup_complete": False}) as complete:
+            self.invoke(["NEW", "wrong", "NEW", "NEW"])
+        self.manager.provision.assert_called_once_with()
+        self.manager.runner.assert_called_once_with(["systemctl", "start", "nebulalog-firstboot.service"], timeout=180)
+        complete.assert_called_once()
+        self.recovery.start.assert_not_called()
+
+    def test_restore_uses_only_paths_and_verified_completion_without_normal_provision(self):
+        self.recovery.status.side_effect = [{"state": "not_started"}, self.retained("runtime_ready")]
+        with patch("nebulalog_manager.setup_integrity.resume_runtime", return_value={"https_url": "https://logs.example.test"}), \
+                patch("nebulalog_manager.firstboot._runtime_console", return_value={"setup_complete": False}) as complete:
+            self.invoke(["RESTORE", "/recovery/backup.cms", "/recovery/public.pem", "/run/nebulalog/private.pem",
+                         "RESTORE logs.example.test", "CONTINUE"])
+        self.recovery.prepare.assert_called_once_with(Path("/recovery/backup.cms"), Path("/run/nebulalog/private.pem"), Path("/recovery/public.pem"))
+        self.recovery.apply_prepared.assert_called_once_with(self.operation, "b" * 64)
+        self.assertIn("Authenticated recovery review", " ".join(self.output))
+        self.assertTrue(complete.call_args.args[2]["restored"])
+        self.manager.runner.assert_not_called()
+        self.manager.provision.assert_not_called()
+        self.assertNotIn("/run/nebulalog/private.pem", " ".join(self.output))
+        self.assertIn("existing MFA", " ".join(self.output))
+
+    def test_resume_uses_exact_retained_uuid_without_replacement_inputs(self):
+        self.recovery.status.return_value = self.retained()
+        self.invoke(["NEW", "RESUME", "wrong", "RESUME", self.operation, "LATER"], restore_only=True)
+        self.recovery.resume.assert_called_once_with(self.operation)
+        self.recovery.start.assert_not_called()
+        self.manager.provision.assert_not_called()
+
+    def test_explicit_media_selection_uses_shared_import_and_target_confirmation(self):
+        with patch("nebulalog_manager.recovery_media.restore_from_media", return_value={"state": "cancelled"}) as imported:
+            self.invoke(["MEDIA", "/dev/sr1", "LATER"])
+        self.assertEqual(imported.call_args.args, (self.recovery, Path("/dev/sr1")))
+        self.assertEqual(imported.call_args.kwargs["target_confirmation"], "RESTORE logs.example.test")
+        imported.call_args.kwargs["guard"]()
+        self.manager.provision.assert_not_called()
+        self.recovery.start.assert_not_called()
+
+    def test_cancelled_or_retained_media_choice_never_mounts(self):
+        with patch("nebulalog_manager.recovery_media.restore_from_media") as imported:
+            self.invoke(["MEDIA", "CANCEL", "LATER"])
+            self.recovery.status.return_value = self.retained()
+            self.invoke(["MEDIA", "LATER"])
+        imported.assert_not_called()
+        self.manager.provision.assert_not_called()
+
+    def test_uncertain_outcome_never_dispatches_resume(self):
+        self.recovery.status.return_value = self.retained(blocked=True)
+        self.invoke(["RESUME", "LATER"], restore_only=True)
+        self.recovery.resume.assert_not_called()
+        self.assertIn("uncertain outcome", " ".join(self.output))
+        self.assertIn("not established", " ".join(self.output))
+
+    def test_missing_retained_pointer_cannot_fall_back_to_new(self):
+        with self.assertRaisesRegex(Refused, "normal provisioning"):
+            self.invoke([], restore_only=True)
+        self.manager.provision.assert_not_called()
+
+    def test_invalid_paths_cancel_and_unconfirmed_restore_have_no_effect(self):
+        for value in ("https://example.test/backup", "relative", "/tmp/../etc/key", "/tmp/key\nsecret", "-----BEGIN PRIVATE KEY-----"):
+            with self.subTest(value=value), self.assertRaises(Refused):
+                self.invoke(["RESTORE", value])
+        self.invoke(["RESTORE", "CANCEL", "LATER"])
+        self.invoke(["RESTORE", "/recovery/backup.cms", "/recovery/public.pem", "/run/nebulalog/key", "wrong", "LATER"])
+        self.recovery.start.assert_not_called()
+        self.recovery.apply_prepared.assert_not_called()
+
+    def test_console_boundary_rechecked_before_dispatch_after_input(self):
+        self.guard.side_effect = [None, None, None, Refused("console boundary changed")]
+        with self.assertRaisesRegex(Refused, "boundary changed"):
+            self.invoke(["RESTORE", "/recovery/backup.cms", "/recovery/public.pem", "/run/nebulalog/key", "RESTORE logs.example.test"])
+        self.recovery.start.assert_not_called()
+        self.recovery.apply_prepared.assert_not_called()
+
+    def test_retained_ready_flag_alone_cannot_complete_setup(self):
+        self.recovery.status.return_value = self.retained("runtime_ready")
+        with patch("nebulalog_manager.setup_integrity.resume_runtime", return_value=None), \
+                patch("nebulalog_manager.firstboot._runtime_console") as complete:
+            with self.assertRaisesRegex(Refused, "evidence is incomplete"):
+                self.invoke(["CONTINUE"])
+        complete.assert_not_called()
 
 
 class SystemdContractTests(unittest.TestCase):

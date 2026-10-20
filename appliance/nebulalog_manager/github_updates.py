@@ -225,6 +225,11 @@ class GitHubUpdater:
                     raise Refused("Host-enrolled appliances require a versioned host bundle for authorized integrity acceptance")
                 if any(not component["rollback_safe"] for component in metadata["components"].values()):
                     raise Refused("Controlled migration release requires a database-specific recovery procedure")
+                try:
+                    self.manager._require_restore_update_compatibility()
+                except Refused:
+                    return self.record(policy, "blocked", reason="restored_appliance_compatibility_pending",
+                                       release_id=release["id"], sequence=metadata["sequence"])
                 if metadata["declared_bytes"] > MAX_BUNDLE or shutil.disk_usage(self.state).free < metadata["declared_bytes"] * 4 + 1024**3:
                     raise Refused("Insufficient download and transaction reserve")
                 for artifact in metadata["artifacts"]:

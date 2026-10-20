@@ -17,20 +17,22 @@ import (
 var categories = map[string]bool{"traffic": true, "threat": true, "url": true, "wildfire": true, "dns": true, "data": true, "hip": true, "globalprotect": true, "iptag": true, "userid": true, "decryption": true, "tunnel": true, "configuration": true, "system": true, "alarms": true, "authentication": true, "unified": true, "parsing": true}
 
 type Search struct {
-	Query   string   `json:"query"`
-	LogType string   `json:"log_type"`
-	From    string   `json:"from"`
-	To      string   `json:"to"`
-	Columns []string `json:"columns"`
-	Sort    string   `json:"sort"`
-	Order   string   `json:"order"`
+	RetentionRevision int64    `json:"retention_revision,omitempty"`
+	Query             string   `json:"query"`
+	LogType           string   `json:"log_type"`
+	From              string   `json:"from"`
+	To                string   `json:"to"`
+	Columns           []string `json:"columns"`
+	Sort              string   `json:"sort"`
+	Order             string   `json:"order"`
 }
 type cursor struct {
-	Value     string `json:"value"`
-	ID        string `json:"id"`
-	From      string `json:"from"`
-	To        string `json:"to"`
-	Signature string `json:"signature"`
+	Value             string `json:"value"`
+	ID                string `json:"id"`
+	From              string `json:"from"`
+	To                string `json:"to"`
+	Signature         string `json:"signature"`
+	RetentionRevision int64  `json:"retention_revision"`
 }
 
 func buildSearch(in *Search) (string, map[string]string, error) {
@@ -156,6 +158,16 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request) {
 		}
 		p["cursor_id"] = cur.ID
 	}
+	retention, predicate, bound, e := s.retained(r.Context(), time.Now().UTC())
+	if e != nil {
+		databaseError(w, e)
+		return
+	}
+	if cur.ID != "" && cur.RetentionRevision != retention.Revision {
+		problem(w, 409, "Retention policy changed; restart this search")
+		return
+	}
+	where = retentionWhere(where, p, predicate, bound)
 	limit := 200
 	if v.Get("limit") != "" {
 		limit, e = strconv.Atoi(v.Get("limit"))
@@ -174,7 +186,7 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request) {
 	if len(rows) > limit {
 		rows = rows[:limit]
 		last := rows[len(rows)-1]
-		cur = cursor{fmt.Sprint(last[in.Sort]), fmt.Sprint(last["id"]), in.From, in.To, signature(in)}
+		cur = cursor{fmt.Sprint(last[in.Sort]), fmt.Sprint(last["id"]), in.From, in.To, signature(in), retention.Revision}
 		b, _ := json.Marshal(cur)
 		next = base64.RawURLEncoding.EncodeToString(b)
 	}
@@ -192,7 +204,13 @@ func (s *Server) event(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	params := map[string]string{"id": id, "category": kind, "from": at.UTC().Add(-time.Second).Format("2006-01-02 15:04:05.999999"), "to": at.UTC().Add(time.Second).Format("2006-01-02 15:04:05.999999")}
-	rows, err := s.Store.CH.EventRows(r.Context(), "SELECT * EXCEPT expires_at FROM events WHERE log_type={category:String} AND received_at >= {from:DateTime64(6)} AND received_at <= {to:DateTime64(6)} AND id={id:String} LIMIT 1", params)
+	_, predicate, bound, err := s.retained(r.Context(), time.Now().UTC())
+	if err != nil {
+		databaseError(w, err)
+		return
+	}
+	where := retentionWhere("log_type={category:String} AND received_at >= {from:DateTime64(6)} AND received_at <= {to:DateTime64(6)} AND id={id:String}", params, predicate, bound)
+	rows, err := s.Store.CH.EventRows(r.Context(), "SELECT * EXCEPT expires_at FROM events WHERE "+where+" LIMIT 1", params)
 	if err != nil {
 		databaseError(w, err)
 		return

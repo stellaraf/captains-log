@@ -14,6 +14,8 @@ Each published stable `vMAJOR.MINOR.PATCH` release must contain `manifest.json`,
 
 A known, fully terminated failed health check rolls back and keeps the release sequence high-water mark, so the next 15-minute check cannot repeatedly reinstall the failed release. Pending recovery or incomplete maintenance release blocks new installation. Network errors and missing releases are recorded for subsequent checks. Checks do not overlap; OS, storage and component mutations remain serialized by the manager's existing transaction lock. A long-running update is allowed to finish instead of starting another at the next timer tick.
 
+After a fresh-appliance configuration restore, component updates and rollback are temporarily blocked until a compatible host/application pair has been qualified to preserve restored-session revocation. The timer still checks every 15 minutes, but a newer release reports `restored_appliance_compatibility_pending` before downloading component artifacts. Do not delete recovery markers to bypass this check. Automatic updates on restored appliances remain required acceptance work; the separate OS update path is unchanged.
+
 Administration → System → Updates reports the repository, configured policy, timer enabled/active observations, publisher enrollment, last/next check and freshness. Automatic operation is reported only when those observations support it; stale, blocked or unenrolled channels do not appear healthy. The development Docker stack has no host timer and continues to report the channel as not connected.
 
 **Release readiness:** the GitHub repository is connected, but no qualified stable release or production publisher enrollment has been published yet. Source tests cover the downloader, real TLS and signatures, rollback and status reporting. A real GitHub asset-to-guest upgrade, two observed timer intervals, OS/kernel reboot, data retention, and VMware/Nutanix imports remain required. A passing source test is not appliance acceptance.
@@ -73,6 +75,19 @@ Podman/systemd transport, combined release installation and OS hold finalization
 are still being qualified; these changes are not deployed or accepted as a complete
 self-update path. A fresh schema-2 install or successful package assembly does not
 prove the existing-installation upgrade/rollback path.
+
+Normal retention of existing log data introduces schema **3**, with a verified
+ClickHouse table identity and cleanup coordinated through the host storage gate.
+Fresh schema-3 and same-schema lifecycle support have passed focused source tests;
+real database and native appliance qualification remain pending. As of the
+2026-10-19 development review, the repository has no published release or tag.
+Schema-1/2 appliances and their earlier fixed host catalogs are development
+prototypes. Their incompatible migrations remain refused and their data/recovery
+evidence must be preserved; building those prototype bridges is deferred from
+the first supported release. Qualification starts from the new factory schema-3
+baseline and must exercise an actual later supported release, rollback and
+interrupted recovery, including a restored target. Fresh packaging alone proves
+none of those update paths.
 
 Metadata backups and all credentials remain on the encrypted data mount. API/identity writers are quiesced. A verified gate-aware collector continues receiving into durable WAL with database delivery paused; a legacy or unverified collector is stopped for a consistent backup. A failed activation restores validated metadata/configuration and original image pins; a later operator rollback preserves post-commit users/configuration/data and changes only the release's image pins. ClickHouse log history and WAL are not rewound by metadata restore. Unresolved ClickHouse removal or insertion evidence blocks metadata changes. An unrecovered backup failure records `recovery_required` and retains maintenance.
 

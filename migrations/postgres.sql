@@ -45,3 +45,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS storage_emergency_one_pending ON storage_emerg
 CREATE TABLE IF NOT EXISTS storage_emergency_inserts (
  id uuid PRIMARY KEY, table_uuid uuid NOT NULL, partitions jsonb NOT NULL, query_id uuid NOT NULL UNIQUE, created_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- The engine remains unavailable until the explicit migration verifies the
+-- events table identity and absence of legacy TTL. No event rows are rewritten.
+INSERT INTO settings(key,value) VALUES('retention_engine','{"schema":1,"mode":"uninitialized"}') ON CONFLICT DO NOTHING;
+INSERT INTO settings(key,value) VALUES('retention_status','{"state":"not_observed","message":"Waiting for retention engine verification"}') ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS retention_actions (
+ id uuid PRIMARY KEY, state text NOT NULL CHECK(state IN ('prepared','executing','uncertain','awaiting_cleanup','completed','cancelled')),
+ plan jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), completed_at timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS retention_one_pending ON retention_actions((true)) WHERE completed_at IS NULL;

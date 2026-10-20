@@ -281,6 +281,15 @@ func (s *Store) emergencyStep(ctx context.Context, ch emergencyClickHouse, now t
 		state.Message = "Emergency capacity pressure is present, but host lifecycle maintenance prohibits new removals; delivery remains held"
 		return writeEmergencyState(ctx, conn, state)
 	}
+	normal, err := pendingRetention(ctx, conn)
+	if err != nil {
+		return fail("Normal-retention evidence unavailable; removal held", err)
+	}
+	if normal != nil {
+		state.State = "blocked"
+		state.Message = "Emergency capacity pressure is present; the existing normal-retention removal must settle before another removal"
+		return writeEmergencyState(ctx, conn, state)
+	}
 	state.State = "emergency"
 	state.Message = "Emergency active; selecting one eligible complete partition"
 	candidates, err := inspectEmergencyPartitions(ctx, ch, policy, now)
@@ -384,6 +393,12 @@ func (s *Store) RunEmergencyRetention(ctx context.Context) {
 		cancel()
 		if err != nil && ctx.Err() == nil {
 			slog.Warn("emergency storage observation held", "error", err)
+		}
+		attempt, cancel = context.WithTimeout(ctx, 45*time.Second)
+		err = s.RetentionStep(attempt)
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			slog.Warn("normal retention observation held", "error", err)
 		}
 		select {
 		case <-ctx.Done():

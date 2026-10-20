@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
 import resource
 import subprocess
 import sys
@@ -57,6 +58,140 @@ def safe_error(error):
     if isinstance(error, (OSError, subprocess.SubprocessError)):
         return "A required local resource or service is unavailable. Existing setup state has been retained."
     return "Setup could not complete. Existing state has been retained for review."
+
+
+def _recovery_answer(read, prompt):
+    value = read(prompt)
+    if (not isinstance(value, str) or len(value) > 4096
+            or any(ord(char) < 32 or 127 <= ord(char) < 160 for char in value)):
+        raise Refused("Enter one displayed action or an absolute local file path")
+    return value.strip()
+
+
+def _recovery_path(read, label):
+    value = _recovery_answer(read, label + " (absolute local path, or CANCEL): ")
+    if value.upper() == "CANCEL":
+        return None
+    path = Path(value)
+    if not path.is_absolute() or ".." in path.parts or path.as_posix() != value:
+        raise Refused("Recovery accepts normalized absolute local file paths; no URL, shell expansion or pasted key contents")
+    return path
+
+
+def _show_restore_status(value, write):
+    if value["state"] == "not_started":
+        write("No configuration restore has started. Runtime provisioning has not been requested by this menu.")
+        return
+    write("Configuration recovery: " + value["state"] + " | operation " + value["id"])
+    write("Retained database acknowledgements: " + ", ".join(name + ": " + state for name, state in value["databases"].items()))
+    write("Recorded runtime stage: " + (value["runtime_active_stage"] or "none in flight"))
+    write("Status describes retained evidence, not current service health. Setup remains incomplete.")
+    if value["state"] == "recovery_required":
+        write("A listener hold was recorded; current health still needs verification." if value["listener_hold_recorded"]
+              else "A listener hold is not established by this journal. Keep the target isolated and retain its evidence.")
+    if value["resume_blocked"]:
+        write("An action has an uncertain outcome. Automatic replay is refused. Preserve this target and use a new fresh target or qualified recovery review.")
+
+
+def host_ready_console(manager, config, *, restore_only=False, recovery=None, read=input, write=print):
+    """Choose provisioning or retained recovery on the existing protected tty1."""
+    from .configuration_restore import ConfigurationRestore
+    from .restore_runtime import FreshRestoreRuntime
+    from .setup_integrity import pending_console, resume_runtime
+    from .firstboot import _runtime_console, validate_config
+    validate_config(config)
+    pending_console(manager)
+    gate = manager.gate()
+    if gate.get("host_ready") is not True or gate.get("setup_complete") is not False:
+        raise Refused("Recovery selection requires the unfinished host-enrolled appliance")
+    recovery = recovery or ConfigurationRestore(runtime=FreshRestoreRuntime(paths=manager.paths, firstboot=manager))
+    write("\nEncrypted storage and host configuration are ready.")
+    write("NEW prepares a new application. MEDIA imports a configuration backup from an explicitly selected recovery ISO. RESTORE uses already protected local files.")
+    write("Recovery retains source accounts, passwords and existing MFA; it does not reset them. ClickHouse log data is excluded.")
+    while True:
+        pending_console(manager)
+        status = recovery.status()
+        retained = status["state"] != "not_started"
+        if restore_only and not retained:
+            raise Refused("The retained restore pointer is unavailable; normal provisioning will not replace it")
+        _show_restore_status(status, write)
+        if retained:
+            prompt = "STATUS, CONTINUE setup, or LATER: " if status["state"] == "runtime_ready" else "STATUS, RESUME recovery, or LATER: "
+        else:
+            prompt = "NEW application, MEDIA recovery ISO, RESTORE local configuration, STATUS, or LATER: "
+        action = _recovery_answer(read, prompt).upper()
+        pending_console(manager)  # Recheck the terminal/unfinished boundary after input.
+        if action == "LATER":
+            return {"state": status["state"] if retained else "host-ready", "setup_complete": False}
+        if action == "STATUS":
+            continue
+        if retained:
+            if action == "CONTINUE" and status["state"] == "runtime_ready":
+                receipt = resume_runtime(manager, config)
+                if receipt is None:
+                    raise Refused("Restored runtime evidence is incomplete; setup cannot continue")
+                return _runtime_console(manager, config, {**receipt, "restored": True})
+            if action != "RESUME":
+                write("This appliance belongs to its retained recovery. Choose a displayed action; NEW and replacement inputs are unavailable.")
+                continue
+            if status["resume_blocked"]:
+                write("RESUME is unavailable for the recorded uncertain action; no restore command was dispatched.")
+                continue
+            confirmation = _recovery_answer(read, "Type the complete operation UUID to resume its retained inputs: ")
+            if confirmation != status["id"]:
+                write("Recovery was not resumed.")
+                continue
+            pending_console(manager)
+            recovery.resume(status["id"])
+            continue
+        if action == "NEW":
+            if _recovery_answer(read, "Type NEW to prepare a new application instead of restoring a backup: ") != "NEW":
+                write("Application provisioning was not requested.")
+                continue
+            pending_console(manager)
+            manager.runner(["systemctl", "start", "nebulalog-firstboot.service"], timeout=180)
+            return _runtime_console(manager, config, manager.provision())
+        if action not in {"RESTORE", "MEDIA"}:
+            write("Choose NEW, MEDIA, RESTORE, STATUS, or LATER.")
+            continue
+        recovery.runtime.guard_fresh()
+        write("Use the same immutable release/schema, source hostname, administrator username and baseline. Keep the source offline before reusing its address.")
+        if action == "MEDIA":
+            from .recovery_media import restore_from_media
+            write("Attach your configuration recovery ISO through the hypervisor console. Only the device you select will be mounted, read-only; no media is selected automatically.")
+            device = _recovery_answer(read, "Optical device (/dev/sr0, /dev/sr1, …), or CANCEL: ")
+            if device.upper() == "CANCEL":
+                write("Recovery media import was cancelled.")
+                continue
+            pending_console(manager)
+            result = restore_from_media(recovery, Path(device), read=read, write=write,
+                                        guard=lambda: pending_console(manager), target_confirmation="RESTORE " + config["hostname"])
+            if result.get("state") == "cancelled":
+                write("Recovery media import was cancelled before applying a backup.")
+            continue
+        write("Export the new target's disk recovery material. Stage the encrypted backup and certificate in root-controlled directories; keep the private recovery key root-only, preferably in /run/nebulalog.")
+        write("Enter protected paths only; use MEDIA for an attached recovery ISO. Do not paste secrets here. This path does not download inputs, upload keys or start SSH.")
+        paths = []
+        for label in ("Encrypted configuration backup", "Recipient certificate", "Private recovery key"):
+            value = _recovery_path(read, label)
+            if value is None:
+                break
+            paths.append(value)
+        if len(paths) != 3:
+            write("Recovery was cancelled before applying any backup.")
+            continue
+        pending_console(manager)
+        write("Authenticating recovery inputs for review. Application services remain stopped.")
+        review = recovery.prepare(paths[0], paths[2], paths[1])
+        from .configuration_restore import review_text
+        write(review_text(review))
+        confirm = "RESTORE " + config["hostname"]
+        if _recovery_answer(read, "After isolating the source and exporting target disk recovery material, type " + confirm + ": ") != confirm:
+            write("Recovery was not started.")
+            continue
+        pending_console(manager)
+        write("Applying the authenticated review. Retained status is available when this operation finishes or after a restart.")
+        recovery.apply_prepared(review["id"], review["review_digest"])
 
 
 def serve(manager=None, *, wizard_fn=wizard, guard=local_console, read=input, write=print, runner=run):

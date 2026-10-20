@@ -431,6 +431,8 @@ class FirstBoot:
         self.runner(["systemctl", "restart", "chronyd"])
 
     def apply(self, config: dict, confirmation: str) -> dict:
+        from .restore_runtime import refuse_normal_provision
+        refuse_normal_provision(self.paths)
         validate_config(config)
         self._host()
         from .setup_integrity import _integrity_state_exists
@@ -442,6 +444,7 @@ class FirstBoot:
         # Never keep the LUKS unlock key on the unencrypted system disk.
         _private_file(Path(config["unlock_key_file"]), minimum=14)
         with locked(self.paths.bootstrap / "firstboot.lock"):
+            refuse_normal_provision(self.paths)
             if _integrity_state_exists(self):
                 raise Refused("File-integrity state already exists; automatic host reconfiguration is refused")
             plan = self.plan(config)
@@ -512,11 +515,14 @@ class FirstBoot:
         return result
 
     def provision(self):
+        from .restore_runtime import refuse_normal_provision
+        refuse_normal_provision(self.paths)
         gate = self.gate()
         from .setup_integrity import _integrity_state_exists
         if _integrity_state_exists(self):
             raise Refused("File-integrity state already exists; automatic runtime reprovisioning is refused")
         with locked(self.paths.bootstrap / "firstboot.lock"):
+            refuse_normal_provision(self.paths)
             if _integrity_state_exists(self):
                 raise Refused("File-integrity state already exists; automatic runtime reprovisioning is refused")
             receipt = self._runtime_receipt("prepare", gate["installation_id"])
@@ -653,7 +659,10 @@ def _runtime_console(manager, config, receipt):
         print("TLS certificate SHA-256: " + receipt["tls_certificate_sha256"])
     if receipt.get("tls_ca_certificate_sha256"):
         print("TLS CA certificate SHA-256: " + receipt["tls_ca_certificate_sha256"])
-    print("Sign in with your local administrator, enroll MFA and recovery codes, and configure PAN-OS forwarding.")
+    if receipt.get("restored") is True:
+        print("Sign in with the restored administrator and existing MFA/recovery credentials. Verify roles, settings and PAN-OS forwarding. Recovery does not reset passwords or MFA.")
+    else:
+        print("Sign in with your local administrator, enroll MFA and recovery codes, and configure PAN-OS forwarding.")
     print("File integrity requires the installation's reviewed security policy. Enroll and check it before final security assessment and findings review.")
     while True:
         action = _answer("HARDENING, FILE INTEGRITY, VERIFY final setup, or LATER", "LATER").upper()
@@ -716,6 +725,8 @@ def wizard(manager=None):
         config = manager.config(config_path)
         print("Resuming the existing installation; disk and configuration selections are locked to its journal.")
     else:
+        print("If recovering a configuration backup, use its hostname, administrator username and baseline. Keep the source offline before reusing its network identity.")
+        print("Host enrollment uses new disk credentials. Its temporary bootstrap administrator password does not replace restored account credentials or MFA.")
         _private_dir(manager.paths.runtime)
         _private_dir(manager.paths.bootstrap)
         candidates, seen = [], set()
@@ -767,10 +778,20 @@ def wizard(manager=None):
                   "retention_days": int(_answer("Initial retention days", "90"))}
         validate_config(config)
         atomic_json(config_path, config)
+    from .console import host_ready_console
+    # A restore owns this target before runtime readiness exists. Never fall
+    # through into apply/provision, including after an interrupted activation.
+    if os.path.lexists(manager.paths.data / "manager/restore.json"):
+        return host_ready_console(manager, config, restore_only=True)
     receipt = resume_runtime(manager, config)
     if receipt is not None:
         print("Verified the existing installation and completed runtime journal. Resuming completion actions without reprovisioning.")
         return _runtime_console(manager, config, receipt)
+    if os.path.lexists(manager.paths.bootstrap / "host-ready.json"):
+        gate = manager.gate()
+        prepared = {**gate, "recovery_key_path": str(manager.paths.runtime / ("luks-recovery-" + gate["installation_id"] + ".key"))}
+        _console_recovery(manager, prepared)
+        return host_ready_console(manager, config)
     _private_dir(manager.paths.runtime)
     _private_dir(manager.paths.bootstrap)
     plan = manager.plan(config)
@@ -784,10 +805,7 @@ def wizard(manager=None):
     print("\nEnrolling the reviewed disk and applying configuration. Interrupted work retains its journal.")
     prepared = manager.apply(config, plan["confirmation"])
     _console_recovery(manager, prepared)
-    print("Encrypted storage and host configuration are ready. Preparing application services...")
-    manager.runner(["systemctl", "start", "nebulalog-firstboot.service"], timeout=180)
-    receipt = manager.provision()
-    return _runtime_console(manager, config, receipt)
+    return host_ready_console(manager, config)
 
 
 def main(argv=None):

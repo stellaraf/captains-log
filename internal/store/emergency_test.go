@@ -134,7 +134,7 @@ func (f *emergencyFake) Rows(_ context.Context, sql string, params map[string]st
 		if id == "" {
 			id = fixtureTableUUID
 		}
-		return []map[string]any{{"uuid": id, "engine": "MergeTree", "partition_key": "(log_type, toDate(ingested_at))", "storage_policy": "default", "database_engine": "Atomic", "data_paths": []any{"/var/lib/clickhouse/store/123/" + id + "/"}}}, nil
+		return []map[string]any{{"uuid": id, "create_table_query": "CREATE TABLE nebulalog.events ENGINE=MergeTree", "engine": "MergeTree", "partition_key": "(log_type, toDate(ingested_at))", "storage_policy": "default", "database_engine": "Atomic", "data_paths": []any{"/var/lib/clickhouse/store/123/" + id + "/"}}}, nil
 	}
 	if strings.Contains(sql, "system.disks") {
 		index := f.observations
@@ -529,6 +529,9 @@ func TestEmergencyMaintenanceAndAdmissionIsolated(t *testing.T) {
 		f.used = []int{99}
 		ch, inserts := fakeEmergencyHTTP(t, f)
 		s.CH = ch
+		if _, e := s.PG.Exec(ctx, "UPDATE settings SET value=$1 WHERE key='retention_engine'", emergencyJSON(RetentionEngine{Schema: 1, Mode: "partition", TableUUID: fixtureTableUUID})); e != nil {
+			t.Fatal(e)
+		}
 		if e := s.insertEmergencyGuarded(ctx, []map[string]any{emergencyEvent("retain-wal", "traffic", "2020-01-01", "parsed")}); e != ErrStoragePressure {
 			t.Fatal(e)
 		}
@@ -557,6 +560,9 @@ func TestEmergencyMaintenanceAndAdmissionIsolated(t *testing.T) {
 		}
 		ch, inserts := fakeEmergencyHTTP(t, f)
 		s.CH = ch
+		if _, e := s.PG.Exec(ctx, "UPDATE settings SET value=$1 WHERE key='retention_engine'", emergencyJSON(RetentionEngine{Schema: 1, Mode: "partition", TableUUID: fixtureTableUUID})); e != nil {
+			t.Fatal(e)
+		}
 		if e := s.insertEmergencyGuarded(ctx, []map[string]any{emergencyEvent("health-canary", "traffic", "2020-01-01", "parsed")}); e != nil {
 			t.Fatal(e)
 		}

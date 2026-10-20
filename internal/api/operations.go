@@ -102,7 +102,8 @@ func (s *Server) firewalls(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusBadRequest, "Invalid firewall serial")
 		return
 	}
-	retention, e := s.Store.Retention(r.Context())
+	asOf := time.Now().UTC().Truncate(time.Second)
+	retention, predicate, params, e := s.retained(r.Context(), asOf)
 	if e != nil {
 		databaseError(w, e)
 		return
@@ -113,8 +114,8 @@ func (s *Server) firewalls(w http.ResponseWriter, r *http.Request) {
 			retentionDays = days
 		}
 	}
-	asOf := time.Now().UTC().Truncate(time.Second)
-	rows, e := s.Store.CH.Rows(r.Context(), firewallRateSQL("events"), map[string]string{"serial_filter": serialFilter, "as_of": asOf.Format(time.RFC3339Nano)})
+	params["serial_filter"], params["as_of"] = serialFilter, asOf.Format(time.RFC3339Nano)
+	rows, e := s.Store.CH.Rows(r.Context(), firewallRateSQL("(SELECT * FROM events WHERE "+predicate+")"), params)
 	if e != nil {
 		databaseError(w, e)
 		return
