@@ -4,6 +4,7 @@ import base64
 import time
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -143,6 +144,8 @@ class MaintenanceBackendTests(unittest.TestCase):
         atomic_json(root / "public/maintenance.json", marker)
         atomic_json(data / "manager/storage-maintenance/gate.json", {
             "schema": 1, "held": True, "delivery_held": True, "operation": hashlib.sha256(str(stage).encode()).hexdigest()})
+        (data / "manager/storage-maintenance").chmod(0o755)
+        (data / "manager/storage-maintenance/gate.json").chmod(0o644)
         self.native = Native(root)
         self.transaction = {"activation_started": True}
         self.life = SimpleNamespace(data=data, configuration=config, quadlets=root / "quadlets",
@@ -157,6 +160,40 @@ class MaintenanceBackendTests(unittest.TestCase):
         self.backend = IdentityMaintenanceBackend(self.life, stage, "activate")
         self.backend.api.ready = Mock(return_value=True)
         self.backend.hold()
+
+    def test_shared_gate_accepts_lifecycle_permissions_without_relaxing_private_reads(self):
+        from nebulalog_adapters.identity_maintenance import _storage_gate
+        from nebulalog_manager.identity_sessions import SessionCutoffJournal
+        gate = self.life.data / "manager/storage-maintenance/gate.json"
+        self.assertTrue(_storage_gate(gate)["delivery_held"])
+        self.assertTrue(self.backend.fenced(self.backend.operation))
+        with self.assertRaises(Refused):
+            SessionCutoffJournal._read(gate)
+
+    def test_shared_gate_rejects_write_access_links_oversize_and_bad_types(self):
+        from nebulalog_adapters.identity_maintenance import _storage_gate
+        gate = self.life.data / "manager/storage-maintenance/gate.json"
+        raw = gate.read_bytes()
+        for mode in (0o600, 0o664, 0o666):
+            with self.subTest(mode=mode):
+                gate.chmod(mode)
+                with self.assertRaises(Refused): _storage_gate(gate)
+        gate.chmod(0o644)
+        for body in (b"x" * 4097, json.dumps({
+                **json.loads(raw), "schema": True}).encode()):
+            gate.write_bytes(body)
+            with self.assertRaises(Refused): _storage_gate(gate)
+        gate.write_bytes(raw)
+        alias = gate.with_name("other.json")
+        os.link(gate, alias)
+        with self.assertRaises(Refused): _storage_gate(gate)
+        alias.unlink()
+        gate.rename(alias); gate.symlink_to(alias)
+        with self.assertRaises(Refused): _storage_gate(gate)
+        gate.unlink(); alias.rename(gate)
+        gate.parent.chmod(0o777)
+        with self.assertRaises(Refused): _storage_gate(gate)
+        gate.parent.chmod(0o755)
 
     def test_fixed_vendor_command_private_credentials_and_cleanup(self):
         self.backend.quiesce(NAME)

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import time
 import uuid
 from urllib.error import URLError
@@ -50,6 +51,39 @@ def _environment(raw):
     return result
 
 
+def _storage_gate(path):
+    """Read the root-owned shared gate produced by Lifecycle.storage_maintenance.
+
+    Containers need read access to this non-secret fence. It is deliberately
+    0644, unlike the 0600 identity journals and credential files.
+    """
+    from .lifecycle import storage_gate_value
+    path = Path(path)
+    if not path.is_absolute() or path.resolve() != path:
+        raise Refused("Identity storage fence must use its canonical path")
+    parent = path.parent.lstat()
+    if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0 or parent.st_gid != 0
+            or stat.S_IMODE(parent.st_mode) != 0o755):
+        raise Refused("Identity storage fence requires its protected shared directory")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
+                or stat.S_IMODE(info.st_mode) != 0o644 or info.st_nlink != 1
+                or not 0 < info.st_size <= 4096):
+            raise Refused("Identity storage fence requires a bounded root-owned shared file")
+        with os.fdopen(os.dup(fd), "rb") as stream:
+            raw = stream.read(4097)
+        after = os.fstat(fd)
+        if (len(raw) != info.st_size or
+                (info.st_size, info.st_mtime_ns, info.st_ctime_ns) !=
+                (after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+            raise Refused("Identity storage fence changed during its read")
+        return storage_gate_value(strict_json(raw))
+    finally:
+        os.close(fd)
+
+
 def capture_before_database_restore(lifecycle, stage, context, *, resume):
     """Retain identity cutoff before the lifecycle can destroy its current DB.
 
@@ -85,7 +119,7 @@ def capture_before_database_restore(lifecycle, stage, context, *, resume):
             raise Refused("Identity restore admission disappeared")
         marker = strict_json(SessionCutoffJournal._read(life.data / "manager/maintenance.json"))
         public = strict_json(trusted_file(PUBLIC_MAINTENANCE).read_bytes())
-        gate = strict_json(SessionCutoffJournal._read(life.data / "manager/storage-maintenance/gate.json"))
+        gate = _storage_gate(life.data / "manager/storage-maintenance/gate.json")
         if (marker != public or marker.get("active") is not True or marker.get("release") != str(stage)
                 or gate != {"schema": 1, "held": True, "delivery_held": True,
                             "operation": _digest(str(stage).encode())}):
@@ -334,7 +368,7 @@ class IdentityMaintenanceBackend:
         public_marker = strict_json(trusted_file(public).read_bytes())
         if marker != public_marker or marker.get("active") is not True or marker.get("release") != str(self.stage):
             raise Refused("Identity work requires this transaction's external maintenance marker")
-        gate = strict_json(SessionCutoffJournal._read(self.life.data / "manager/storage-maintenance/gate.json"))
+        gate = _storage_gate(self.life.data / "manager/storage-maintenance/gate.json")
         if gate != {"schema": 1, "held": True, "delivery_held": True, "operation": self.gate_operation}:
             raise Refused("Identity work requires continuous transaction-owned delivery fencing")
         for name in ("api", "ingest"):

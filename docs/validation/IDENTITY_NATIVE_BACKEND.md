@@ -19,6 +19,15 @@ then stops the host Apache edge and verifies its inactive state. Every subsequen
 operation rechecks those fences, bound inputs, encrypted storage, and the
 encrypted Podman graph root. Success never starts Apache or releases maintenance.
 
+The delivery gate is a non-secret, container-readable fence: the lifecycle
+publishes it as a root-owned `0644` file in a root-owned `0755` directory.
+Identity recovery uses a dedicated bounded reader for that contract, refusing
+links, additional hard links, writable modes, changed reads and malformed gate
+types. Credentials and identity/session journals still require private `0600`
+files. Using the private-journal reader for the shared gate was an integration
+defect: actual coordinator execution stopped before database replacement even
+though fixtures that created a private gate had passed.
+
 ## Vendor command and interruption recovery
 
 Before creating a container, the backend stores the credential environment on
@@ -157,6 +166,50 @@ identity failure before writer startup, unrelated configuration/Quadlet changes,
 edge startup failure, cleanup despite gate-write failure, changed database role
 credentials, actual composed journal verification and forged success rejection.
 Both regression containers and the ACL container/volume were removed after use.
+
+### Real schema-4 coordinator qualification
+
+The subsequent integration fixture invokes the production `Lifecycle.backup()`
+and `Lifecycle.rollback()` with the complete schema-4 PostgreSQL catalog.
+It runs actual PostgreSQL **17.11** dump/drop/create/restore, catalog queries and
+storage-barrier transactions, plus Keycloak **26.8.1** vendor account creation,
+verified HTTPS session repair, account deletion and SQL completion readback.
+Versions were checked against the running database and pinned image metadata.
+
+The first run stopped before database replacement because identity capture
+treated the lifecycle's shared `0644` delivery gate as a private journal.
+A second diagnostic run retained the exact traceback. The shared-gate reader
+was corrected without changing the private credential/journal contract, and
+the final source passed **709 of 710 regression tests**. The one tmpfs ACL skip
+passed separately on a Docker volume. New tests also refuse writable modes,
+links, extra hard links, oversized input and malformed gate types.
+
+The final integration run passed **20 HTTPS identity checks** and **42 coordinator
+checks across five fresh probe processes**. It completed both real database
+restores, resumed a lost vendor-creation response, resumed a lost account-deletion
+response, held writers/delivery after an injected edge-start failure, and
+completed a successful retry. Across those attempts there were exactly two
+database replacements, one temporary account creation/deletion, and one completed
+session invalidation. Retries did not recapture the floor, recopy the old API
+environment or replace either database again. An unrelated configuration edit
+was refused; recovery succeeded after restoring those original bytes. Public
+maintenance remained held after coordinator success.
+
+This fixture injects native service controls, Podman command translation/cleanup,
+encrypted-storage admission, candidate image admission and ClickHouse table
+observations. API/ingestion/edge startup is an asserted coordinator boundary,
+not a running application acceptance test. PostgreSQL itself remains running
+across the simulated host-service stops, while both database replacements are
+real. It does not exercise host-component/AIDE acceptance, native Podman/systemd,
+encrypted XFS, SELinux or strict FIPS. Those remain required on the actual appliance.
+
+All **23 owned containers/volumes** across the diagnostic and final runs were
+independently confirmed absent. Both downloaded vendor fixture images were
+removed without force after checking for other users. About **7.8 MiB** of
+measured host scratch was reclaimed; logs, source hashes and result receipts
+were retained. Runtime images, VM disks and release artifacts were preserved.
+
+### Earlier composed-workflow validation
 
 Validation passed **314 focused tests** under Rocky Python **3.14.8**, with no
 skips. The composed-operation cases cover lost creation, logout, deletion,
