@@ -87,6 +87,76 @@ loopback HTTP. It did not bypass the production strict-FIPS entrypoint. Native
 TLS/FIPS execution and production optimized-image recovery are separate gates.
 The earlier failed exact-equality run remains failure evidence, not a pass.
 
+## Durable cutoff journal
+
+`SessionCutoffJournal` retains a root-owned, mode-0600 record in a private manager
+state directory outside the database and customer-configuration backup. It
+binds the installation, realm ID, operation, canonical API environment path,
+non-cutoff configuration hash, phase and greatest recorded issuance floor.
+
+Before any realm mutation, it durably writes and reads back an intent containing
+the maximum of the requested, retained, API and realm floors. After session
+invalidation it persists the effective floor before replacing the API's cutoff
+line. Both the record and environment writes fsync the file and parent directory.
+The receipt requires fresh-login verification and explicitly does not authorize
+releasing maintenance.
+
+Retries require the same non-cutoff API configuration. A distinct authorized
+operation can bind legitimate changed settings after the prior operation reached
+the API phase; it still retains the maximum cutoff. Foreign realm/installation
+identity, ambiguous environment keys, duplicate JSON fields, unsafe modes,
+symlinks, hardlinks, lost fencing and an unfinished different operation are
+refused. Recovering with a missing journal refuses instead of silently starting
+at an older floor. First initialization is explicit and must be authorized by
+the factory/update coordinator; existence checks alone are insufficient to
+re-authorize initialization after loss.
+
+The caller must provide an operation-bound fence check, verify the directory is
+on encrypted manager storage, and keep the API stopped throughout reconciliation.
+The journal does not create temporary administration, stop services, authorize
+initialization, or invoke itself from the updater. It must be combined with the
+coordinator's configuration-preservation checks. A rollback must not overwrite
+the database while a newer observed boundary remains unpersisted after an I/O
+failure; that remains a held recovery condition.
+
+All **106 focused tests** passed under Rocky Python 3.14.8, including 17 journal
+tests using real private files. Faults cover lost logout/write acknowledgements,
+durable-intent failure before REST mutation, fence loss, changed configuration,
+restored older floors, record loss and ownership/format violations. These file
+and injected-REST tests are separate from the live database-restore fixture.
+
+### Live database and configuration rollback
+
+The final source-bound fixture passed **12 authority/token/rollback checks**
+against PostgreSQL 17.11 and Keycloak 26.8.1. It took a real SQL backup containing
+the original browser session, applied session invalidation, and confirmed that
+the old refresh token failed. With the API still stopped, it stopped Keycloak,
+restored the actual database backup with its original owners and permissions,
+and restarted the identity server. The old refresh session worked again,
+demonstrating that database rollback alone revives previously revoked sessions.
+
+A new Rocky Python 3.14.8 process reused the same private journal volume and
+reconciled the restored older API environment and identity database. The retained
+record matched the first process's final record; its floor was preserved or
+increased. The revived refresh token then failed, and the actual API rejected
+both original and newly revived, still-unexpired access tokens with HTTP 401.
+The host fixture's API environment hash matched the journal's resulting file.
+
+All six browser regressions passed before and six after the operation. Four
+role-permission cases, fresh authenticator enrollment, invalid-code rejection
+and fresh-context password/TOTP login passed. Identity/credential/grant and
+signing-key snapshots stayed equal. Temporary administration was removed and
+its credentials and issued token were refused; the original bootstrap account
+remained disabled.
+
+The SQL backup deliberately included the fixture's temporary administrator so
+the restored server could be administered without introducing a second recovery
+identity. Therefore this test does **not** qualify durable temporary-administrator
+creation/deletion recovery. The fixture supplied the fence-admission callback
+from its API-stopped observation; production maintenance admission, encrypted
+host-storage verification, full lifecycle rollback, native TLS/FIPS and failure
+between a remote mutation and persistence remain separate gates.
+
 ## Rollback and integration limits
 
 Both helpers are catalogued libraries, not an automatic migration entrypoint.
@@ -105,4 +175,6 @@ The recovery path must also remove temporary administration and retain the
 original bootstrap account's disabled state.
 
 Automatic transaction integration, durable temporary-authority recovery,
-rollback, native TLS/FIPS execution and full appliance acceptance remain open.
+full lifecycle rollback, native TLS/FIPS execution and full appliance acceptance
+remain open. The isolated SQL/configuration rollback above does not release
+those production gates.
