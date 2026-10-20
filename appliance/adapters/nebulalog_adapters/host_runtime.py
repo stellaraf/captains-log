@@ -318,9 +318,21 @@ class HostRuntime:
         else:
             atomic_file(path, raw, 0o600, (OWNER_UID, OWNER_GID))
 
-    def _preserved(self, plan):
-        if self.preserved() != plan["preserved"]:
+    def _preserved(self, plan, *, rollback=False):
+        observed = self.preserved()
+        expected = plan["preserved"]
+        if observed == expected:
+            return
+        api = str(self.lifecycle.configuration / "runtime/api.env")
+        if (not rollback or len(observed) != len(expected)
+                or [item["path"] for item in observed] != [item["path"] for item in expected]
+                or sum(item["path"] == api for item in expected) != 1
+                or any(old != new for old, new in zip(expected, observed) if old["path"] != api)):
             raise Refused("Customer configuration or enrolled trust changed during host maintenance")
+        from .identity_maintenance import verify_restore_api_preservation
+        before = next(item for item in expected if item["path"] == api)
+        after = next(item for item in observed if item["path"] == api)
+        verify_restore_api_preservation(self.lifecycle, self.stage, before, after)
 
     def backup(self, *, preactivation_recovery=False):
         if preactivation_recovery and self.transaction.get("activation_started") is not False:
@@ -376,7 +388,7 @@ class HostRuntime:
         self.phase("update-rollback" if rollback else "update-activate")
         from .lifecycle import atomic_file
         plan = self.verify_backup()
-        self._preserved(plan)
+        self._preserved(plan, rollback=rollback)
         if not rollback:
             host_dispatch.generation_info(self.candidate["generation"])
             if "baseline" in self.release["components"]:
@@ -397,14 +409,14 @@ class HostRuntime:
                 raise Refused("Host runtime file did not retain the selected bytes and mode")
         if self.lifecycle.config.get("edge_service"):
             self.lifecycle.cmd(["httpd", "-t"])
-        self._preserved(plan)
+        self._preserved(plan, rollback=rollback)
 
     def runtime_evidence(self, action, *, accept_integrity=False):
         self.phase(action)
         plan = self.verify_backup()
-        self._preserved(plan)
         selected = host_activation.selection()
         rollback = selected["generation"] == self.previous["generation"]
+        self._preserved(plan, rollback=rollback and action in {"update-rollback", "update-health", "update-finalize"})
         phase = "before" if rollback else "after"
         for item in plan["files"]:
             if checked_file(Path(item["path"]))[1] != item[phase]:

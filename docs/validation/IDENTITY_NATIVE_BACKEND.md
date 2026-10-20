@@ -113,10 +113,10 @@ or repeating completed session work. New state-directory entries are fsynced
 before subsequent durable work.
 
 The composed operation is not yet invoked automatically by lifecycle service
-startup. Host resource preservation and AIDE both currently require the original
-API environment hash. They need a narrowly authorized cutoff transformation,
-including historical integrity evidence, before this operation can be connected
-without failing integrity acceptance. The completed-restore retry path must also
+startup. Host resource preservation now verifies the exact completed restore
+transformation described below. AIDE still requires the original API environment
+hash and needs retained historical authorization before this operation can be
+connected without failing integrity acceptance. The completed-restore retry path must also
 preserve the new cutoff rather than recopying the old configuration. Those checks
 remain enforced; this work does not exempt the API environment from integrity
 monitoring or claim full appliance rollback acceptance.
@@ -140,6 +140,45 @@ transport, session journal and authority controller. Its command boundary uses
 owned Docker containers for the real vendor CLI and server, with injected native
 Podman journaling, lifecycle admission and encrypted-storage checks. It does not
 qualify those native boundaries, AIDE acceptance, or the full appliance lifecycle.
+
+### Host preservation after session recovery
+
+Rollback host reconciliation can authorize the single changed
+`runtime/api.env` inventory entry through
+`verify_restore_api_preservation()`. Forward activation, backup and preparation
+retain their exact original-file checks. Every other customer/trust inventory
+entry must still match, with no added, removed or reordered entries.
+
+The read-only verifier binds the original protected API descriptor to the
+verified recovery copy, requires completed database replacement and the exact
+pre-restore capture, and validates the operation's admission/completion records,
+installation identity, immutable image pin and retained input hashes. It
+compares all non-cutoff bytes directly, requires the canonical final cutoff line
+and a nondecreasing floor, checks the completed session journal and removed
+temporary-authority record, then remeasures both API files. Files must retain
+root ownership, private mode and protected ancestry. The returned evidence
+contains hashes and metadata, never credential values; it does not release
+maintenance or assert current database/server health.
+
+The focused Rocky Python **3.14.8** run passed **348 tests** without skips,
+including changed customer values, lowered cutoffs, wrong plan descriptors,
+changed recovery copies, foreign or incomplete operations, missing admission,
+unremoved authority, concurrent file modification, and forward-use refusal.
+Existing AIDE tests still reject unrelated byte/metadata changes. The test
+container's private scratch mount has protected ancestry; the first attempt
+correctly refused fixtures beneath a world-writable scratch parent.
+
+The repeated PostgreSQL **17.11** / Keycloak **26.8.1** HTTPS fixture passed
+**20 identity checks**, **six database capture/restore checks**, and **19
+workflow/preservation checks** across three separate recovery processes.
+The new verifier accepted the actual restored API cutoff, refused a wrong
+preimage, returned no customer credential value and did not authorize releasing
+maintenance. Creation, session work and deletion each occurred once despite
+lost creation/deletion acknowledgements. Native admission, command journaling
+and encrypted-storage checks remain injected as described above.
+
+This host check does not grant an AIDE exception. Historical authorization,
+completed-restore resume ordering and lifecycle invocation remain required.
 
 ### Pre-restore cutoff capture
 

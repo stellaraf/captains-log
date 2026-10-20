@@ -10,7 +10,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from nebulalog_adapters.identity_maintenance import IdentityMaintenanceBackend, LABEL, capture_before_database_restore
+from nebulalog_adapters.identity_maintenance import (IdentityMaintenanceBackend, LABEL, capture_before_database_restore,
+                                                    verify_restore_api_preservation)
 from nebulalog_manager.common import Refused, atomic_json
 from nebulalog_manager.identity_sessions import SessionCutoffJournal
 
@@ -573,6 +574,125 @@ class MaintenanceBackendTests(unittest.TestCase):
         captured=json.loads(self.capture_path.read_text());atomic_json(self.capture_path,{**captured,'floor':self.capture_floor+1})
         with self.assertRaises(Refused):self.backend.restore_sessions()
         self.assertEqual(self.logout_calls,1)
+
+    def preservation_descriptors(self):
+        from nebulalog_adapters.host_runtime import checked_file
+        api = self.backend.api_environment
+        before = {"path": str(api), **checked_file(self.backend.stage / "recovery/configuration/runtime/api.env")[1]}
+        after = {"path": str(api), **checked_file(api)[1]}
+        return before, after
+
+    def verify_preservation(self, before=None, after=None):
+        actual_before, actual_after = self.preservation_descriptors()
+        return verify_restore_api_preservation(self.life, self.backend.stage,
+                                              before or actual_before, after or actual_after)
+
+    def test_restore_preservation_authorizes_exact_change_without_commands_or_secrets(self):
+        self.prepare_session_restore(); self.backend.restore_sessions()
+        before, after = self.preservation_descriptors()
+        commands = len(self.native.calls)
+        result = self.verify_preservation(before, after)
+        self.assertEqual(result["before"], before); self.assertEqual(result["after"], after)
+        self.assertEqual(result["token_not_before"], self.capture_floor)
+        self.assertFalse(result["maintenance_release_authorized"])
+        self.assertNotIn("keep-this-fixture-value", json.dumps(result))
+        self.assertNotIn(self.restore_secret, json.dumps(result))
+        self.assertEqual(len(self.native.calls), commands)
+
+    def test_restore_preservation_rejects_customer_changes_even_with_fresh_descriptor(self):
+        self.prepare_session_restore(); self.backend.restore_sessions()
+        original = self.backend.api_environment.read_bytes()
+        for altered in (original.replace(b"keep-this", b"changed"),
+                        original.replace(str(self.capture_floor).encode(), str(self.capture_floor - 1).encode()),
+                        b"UNEXPECTED_SETTING=value\n" + original,
+                        original + b"OIDC_TOKEN_NOT_BEFORE=1800000000\n"):
+            with self.subTest(altered=hashlib.sha256(altered).hexdigest()):
+                self.backend.api_environment.write_bytes(altered)
+                with self.assertRaises(Refused): self.verify_preservation()
+        self.backend.api_environment.write_bytes(original)
+        self.backend.api_environment.chmod(0o640)
+        with self.assertRaises(Refused): self.verify_preservation()
+
+    def test_restore_preservation_requires_exact_plan_preimage_and_measured_postimage(self):
+        self.prepare_session_restore(); self.backend.restore_sessions()
+        before, after = self.preservation_descriptors()
+        for key, value in (("sha256", "f" * 64), ("bytes", before["bytes"] + 1),
+                           ("mode", 0o644), ("path", str(self.root / "foreign.env"))):
+            with self.subTest(key=key):
+                with self.assertRaises(Refused): self.verify_preservation({**before, key: value}, after)
+                with self.assertRaises(Refused): self.verify_preservation(before, {**after, key: value})
+        original = self.backend.stage / "recovery/configuration/runtime/api.env"
+        original.write_bytes(original.read_bytes().replace(b"keep-this", b"changed"))
+        with self.assertRaises(Refused): self.verify_preservation(before, after)
+
+    def test_restore_preservation_requires_bound_capture_and_completed_database_restore(self):
+        self.prepare_session_restore(); self.backend.restore_sessions()
+        self.life.database_restore_status.return_value = (self.restore_context, True, False)
+        with self.assertRaises(Refused): self.verify_preservation()
+        self.life.database_restore_status.return_value = (self.restore_context, True, True)
+        self.transaction["activation_started"] = False
+        with self.assertRaises(Refused): self.verify_preservation()
+        self.transaction["activation_started"] = True
+        saved = self.capture_path.read_bytes()
+        capture = json.loads(saved)
+        for key, value in (("operation", "f" * 64), ("floor", self.capture_floor + 1), ("realm_id", "foreign")):
+            atomic_json(self.capture_path, {**capture, key: value})
+            with self.assertRaises(Refused): self.verify_preservation()
+        self.capture_path.write_bytes(saved)
+        self.assertEqual(self.verify_preservation()["token_not_before"], self.capture_floor)
+
+    def test_restore_preservation_rejects_foreign_completion_and_incomplete_authority(self):
+        self.prepare_session_restore(); self.backend.restore_sessions()
+        complete = self.backend.workdir / "restore-complete.json"
+        authority = self.backend.directory / "temporary-authority.json"
+        session = self.backend.directory / "session-cutoff.json"
+        mutations = ((complete, "authority_removed", False), (complete, "maintenance_released", True),
+                     (complete, "schema", True), (authority, "phase", "removing"),
+                     (authority, "secret", "a" * 64), (authority, "operation", "f" * 64),
+                     (session, "phase", "realm"), (session, "api_configuration_sha256", "f" * 64))
+        for path, key, value in mutations:
+            with self.subTest(path=path.name, key=key):
+                raw = path.read_bytes(); changed = json.loads(raw); changed[key] = value
+                atomic_json(path, changed)
+                with self.assertRaises(Refused): self.verify_preservation()
+                path.write_bytes(raw)
+        raw = complete.read_bytes(); changed = json.loads(raw); changed["binding"]["direction"] = "activate"
+        atomic_json(complete, changed)
+        with self.assertRaises(Refused): self.verify_preservation()
+        complete.write_bytes(raw)
+        (self.backend.workdir / "restore-admission.json").unlink()
+        with self.assertRaises(OSError): self.verify_preservation()
+
+    def test_restore_preservation_rechecks_live_bytes_after_records(self):
+        from nebulalog_adapters import host_runtime
+        self.prepare_session_restore(); self.backend.restore_sessions()
+        before, after = self.preservation_descriptors()
+        read = host_runtime.checked_file
+        calls = 0
+        def changed(path, *args):
+            nonlocal calls
+            calls += 1
+            if calls == 4:
+                path.write_bytes(path.read_bytes() + b"EXTRA=value\n")
+            return read(path, *args)
+        with patch.object(host_runtime, "checked_file", changed), self.assertRaises(Refused):
+            verify_restore_api_preservation(self.life, self.backend.stage, before, after)
+
+    def test_host_preservation_uses_real_restore_validation_only_on_rollback(self):
+        from nebulalog_adapters.host_runtime import HostRuntime
+        self.prepare_session_restore(); self.backend.restore_sessions()
+        before, after = self.preservation_descriptors()
+        unchanged = {"path": str(self.root / "trust.json"), "sha256": "a" * 64}
+        host = HostRuntime.__new__(HostRuntime)
+        host.lifecycle = self.life; host.stage = self.backend.stage
+        host.preserved = Mock(return_value=[after, unchanged])
+        plan = {"preserved": [before, unchanged]}
+        with self.assertRaises(Refused): host._preserved(plan)
+        host._preserved(plan, rollback=True)
+        for observed in ([after], [after, {**unchanged, "sha256": "b" * 64}],
+                         [after, unchanged, {"path": "new-file"}], [unchanged, after]):
+            host.preserved.return_value = observed
+            with self.assertRaises(Refused): host._preserved(plan, rollback=True)
 
 
 if __name__ == "__main__":

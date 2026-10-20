@@ -142,6 +142,118 @@ def capture_before_database_restore(lifecycle, stage, context, *, resume):
                                    int(time.time()), held, resume=resume)
 
 
+def verify_restore_api_preservation(life, stage, before, after):
+    """Authorize one completed restore's exact API cutoff transformation.
+
+    This is a read-only preservation check, not integrity-baseline acceptance or
+    permission to start services. AIDE must independently retain and validate
+    its historical authorization before the lifecycle can invoke this workflow.
+    """
+    from .host_runtime import checked_file, description
+    stage = Path(stage)
+    if not stage.is_absolute() or stage.resolve() != stage:
+        raise Refused("Restore preservation requires a canonical stage")
+    life.guard()
+    _, transaction = life.release(stage)
+    if transaction.get("activation_started") is not True:
+        raise Refused("Restore preservation requires activation admission")
+    context, restoring, restored = life.database_restore_status(stage, life.checked_backup(stage))
+    if restoring is not True or restored is not True:
+        raise Refused("Restore preservation requires completed database replacement")
+    api = life.configuration / "runtime/api.env"
+    original_path = stage / "recovery/configuration/runtime/api.env"
+    original, original_description = checked_file(original_path)
+    current, current_description = checked_file(api)
+    if (before != {"path": str(api), **original_description}
+            or after != {"path": str(api), **current_description}
+            or original_description != description(original, 0o600, 0, 0)
+            or current_description != description(current, 0o600, 0, 0)):
+        raise Refused("Restore preservation differs from the original protected API file")
+    original_floor, body, configuration = SessionCutoffJournal._environment(original)
+    floor, current_body, current_configuration = SessionCutoffJournal._environment(current)
+    if (current_body != body or current_configuration != configuration or floor < original_floor
+            or current != body + b"OIDC_TOKEN_NOT_BEFORE=" + str(floor).encode() + b"\n"):
+        raise Refused("Restore preservation permits only the canonical monotonic cutoff")
+    setup = life.configuration / "bootstrap/setup.json"
+    installation = strict_json(SessionCutoffJournal._read(setup))["installation_id"]
+    if not isinstance(installation, str) or str(uuid.UUID(installation)) != installation:
+        raise Refused("Restore preservation requires a canonical installation identity")
+    operation = _digest((str(stage) + "/identity/rollback").encode())
+    directory = life.data / "manager/identity-maintenance"
+    journal = SessionCutoffJournal(directory, installation)
+    workdir = directory / "operations" / operation
+    for path in (directory / "operations", workdir):
+        SessionCutoffJournal._directory(path)
+    capture = journal._restore_record(api)
+    capture_operation = _digest(json.dumps(context, sort_keys=True, separators=(",", ":")).encode())
+    if (capture is None or capture["operation"] != capture_operation
+            or not original_floor <= capture["floor"] <= floor):
+        raise Refused("Restore preservation lost its pre-restore floor")
+    binding_files = (setup, life.configuration / "runtime/keycloak.env",
+                     life.quadlets / "nebulalog-keycloak.container",
+                     life.configuration / "tls/ca.crt", stage / "manifest.json")
+    inputs = {str(path): _digest(trusted_file(path).read_bytes()) for path in binding_files}
+    complete_raw = SessionCutoffJournal._read(workdir / "restore-complete.json")
+    complete = strict_json(complete_raw)
+    fields = {"schema", "binding", "admission_sha256", "session", "authority_removed", "maintenance_released"}
+    if (not isinstance(complete, dict) or set(complete) != fields
+            or type(complete["schema"]) is not int or complete["schema"] != 1
+            or complete["authority_removed"] is not True or complete["maintenance_released"] is not False):
+        raise Refused("Restore preservation requires an exact completion receipt")
+    binding = complete["binding"]
+    if (not isinstance(binding, dict)
+            or set(binding) != {"schema", "operation", "installation_id", "stage", "direction", "image", "image_id", "inputs"}
+            or type(binding["schema"]) is not int or binding["schema"] != 1
+            or binding["operation"] != operation or binding["installation_id"] != installation
+            or binding["stage"] != str(stage) or binding["direction"] != "rollback" or binding["inputs"] != inputs
+            or not isinstance(binding["image"], str) or not IMAGE.fullmatch(binding["image"])
+            or not isinstance(binding["image_id"], str) or not SHA.fullmatch(binding["image_id"])
+            or re.findall(r"^Image=(.*)$", binding_files[2].read_text(), re.MULTILINE) != [binding["image"]]):
+        raise Refused("Restore preservation completion belongs to another operation")
+    admission_raw = SessionCutoffJournal._read(workdir / "restore-admission.json")
+    admission = strict_json(admission_raw)
+    fixed = {"schema": 1, "binding": binding, "restore_operation": capture_operation,
+             "capture_sha256": _digest(json.dumps(capture, sort_keys=True, separators=(",", ":")).encode()),
+             "original_api_sha256": _digest(original), "api_configuration_sha256": configuration}
+    if (not isinstance(admission, dict)
+            or set(admission) != set(fixed) | {"initialize_authority", "initialize_session"}
+            or type(admission["schema"]) is not int
+            or any(admission[key] != value for key, value in fixed.items())
+            or any(type(admission[key]) is not bool for key in ("initialize_authority", "initialize_session"))
+            or _digest(admission_raw) != complete["admission_sha256"]):
+        raise Refused("Restore preservation admission changed")
+    receipt = TemporaryIdentityAuthority._receipt(complete["session"], installation, operation)
+    expected_journal = {"schema": 1, "installation_id": installation, "operation": operation, "floor": floor,
+                        "phase": "api", "api_path": str(api), "api_configuration_sha256": configuration,
+                        "realm_id": capture["realm_id"]}
+    retained = strict_json(SessionCutoffJournal._read(journal.path))
+    if (retained != expected_journal or type(retained.get("schema")) is not int
+            or receipt["token_not_before"] != floor or receipt["api_sha256"] != _digest(current)
+            or receipt["api_configuration_sha256"] != configuration):
+        raise Refused("Restore preservation differs from completed session work")
+    authority = strict_json(SessionCutoffJournal._read(directory / "temporary-authority.json"))
+    authority_fields = {"schema", "installation_id", "operation", "realm_id", "bootstrap_id", "client_name",
+                        "client_id", "service_user_id", "secret", "token", "phase", "work_receipt"}
+    if (not isinstance(authority, dict) or set(authority) != authority_fields
+            or type(authority["schema"]) is not int or authority["schema"] != 1
+            or authority.get("phase") != "removed"
+            or authority.get("installation_id") != installation or authority.get("operation") != operation
+            or authority.get("realm_id") != capture["realm_id"]
+            or authority.get("secret") is not None or authority.get("token") is not None
+            or authority.get("work_receipt") != receipt
+            or not isinstance(authority["client_name"], str) or not CLIENT.fullmatch(authority["client_name"])
+            or any(not isinstance(authority[key], str) or not IDENTITY.fullmatch(authority[key])
+                   for key in ("bootstrap_id", "client_id", "service_user_id"))):
+        raise Refused("Restore preservation requires retained authority removal")
+    # Re-read both files after the bound records; do not bless a concurrent edit.
+    if checked_file(original_path) != (original, original_description) or checked_file(api) != (current, current_description):
+        raise Refused("API preservation changed during verification")
+    return {"schema": 1, "kind": "restored-api-cutoff-v1", "operation": operation,
+            "installation_id": installation, "before": before, "after": after,
+            "configuration_sha256": configuration, "token_not_before": floor,
+            "completion_sha256": _digest(complete_raw), "maintenance_release_authorized": False}
+
+
 class IdentityMaintenanceBackend:
     """Compose with TemporaryIdentityAuthority while the lifecycle lease is held.
 
