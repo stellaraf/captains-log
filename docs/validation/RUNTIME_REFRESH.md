@@ -74,6 +74,39 @@ bind-mount ownership behavior without relaxing production database checks.
 Both temporary schemas were removed; the container, volume, private fixture
 credentials and build caches were independently confirmed absent afterward.
 
+## Subsequent Linux peer qualification
+
+Both opt-in Linux host-planning socket tests passed using the Go 1.27.2
+Linux/amd64 test executable and public Rocky Python 3.14.8, with networking
+disconnected. The dedicated API UID could create and retrieve a plan. Root
+was rejected as an API caller, a different session could not retrieve the plan,
+and an untrusted server received no request bytes even after its socket's
+filesystem ownership was made to look trusted. The kernel `SO_PEERCRED`
+checks, framing and private journals were real; disk geometry was synthetic
+and no storage operation was executed.
+
+The first run exposed a fixture teardown defect: Go context cancellation
+killed Python before its journal cleanup ran. The test now requests and checks
+graceful shutdown before canceling the context, and explicitly runs Python
+3.14. Both integration cases and all three Python fixture-safety tests then
+passed. An independent in-container check confirmed that the socket, control
+directory and temporary journals were absent. The container and host compile
+caches were subsequently removed and their absence verified. This does not
+qualify native host-authority enrollment, privileged execution or recovery.
+
+## Subsequent constrained-filesystem qualification
+
+`TestSpoolHeadroomConstrainedFilesystem` passed on a real, initially empty
+320 MiB Linux tmpfs using the Go 1.27.2 Linux/amd64 test executable. Actual
+filesystem pressure refused admission at 268,496,896 available bytes while
+preserving the 268,435,456-byte reserve. The test verified the exact retained
+WAL record across restart, continued refusal after restart, acknowledgement
+and draining under pressure, and resumed admission after space was recovered.
+It ran without network access and with all container capabilities dropped.
+The tmpfs was empty afterward; the container and host compile caches were
+independently confirmed absent. Physical disk failures, native encrypted
+storage and full appliance recovery remain separate acceptance gates.
+
 ## Remaining acceptance
 
 Existing-appliance interpreter installation and fixed-host migration,
