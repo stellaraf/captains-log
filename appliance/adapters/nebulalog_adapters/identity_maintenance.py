@@ -1,7 +1,8 @@
 """Fixed native boundaries for operation-owned Keycloak recovery.
 
-No entrypoint invokes this backend until lifecycle admission/migration is wired
-and qualified. In particular, ``hold`` never authorizes releasing maintenance.
+Failed-activation rollback invokes this backend after durable database restore.
+Native qualification remains required. ``hold`` never authorizes releasing
+maintenance.
 """
 import hashlib
 import json

@@ -2,8 +2,9 @@
 
 `IdentityMaintenanceBackend` implements the fixed host boundaries needed by
 `TemporaryIdentityAuthority`. It is included in the **137-file** factory host
-catalog. No lifecycle entrypoint invokes it yet; inclusion in a verified archive
-does not authorize activation or migrate an installed catalog.
+catalog. Failed-activation rollback now invokes its composed session recovery
+after durable database replacement. Inclusion in a verified archive does not
+qualify native execution, authorize activation or migrate an installed catalog.
 
 ## Admission and external access
 
@@ -112,14 +113,50 @@ acknowledgement can reuse the exact receipt without creating a second account
 or repeating completed session work. New state-directory entries are fsynced
 before subsequent durable work.
 
-The composed operation is not yet invoked automatically by lifecycle service
-startup. Host resource preservation now verifies the exact completed restore
+The composed operation is invoked by failed-activation rollback before external
+service startup. Host resource preservation verifies the exact completed restore
 transformation described below. AIDE now retains the corresponding authorization
 and verifies its historical database rows, but native qualification is still
-required. The completed-restore retry path must also
-preserve the new cutoff rather than recopying the old configuration. Those checks
-remain enforced; this work does not exempt the API environment from integrity
-monitoring or claim full appliance rollback acceptance.
+required. The completed-restore retry path preserves the new cutoff rather than
+recopying the old configuration. Those checks remain enforced; this work does
+not exempt the API environment from integrity monitoring or claim full appliance
+rollback acceptance.
+
+### Lifecycle restore integration
+
+The coordinator stops the public edge and external writers under the existing
+maintenance and delivery holds. After database restoration is durably complete,
+it invokes session recovery and independently verifies its retained completion,
+API transformation and temporary-authority removal before restarting services.
+Host rollback preservation runs again after identity recovery. Apache is restarted
+explicitly even when the container lifecycle's optional edge setting is absent.
+Delivery resumes only after service startup and host-runtime readback; external
+maintenance remains active for the existing health/finalization gates.
+
+A completed-database-restore retry does not recapture the pre-restore cutoff,
+stop PostgreSQL, repeat database replacement or copy the old configuration.
+It verifies the complete restored file/ownership/mode inventory, configuration
+directories, original Quadlets and database role credentials. Only the API
+file's content is deferred to the identity controller and independent completion
+verifier. This allows the controller to reconcile its own interrupted vendor
+command before startup; unrelated file changes remain refused.
+
+Startup or completion-write failure attempts to reestablish the delivery hold
+and stop API, ingestion and Apache. Failure of one cleanup action does not skip
+the others, and a failure to restore those holds produces a reconciliation error.
+The coordinator tests inject systemd, databases, encrypted storage and the native
+identity boundary. Separate composed-boundary tests execute the actual authority,
+session journals and completion verifier with injected native/HTTPS operations.
+These tests do not establish native or full-appliance acceptance.
+
+The final lifecycle integration source ran **708 tests** on public Rocky Python
+**3.14.8**, Linux/amd64: **707 passed** and the read-only ACL ABI check skipped on
+tmpfs. That exact ACL check passed separately on a Docker volume without skips.
+Eight added tests cover interrupted resume without recopy or database replacement,
+identity failure before writer startup, unrelated configuration/Quadlet changes,
+edge startup failure, cleanup despite gate-write failure, changed database role
+credentials, actual composed journal verification and forged success rejection.
+Both regression containers and the ACL container/volume were removed after use.
 
 Validation passed **314 focused tests** under Rocky Python **3.14.8**, with no
 skips. The composed-operation cases cover lost creation, logout, deletion,
@@ -247,8 +284,8 @@ capture evidence stops recovery.
 
 `SessionCutoffJournal.reconcile()` consumes that retained floor and verifies
 the realm identity before mutation. Capture is not session invalidation: the
-complete post-restore authority/session workflow must still be connected before
-this can qualify a full appliance rollback. Historical image-only rollback
+complete post-restore authority/session workflow is now connected, but still
+requires native qualification for full appliance rollback. Historical image-only rollback
 does not replace the database and does not use this capture boundary.
 
 The final source passed **308 focused tests** on Rocky Python **3.14.8**,
@@ -278,10 +315,9 @@ responses. They exercise command journaling and interruption recovery but cannot
 establish actual Podman behavior, SELinux labeling, encrypted mount admission or
 strict-FIPS execution.
 
-Remaining work includes connecting this backend to the full authority/session
-workflow and service-client migration; preserving the authentication cutoff
-before database replacement; reconciling the API environment with host-update
-configuration preservation; and exercising actual activation, rollback and
-interruption on both hypervisors. All prerelease external identity-provider
+Remaining work includes service-client migration and forward activation;
+qualifying the connected restore workflow, retained cutoff and host/AIDE
+preservation on the native platform; and exercising actual activation, rollback
+and interruption on both hypervisors. All prerelease external identity-provider
 qualification gates remain in force. The public Rocky kernel's native crypto
 self-test blocker and final OVA acceptance remain separate unresolved gates.

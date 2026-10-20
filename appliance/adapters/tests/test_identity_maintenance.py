@@ -507,6 +507,32 @@ class MaintenanceBackendTests(unittest.TestCase):
         self.assertEqual(self.logout_calls,1)
         self.assertFalse(any(call[:2]==['podman','create']for call in self.native.calls[calls:]))
 
+    def test_lifecycle_boundary_runs_recovery_and_independent_completion_verification(self):
+        from nebulalog_adapters.lifecycle import Lifecycle
+        self.prepare_session_restore()
+        # Keep the real composed backend, durable journals and final verifier;
+        # only construction uses this fixture's native/HTTPS boundaries.
+        with patch("nebulalog_adapters.identity_maintenance.IdentityMaintenanceBackend",
+                   return_value=self.backend) as constructor:
+            result = Lifecycle.identity_restore_sessions(self.life, self.backend.stage)
+            constructor.assert_called_once_with(self.life, self.backend.stage, "rollback")
+        self.assertTrue(result["authority_removed"])
+        self.assertFalse(result["maintenance_released"])
+        self.assertEqual(self.verify_preservation()["token_not_before"], self.capture_floor)
+        self.assertEqual(self.native.units["api"], "inactive")
+        self.assertEqual(self.native.units["edge"], "inactive")
+
+    def test_lifecycle_boundary_rejects_forged_backend_success(self):
+        from nebulalog_adapters.lifecycle import Lifecycle
+        self.prepare_session_restore()
+        # A success-shaped callback cannot substitute for retained authority
+        # removal/session completion evidence.
+        with patch("nebulalog_adapters.identity_maintenance.IdentityMaintenanceBackend") as constructor:
+            constructor.return_value.restore_sessions.return_value = {
+                "authority_removed": True, "maintenance_released": False}
+            with self.assertRaises((Refused, FileNotFoundError)):
+                Lifecycle.identity_restore_sessions(self.life, self.backend.stage)
+
     def test_post_restore_resumes_lost_creation_logout_and_deletion(self):
         for fault in ('created','logout','delete'):
             with self.subTest(fault=fault):

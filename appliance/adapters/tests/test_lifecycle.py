@@ -93,6 +93,9 @@ class LifecycleTests(unittest.TestCase):
         self.manager.storage_maintenance = Mock()
         self.manager.identity_restore_capture = Mock(side_effect=lambda stage, context, **kw:
             self.commands.calls.append(["identity-capture", kw["resume"]]))
+        self.manager.identity_restore_sessions = Mock(side_effect=lambda stage:
+            self.commands.calls.append(["identity-restored"]) or
+            {"authority_removed": True, "maintenance_released": False})
         self.manager.application_schema_catalog = Mock(return_value={"schema_revision": "1"})
         self.manager.api_ready = Mock()
         self.trusted = patch("nebulalog_adapters.lifecycle.trusted_file", side_effect=lambda path: path)
@@ -206,6 +209,102 @@ class LifecycleTests(unittest.TestCase):
         captures=[i for i,call in enumerate(self.commands.calls) if call==['identity-capture',False]]
         self.assertEqual(len(captures),2)
         self.assertTrue(all(i<first_drop for i in captures))
+
+    def test_identity_recovery_failure_never_restarts_external_writers(self):
+        self.manager.backup(self.stage); self.manager.prepare(self.stage); self.manager.activate(self.stage)
+        self.manager.identity_restore_sessions.side_effect = Refused("identity cleanup incomplete")
+        before = len(self.commands.calls)
+        with self.assertRaisesRegex(Refused, "identity cleanup"):
+            self.manager.rollback(self.stage)
+        self.assertTrue((self.stage / "adapter-database-restore-complete.json").exists())
+        calls = self.commands.calls[before:]
+        for name in ("api", "ingest", "edge"):
+            self.assertNotIn(["systemctl", "start", "nebulalog-" + name + ".service"], calls)
+            self.assertEqual(self.commands.units["nebulalog-" + name + ".service"], "inactive")
+
+    def test_completed_restore_resumes_identity_without_recopy_or_recapture(self):
+        api = self.config_dir / "runtime/api.env"
+        api.parent.mkdir(mode=0o700); api.write_bytes(b"OIDC_TOKEN_NOT_BEFORE=1700000000\n"); api.chmod(0o600)
+        self.manager.backup(self.stage); self.manager.prepare(self.stage); self.manager.activate(self.stage)
+        def interrupted(stage):
+            api.write_bytes(b"OIDC_TOKEN_NOT_BEFORE=1800000000\n")
+            raise OSError("lost identity completion acknowledgment")
+        self.manager.identity_restore_sessions.side_effect = interrupted
+        with self.assertRaises(OSError): self.manager.rollback(self.stage)
+        changed = api.read_bytes()
+        self.manager.identity_restore_capture.reset_mock()
+        before = len(self.commands.calls)
+        def resume(stage):
+            self.assertEqual(api.read_bytes(), changed)
+            self.commands.calls.append(["identity-restored"])
+            return {"authority_removed": True, "maintenance_released": False}
+        self.manager.identity_restore_sessions.side_effect = resume
+        with patch("nebulalog_adapters.lifecycle.atomic_file", side_effect=AssertionError("must not recopy")):
+            result = self.manager.rollback(self.stage)
+        self.assertTrue(result["identity"]["authority_removed"])
+        self.manager.identity_restore_capture.assert_not_called()
+        calls = self.commands.calls[before:]
+        self.assertFalse(any("dropdb" in call or "createdb" in call or "pg_restore" in call for call in calls))
+        self.assertNotIn(["systemctl", "stop", "nebulalog-postgresql.service"], calls)
+        finished = calls.index(["identity-restored"])
+        for name in ("api", "ingest", "edge"):
+            self.assertGreater(calls.index(["systemctl", "start", "nebulalog-" + name + ".service"]), finished)
+        self.assertEqual(api.read_bytes(), changed)
+
+    def test_completed_restore_refuses_unrelated_configuration_and_unit_changes(self):
+        self.manager.backup(self.stage); self.manager.prepare(self.stage); self.manager.activate(self.stage)
+        self.manager.rollback(self.stage)
+        for target in (self.secret, self.quadlets / "nebulalog-keycloak.container"):
+            original = target.read_bytes()
+            with self.subTest(path=target):
+                target.write_bytes(original + b"UNEXPECTED=true\n")
+                self.manager.identity_restore_sessions.reset_mock()
+                with self.assertRaisesRegex(Refused, "Completed restore"):
+                    self.manager.rollback(self.stage)
+                self.manager.identity_restore_sessions.assert_not_called()
+                self.assertEqual(target.read_bytes(), original + b"UNEXPECTED=true\n")
+                target.write_bytes(original)
+
+    def test_edge_start_failure_restops_writers_and_retains_delivery_hold(self):
+        self.manager.backup(self.stage); self.manager.prepare(self.stage); self.manager.activate(self.stage)
+        command = self.manager.cmd
+        def failing(argv, **kwargs):
+            if argv == ["systemctl", "start", "nebulalog-edge.service"]:
+                raise Refused("edge failed")
+            return command(argv, **kwargs)
+        # Keep capture/feed on the command object for the DB restore phase.
+        failing.feed = command.feed
+        self.manager.cmd = failing
+        with self.assertRaisesRegex(Refused, "edge failed"): self.manager.rollback(self.stage)
+        for name in ("api", "ingest", "edge"):
+            self.assertEqual(self.commands.units["nebulalog-" + name + ".service"], "inactive")
+        self.manager.storage_maintenance.assert_called_with(
+            self.stage, held=True, delivery_held=True, host_only=True)
+
+    def test_gate_rehold_failure_still_attempts_all_writer_stops(self):
+        self.manager.backup(self.stage); self.manager.prepare(self.stage); self.manager.activate(self.stage)
+        command = self.manager.cmd
+        def failing(argv, **kwargs):
+            if argv == ["systemctl", "start", "nebulalog-edge.service"]:
+                self.manager.storage_maintenance.side_effect = OSError("gate disk failed")
+                raise Refused("edge failed")
+            return command(argv, **kwargs)
+        failing.feed = command.feed
+        self.manager.cmd = failing
+        with self.assertRaisesRegex(Refused, "holds require reconciliation"):
+            self.manager.rollback(self.stage)
+        for name in ("api", "ingest", "edge"):
+            self.assertEqual(self.commands.units["nebulalog-" + name + ".service"], "inactive")
+
+    def test_completed_restore_rechecks_database_role_credentials_before_identity(self):
+        self.manager.backup(self.stage); self.manager.prepare(self.stage); self.manager.activate(self.stage)
+        self.manager.rollback(self.stage)
+        self.manager.identity_restore_sessions.reset_mock()
+        sql = self.manager.sql
+        self.manager.sql = lambda query, *a, **kw: "{}" if "pg_authid" in query else sql(query, *a, **kw)
+        with self.assertRaisesRegex(Refused, "role credentials changed"):
+            self.manager.rollback(self.stage)
+        self.manager.identity_restore_sessions.assert_not_called()
 
     def test_finalize_requires_durable_completion_and_all_checks(self):
         with self.assertRaises(Refused):

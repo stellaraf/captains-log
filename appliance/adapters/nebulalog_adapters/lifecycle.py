@@ -1633,6 +1633,99 @@ END $fence$; SELECT 'fenced';"""
             raise Refused("Identity restore capture receipt did not persist")
         return result
 
+    def identity_restore_sessions(self, stage):
+        from .identity_maintenance import IdentityMaintenanceBackend, verify_restore_api_preservation
+        from .host_runtime import checked_file
+        result = IdentityMaintenanceBackend(self, stage, "rollback").restore_sessions()
+        api = self.configuration / "runtime/api.env"
+        _, before = checked_file(stage / "recovery/configuration/runtime/api.env")
+        _, after = checked_file(api)
+        # Independently read the retained completion and authority-removal
+        # records before any caller can restart external writers.
+        verify_restore_api_preservation(self, stage, {"path": str(api), **before},
+                                        {"path": str(api), **after})
+        return result
+
+    def _restored_configuration(self, stage, evidence):
+        """Check a completed restore without overwriting partial session work.
+
+        Only the API file's content may differ here. The identity backend must
+        reconcile its exact operation journal and prove the cutoff change before
+        services start; this inventory check alone never admits that content.
+        """
+        expected = inventory(stage / "recovery/configuration")
+        actual = inventory(self.configuration)
+        if len(actual) != len(expected):
+            raise Refused("Completed restore configuration inventory changed")
+        for old, current in zip(expected, actual):
+            fields = {"bytes", "sha256"} if old["path"] == "runtime/api.env" else set()
+            if {k: v for k, v in old.items() if k not in fields} != {
+                    k: v for k, v in current.items() if k not in fields}:
+                raise Refused("Completed restore configuration changed outside the session cutoff")
+        directories = []
+        for path in [self.configuration, *self.configuration.rglob("*")]:
+            if path.is_dir():
+                info = path.stat()
+                directories.append({"path": path.relative_to(self.configuration).as_posix(),
+                                    "uid": info.st_uid, "gid": info.st_gid, "mode": info.st_mode & 0o777})
+        if sorted(directories, key=lambda x: x["path"]) != sorted(
+                evidence["configuration_directories"], key=lambda x: x["path"]):
+            raise Refused("Completed restore configuration directories changed")
+        # Other installed units are not part of this transaction's recovery
+        # set. Every retained appliance unit must remain byte-for-byte exact.
+        for item in inventory(stage / "recovery/quadlets"):
+            target = self.quadlets / item["path"]
+            trusted_file(target)
+            info = target.stat()
+            if {"path": item["path"], "bytes": info.st_size, "sha256": digest_file(target),
+                    "mode": info.st_mode & 0o777, "uid": info.st_uid, "gid": info.st_gid} != item:
+                raise Refused("Completed restore Quadlet changed")
+
+    def _complete_database_rollback(self, stage, evidence, host):
+        self._restored_configuration(stage, evidence)
+        self._restore_role_credentials(evidence)
+        identity = self.identity_restore_sessions(stage)
+        self._restored_configuration(stage, evidence)
+        if host:
+            # On retry, defer host preservation until the identity controller
+            # has reconciled an interrupted API cutoff and removed authority.
+            host.apply(rollback=True)
+        try:
+            self.service("start", tuple(name for name in self.services if name not in ("postgresql", "edge")))
+            # The recovery backend stops native Apache even when edge_service
+            # is omitted from the container lifecycle configuration.
+            self.cmd(["systemctl", "start", "nebulalog-edge.service"], timeout=180)
+            if self.cmd(["systemctl", "show", "--property=ActiveState", "--value",
+                         "nebulalog-edge.service"]) != "active":
+                raise Refused("Public edge did not restart after identity recovery")
+            host_evidence = {"host": host.runtime_evidence("update-rollback")} if host else {}
+            self.storage_maintenance(stage, held=True, delivery_held=False)
+            return self.receipt(stage, "rollback", restored_databases=["nebulalog", "keycloak"],
+                                restored_image_pins=True, clickhouse_logs_preserved=True, wal_preserved=True,
+                                identity=identity, **host_evidence)
+        except BaseException as failure:
+            # A failed startup/readback must not leave external writers active
+            # or authorize delivery, including a lost gate/receipt write ack.
+            errors = []
+            for stop in (
+                    lambda: self.storage_maintenance(stage, held=True, delivery_held=True, host_only=True),
+                    lambda: self.service("stop", ("ingest",)),
+                    lambda: self.service("stop", ("api",)),
+                    lambda: self.cmd(["systemctl", "stop", "nebulalog-edge.service"], timeout=180)):
+                try:
+                    stop()
+                except Exception as error:
+                    errors.append(type(error).__name__)
+            if errors:
+                raise Refused("Rollback startup failed and recovery holds require reconciliation") from failure
+            raise
+
+    def _restore_role_credentials(self, evidence):
+        owners = evidence["owners"]
+        query = "SELECT json_object_agg(rolname,rolpassword) FROM pg_authid WHERE rolname IN (" + ",".join("'" + owner + "'" for owner in sorted(set(owners.values()))) + ")"
+        if json.loads(self.sql(query)) != evidence["role_hashes"]:
+            raise Refused("Database role credentials changed; automatic restore cannot safely reconcile them")
+
     def rollback(self, stage):
         release, transaction = self.release(stage)
         if transaction.get("activation_started") is False:
@@ -1643,9 +1736,21 @@ END $fence$; SELECT 'fenced';"""
         restore_context, restoring, restored = (None, False, False) if historical else self.database_restore_status(stage, evidence)
         self.maintenance(True, stage)
         self.storage_maintenance(stage, held=True, delivery_held=True, host_only=True)
+        if not historical:
+            self.cmd(["systemctl", "stop", "nebulalog-edge.service"], timeout=180)
         self.service("stop", tuple(name for name in reversed(self.services) if name != "postgresql"))
         self.service("start", ("postgresql",))
         self.pg_ready()
+        if restored:
+            # No pre-restore capture, database replacement, old configuration
+            # copy or PostgreSQL stop here: the identity controller may own a
+            # retained vendor command that it must quiesce itself.
+            self._restored_configuration(stage, evidence)
+            self._schema_read_dependencies(stage)
+            self.storage_maintenance(stage, held=True, delivery_held=True)
+            self.application_schema_check(stage, evidence["application_schema"])
+            host = HostRuntime(self, stage) if "host" in release["components"] else None
+            return self._complete_database_rollback(stage, evidence, host)
         if not historical:
             # This retained floor lives outside the configuration/database
             # recovery set. A partial restore must require the old observation,
@@ -1714,9 +1819,7 @@ END $fence$; SELECT 'fenced';"""
         self.service("start", ("postgresql",))
         self.pg_ready()
         owners = evidence["owners"]
-        query = "SELECT json_object_agg(rolname,rolpassword) FROM pg_authid WHERE rolname IN (" + ",".join("'" + owner + "'" for owner in sorted(set(owners.values()))) + ")"
-        if json.loads(self.sql(query)) != evidence["role_hashes"]:
-            raise Refused("Database role credentials changed; automatic restore cannot safely reconcile them")
+        self._restore_role_credentials(evidence)
         if not restored:
             # The durable intent follows the verified empty-action/INSERT
             # barrier and executor fence. On restart either DB may be absent;
@@ -1732,11 +1835,7 @@ END $fence$; SELECT 'fenced';"""
         self._schema_read_dependencies(stage)
         self.application_schema_restore(stage, evidence["application_schema"])
         self._schema_record(stage / "adapter-database-restore-complete.json", restore_context)
-        self.service("start", tuple(name for name in self.services if name != "postgresql"))
-        self.storage_maintenance(stage, held=True, delivery_held=False)
-        return self.receipt(stage, "rollback", restored_databases=["nebulalog", "keycloak"],
-                            restored_image_pins=True, clickhouse_logs_preserved=True, wal_preserved=True,
-                            **({"host": host.runtime_evidence("update-rollback")} if host else {}))
+        return self._complete_database_rollback(stage, evidence, host)
 
     def get(self, path, token=None):
         headers = {"Authorization": "Bearer " + token} if token else {}
