@@ -231,6 +231,60 @@ the vendor command itself was still writing. The two injected failures occurred
 after committed real operations; they are not a claim of arbitrary power-loss
 coverage. No production updater entrypoint invokes this controller yet.
 
+## Production maintenance HTTPS transport
+
+`MaintenanceIdentityAPI` supplies the local HTTPS connection for the pending
+production recovery backend. It connects to the fixed Keycloak Quadlet listener
+at `127.0.0.1:8443` while checking the configured issuer's certificate hostname
+and explicit, root-owned appliance CA. It does not depend on the public edge
+being available. System proxy settings and redirects cannot send recovery
+credentials elsewhere.
+
+Every request requires a positive maintenance-fence callback. Client credentials
+are sent only in the token request body, and error diagnostics omit response
+bodies. The product-realm callback refuses other realms, traversal, encoded
+paths and arbitrary query parameters. The separate master-realm deletion
+method validates the client-ID format; the authority controller remains
+responsible for supplying only its previously bound client identity.
+Transport failures, unexpected status codes, HTML responses and malformed JSON
+cannot prove that an account or token was revoked. A secret requires an explicit
+OAuth client denial; a token requires a JSON HTTP 401. Neither check by itself
+replaces the controller's database/account-absence observations.
+
+All **178 focused tests** passed on Rocky Python **3.14.8**, Linux/amd64.
+Fourteen new transport cases use an actual loopback TLS server with disposable
+certificates. They exercise CA and hostname rejection, SNI/Host preservation,
+proxy isolation, all five redirect statuses, per-request fencing, bounded and
+strict JSON, disconnections, explicit revocation outcomes, and credential-safe
+errors. The protocol responses in those cases are synthetic. The initial test
+CA lacked its key-usage extension and was rejected by Python's strict verifier;
+the fixture was corrected to match the appliance certificate generator.
+Certificate validation was not relaxed.
+The appliance's actual certificate generator also passed a TLS 1.3 handshake
+using Python's default strict verifier and its generated CA/server chain.
+
+The same production transport subsequently passed against actual vendor
+Keycloak **26.8.1** over HTTPS. The vendor `bootstrap-admin service` command
+created a temporary account with the server stopped. A separate Rocky Python
+3.14 process authenticated it, checked the owned realm, reconciled browser
+scopes, advanced the realm cutoff and logged out sessions, deleted the account,
+and verified that its secret and previously accepted token were rejected.
+There was no TLS proxy or fabricated identity response in this check.
+
+That fixture used disposable `dev-file` storage and an isolated network
+namespace with no published ports; its fence callback was synthetic.
+It does not qualify PostgreSQL persistence, production service control, the
+complete authority journal, strict FIPS, native encrypted storage, or browser
+login over production TLS. Its first attempt rejected a host-generated leaf
+certificate missing an authority-key identifier. The disposable fixture added
+explicit key identifiers; the product verifier and certificate generator were
+unchanged. Both attempts removed their owned containers, database volumes and
+private files.
+
+This transport does not yet control Podman, verify the live maintenance fence,
+or connect the controller to update activation and rollback. Those remain
+required before automatic identity maintenance can be accepted.
+
 ## Rollback and integration limits
 
 These maintenance primitives are catalogued libraries, not an automatic migration entrypoint.

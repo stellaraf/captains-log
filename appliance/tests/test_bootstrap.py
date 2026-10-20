@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import ssl
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -449,6 +450,28 @@ class CertificateTests(unittest.TestCase):
                 manager._certificates()
             self.assertEqual(first, (manager.tls / "server.crt").read_bytes())
             self.assertEqual(first.count(b"-----BEGIN CERTIFICATE-----"), 2)
+            # Exercise Python's actual strict TLS verifier against the exact
+            # generated chain; openssl verify alone has different defaults.
+            client_context = ssl.create_default_context(cafile=str(manager.tls / "ca.crt"))
+            server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server_context.load_cert_chain(manager.tls / "server.crt", manager.tls / "server.key")
+            client_in, client_out, server_in, server_out = (ssl.MemoryBIO() for _ in range(4))
+            client = client_context.wrap_bio(client_in, client_out, server_hostname=SETUP["hostname"])
+            server = server_context.wrap_bio(server_in, server_out, server_side=True)
+            complete = set()
+            for _ in range(10):
+                for name, peer in (("client", client), ("server", server)):
+                    try:
+                        peer.do_handshake()
+                        complete.add(name)
+                    except ssl.SSLWantReadError:
+                        pass
+                server_in.write(client_out.read())
+                client_in.write(server_out.read())
+                if complete == {"client", "server"}:
+                    break
+            self.assertEqual(complete, {"client", "server"})
+            self.assertEqual(client.version(), "TLSv1.3")
             self.assertEqual((manager.tls / "ca.key").stat().st_mode & 0o777, 0o600)
             self.assertEqual((manager.tls / "server.key").stat().st_mode & 0o777, 0o640)
             for name in ("ca.crt", "server.crt", "trust-bundle.pem"):
