@@ -122,7 +122,9 @@ PYPROVENANCE
 fi
 # Read the exact policy records first. Matching registrations are no-ops;
 # unexpected local policy or differing fixed expressions are never modified.
-ensure_fcontext() { python3.14 "$APPLIANCE_SOURCE/provision_guard.py" fcontext "$@"; }
+# Rocky's seobject/libselinux bindings belong to the vendor system Python.
+# Keep appliance code on Python 3.14; use the OS interpreter for this OS policy operation.
+ensure_fcontext() { /usr/bin/python3 "$APPLIANCE_SOURCE/provision_guard.py" fcontext "$@"; }
 ensure_fcontext -a -e /var/lib/containers/storage /var/lib/nebulalog/containers
 ensure_fcontext -a -t httpd_var_run_t '/run/nebulalog-public(/.*)?'
 ensure_fcontext -a -t container_file_t '/run/nebulalog-status(/.*)?'
