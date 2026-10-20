@@ -160,11 +160,15 @@ temporary credentials, downloaded fixture image and compile caches were removed.
 
 ## Integration skip reconciliation
 
-Of the 37 skipped test/subtest entries in the earlier Linux Go run, **34 now
+Of the 37 skipped test/subtest entries in the earlier Linux Go run, **36 now
 have passing execution evidence** in the separate fixtures above. One entry is
-the Linux child helper exercised by its two parent tests. Two entries remain:
-`TestEmergencyObservationControllerIsolated/pre-dispatch=false` and
-`TestEmergencyObservationControllerIsolated/pre-dispatch=true`. All 59 Go
+the Linux child helper exercised by its two parent tests. The final two
+`TestEmergencyObservationControllerIsolated` cases passed against PostgreSQL
+17.11 with injected ClickHouse observations. Inconsistent capacity data was
+resampled and refused, including immediately before dispatch, without creating
+deletion actions or prepared/executing audit authority. Later coherent readings
+restored normal status without deleting anything. Temporary schemas and the
+database fixture were removed. All 59 Go
 production-source/module files in the earlier source manifest still match.
 This reconciliation does not claim one combined full-environment run or native
 appliance acceptance.
