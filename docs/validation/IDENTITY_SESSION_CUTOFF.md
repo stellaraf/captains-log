@@ -282,13 +282,15 @@ unchanged. Both attempts removed their owned containers, database volumes and
 private files.
 
 This transport does not yet control Podman, verify the live maintenance fence,
-or connect the controller to update activation and rollback. Those remain
-required before automatic identity maintenance can be accepted.
+or connect the controller to update activation and rollback. A separate
+[native backend](IDENTITY_NATIVE_BACKEND.md) now implements the fixed host
+boundaries but is not yet invoked by lifecycle entrypoints or qualified natively.
+Those remain required before automatic identity maintenance can be accepted.
 
 ## Rollback and integration limits
 
 These maintenance primitives are catalogued libraries, not an automatic migration entrypoint.
-The new factory host catalog contains 136 files. Existing 134-file factory
+The new factory host catalog contains 137 files. Existing 134- and 136-file factory
 catalogs cannot automatically accept it: catalog/boot migration and rollback
 must be qualified separately. A verified new archive is not installed or
 activated merely because its source and archive hashes pass.

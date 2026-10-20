@@ -96,6 +96,7 @@ class MaintenanceIdentityAPI:
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         host = "[" + parsed.hostname + "]" if ":" in parsed.hostname else parsed.hostname
         self.base = "https://" + host + ":8443"
+        self.issuer = issuer.rstrip("/")
         self.fence = fence
         self.opener = build_opener(ProxyHandler({}), LocalHTTPSHandler(context=context), NoIdentityRedirect())
 
@@ -129,7 +130,7 @@ class MaintenanceIdentityAPI:
         try:
             with self.opener.open(request, timeout=20) as response:
                 raw = response_bytes(response)
-                if response.status == 204 and not raw:
+                if not raw and (response.status == 204 or response.status == 201 and method == "POST"):
                     return None
                 if (not 200 <= response.status < 300
                         or response.headers.get_content_type() != "application/json"):
@@ -176,6 +177,12 @@ class MaintenanceIdentityAPI:
         return (isinstance(value, dict) and value.get("realm") == "nebulalog"
                 and value.get("id") == realm_id and isinstance(value.get("attributes"), dict)
                 and value["attributes"].get("nebulalog.installation-id") == installation_id)
+
+    def ready(self):
+        value = self._request("/realms/nebulalog/.well-known/openid-configuration")
+        if not isinstance(value, dict) or value.get("issuer") != self.issuer:
+            raise Refused("Local identity discovery belongs to another issuer")
+        return True
 
     def delete(self, token, client_id):
         if not isinstance(client_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", client_id):

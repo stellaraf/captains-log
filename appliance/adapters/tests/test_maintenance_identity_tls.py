@@ -127,7 +127,17 @@ class MaintenanceIdentityTLSTests(unittest.TestCase):
         self.assertNotIn("Authorization", headers)
         self.assertNotIn(SECRET, path)
 
+    def test_readiness_requires_the_configured_issuer(self):
+        self.reply(200, {"issuer": self.config["issuer"]})
+        self.assertTrue(self.api.ready())
+        self.assertEqual(self.server.requests[-1][1], "/realms/nebulalog/.well-known/openid-configuration")
+        self.reply(200, {"issuer": "https://foreign.example.invalid/realms/nebulalog"})
+        with self.assertRaises(Refused):
+            self.api.ready()
+
     def test_fixed_delete_and_scope_callback(self):
+        self.reply(201, b"", "application/octet-stream", {"Location": self.api.base + "/admin/realms/nebulalog/clients/new"})
+        self.assertIsNone(self.api.call(TOKEN, "clients", "POST", {"clientId": "fixture"}))
         self.reply(204, b"")
         self.assertIsNone(self.api.delete(TOKEN, "owned-client"))
         self.assertEqual(self.server.requests[-1][:2], ("DELETE", "/admin/realms/master/clients/owned-client"))

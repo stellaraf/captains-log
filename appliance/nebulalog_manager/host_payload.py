@@ -46,7 +46,7 @@ MANAGER_MODULES = (
     "boot_metadata_native.py", "boot_metadata_proof.py", "boot_metadata_lineage.py",
     "publisher_inputs.py", "configuration_restore.py", "recovery_media.py", "recovery_plans.py", "recovery_recipients.py", "recovery_set.py", "recovery_transfer.py", "restore_database.py", "restore_runtime.py", "security.py", "setup_integrity.py", "sizing.py", "status_snapshot.py", "storage.py", "update_enrollment.py", "updates.py",
 )
-ADAPTER_MODULES = ("__init__.py", "auth.py", "cli.py", "commands.py", "host_runtime.py", "lifecycle.py")
+ADAPTER_MODULES = ("__init__.py", "auth.py", "cli.py", "commands.py", "host_runtime.py", "identity_maintenance.py", "lifecycle.py")
 COMMANDS = ("bootstrap-runtime", "enroll-installed-release", "load-image-bundle", "nebulalog", "nebulalog-aide",
             "nebulalog-baseline", "nebulalog-console", "nebulalog-firstboot", "nebulalog-seal", "nebulalog-setup",
             "publish-status", "validate-guest")
