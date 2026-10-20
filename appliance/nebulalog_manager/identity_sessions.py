@@ -149,6 +149,43 @@ class SessionCutoffJournal:
             raise Refused("Pre-restore identity cutoff has invalid ownership or shape")
         return value
 
+    def _session_record(self, api):
+        """Validate the retained intent independently of a live API or realm.
+
+        Database-replacement resume may have neither available. A retained
+        record is evidence of a floor, not authority to adopt another operation
+        or release maintenance.
+        """
+        import os
+        import re
+        from .host_payload import strict_json
+        if not os.path.lexists(self.path):
+            return None
+        value = strict_json(self._read(self.path))
+        fields = {"schema", "installation_id", "operation", "floor", "phase",
+                  "api_path", "api_configuration_sha256", "realm_id"}
+        if (not isinstance(value, dict) or set(value) != fields
+                or type(value["schema"]) is not int or value["schema"] != 1
+                or value["installation_id"] != self.installation_id
+                or not isinstance(value["realm_id"], str) or not value["realm_id"]
+                or not isinstance(value["operation"], str)
+                or not re.fullmatch(r"[a-f0-9]{64}", value["operation"])
+                or type(value["floor"]) is not int
+                or not 1577836800 <= value["floor"] < 2**31
+                or value["phase"] not in ("intent", "realm", "api")
+                or value["api_path"] != str(api)
+                or not isinstance(value["api_configuration_sha256"], str)
+                or not re.fullmatch(r"[a-f0-9]{64}", value["api_configuration_sha256"])):
+            raise Refused("Session journal ownership or shape changed")
+        return value
+
+    @staticmethod
+    def _session_configuration(record, configuration_hash, operation):
+        if (record is not None
+                and (record["operation"] == operation or record["phase"] != "api")
+                and record["api_configuration_sha256"] != configuration_hash):
+            raise Refused("Session journal preserved configuration changed")
+
     def capture_restore(self, observe, operation, api_environment, minimum, fence, *, resume=False):
         """Persist the live issuance floor before a destructive database intent.
 
@@ -182,24 +219,33 @@ class SessionCutoffJournal:
             self._read(lock)
             held()
             previous = self._restore_record(api)
+            session = self._session_record(api)
             if resume:
                 if previous is None or previous["operation"] != operation:
                     raise Refused("Interrupted database replacement lost its pre-restore identity cutoff")
+                if session is not None and (session["realm_id"] != previous["realm_id"]
+                                            or session["floor"] > previous["floor"]):
+                    raise Refused("Retained restore cutoff does not cover the session journal")
                 return previous
             self._directory(api.parent)
-            api_floor, _, _ = self._environment(self._read(api))
+            api_floor, _, configuration_hash = self._environment(self._read(api))
+            self._session_configuration(session, configuration_hash, operation)
             realm = observe()
             if (not isinstance(realm, dict) or set(realm) != {"realm_id", "installation_id", "floor"}
                     or realm["installation_id"] != self.installation_id
                     or not isinstance(realm["realm_id"], str)
                     or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", realm["realm_id"])
                     or type(realm["floor"]) is not int or not 0 <= realm["floor"] < 2**31
-                    or previous is not None and previous["realm_id"] != realm["realm_id"]):
+                    or previous is not None and previous["realm_id"] != realm["realm_id"]
+                    or session is not None and session["realm_id"] != realm["realm_id"]):
                 raise Refused("Pre-restore identity observation belongs to another realm")
             value = {"schema": 1, "installation_id": self.installation_id, "operation": operation,
-                     "floor": max(minimum, api_floor, realm["floor"], previous["floor"] if previous else 0),
+                     "floor": max(minimum, api_floor, realm["floor"], previous["floor"] if previous else 0,
+                                  session["floor"] if session else 0),
                      "api_path": str(api), "realm_id": realm["realm_id"]}
             held()
+            if self._session_record(api) != session:
+                raise Refused("Session journal changed during pre-restore capture")
             atomic_json(self.directory / "restore-cutoff.json", value)
             if self._restore_record(api) != value:
                 raise Refused("Pre-restore identity cutoff did not persist")
@@ -243,26 +289,9 @@ class SessionCutoffJournal:
             self._read(lock)
             raw = self._read(api)
             api_floor, body, configuration_hash = self._environment(raw)
-            previous = None
-            if os.path.lexists(self.path):
-                previous = strict_json(self._read(self.path))
-                fields = {"schema", "installation_id", "operation", "floor", "phase",
-                          "api_path", "api_configuration_sha256", "realm_id"}
-                if (not isinstance(previous, dict) or set(previous) != fields
-                        or type(previous["schema"]) is not int or previous["schema"] != 1
-                        or previous["installation_id"] != self.installation_id
-                        or not isinstance(previous["realm_id"], str) or not previous["realm_id"]
-                        or not isinstance(previous["operation"], str)
-                        or not re.fullmatch(r"[a-f0-9]{64}", previous["operation"])
-                        or type(previous["floor"]) is not int
-                        or not 1577836800 <= previous["floor"] < 2**31
-                        or previous["phase"] not in ("intent", "realm", "api")
-                        or previous["api_path"] != str(api)
-                        or not isinstance(previous["api_configuration_sha256"], str)
-                        or not re.fullmatch(r"[a-f0-9]{64}", previous["api_configuration_sha256"])
-                        or (previous["operation"] == operation or previous["phase"] != "api")
-                        and previous["api_configuration_sha256"] != configuration_hash):
-                    raise Refused("Session journal ownership or preserved configuration changed")
+            previous = self._session_record(api)
+            self._session_configuration(previous, configuration_hash, operation)
+            if previous is not None:
                 if previous["operation"] != operation and previous["phase"] != "api":
                     raise Refused("An unfinished operation owns session recovery")
             if previous is None and not initialize:

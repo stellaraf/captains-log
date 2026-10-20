@@ -388,3 +388,39 @@ Restore admission, storage identity and source/plan admission are still fixture
 boundaries. The guest still reports the known kernel HKDF self-test failure
 despite its enabled FIPS flag. Complete native restore/update integration,
 strict cryptographic acceptance, VMware parity and the final OVA remain open.
+
+## Pre-restore capture includes interrupted session work
+
+Keycloak logout can replace the realm cutoff with its current clock. If the
+logout response is lost before the higher intended cutoff is repaired, that
+higher value may exist only in `session-cutoff.json`; the API environment may
+still have its older value. Reading only the live realm and API before
+database replacement can therefore miss a durable rejection boundary.
+
+The capture path now validates the retained session record and includes its
+floor in the maximum, for `intent`, `realm` and completed `api` phases. The
+installation, API path, record shape and realm must match. Incomplete work
+also requires the same non-cutoff API configuration. A changed journal during
+observation is refused rather than silently adopting an incomplete snapshot.
+The same record validator serves session reconciliation.
+
+Database-replacement resume still requires the original bound capture and
+does not query a partially restored database or require the API file to exist.
+It refuses a journal from another realm or a journal floor above that capture.
+Capture leaves the session journal untouched and grants no permission to take
+over an unfinished operation or release maintenance.
+
+Validation passed **735 regression tests without skips** on Rocky Python
+**3.14.8**, Linux/amd64. Eleven added cases cover lost logout acknowledgement,
+failed API writes, completed records after database/configuration rollback,
+resume without a live API/database, malformed or foreign state, changed
+configuration, concurrent journal changes, unsafe journal files and the
+adapter's capture boundary. All eleven failed against the prior module
+(18 failed assertions including subtests). The adapter case uses actual
+private files with injected native commands/SQL observations; it is not a live
+database or complete update test. Six owned test containers/volumes were
+independently confirmed absent afterward.
+
+Forward migration remains unconnected. Safe retirement of its interrupted
+temporary authority and session operation, forward integrity authorization,
+and complete update/rollback execution remain required.

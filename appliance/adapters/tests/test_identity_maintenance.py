@@ -437,6 +437,22 @@ class MaintenanceBackendTests(unittest.TestCase):
         self.assertEqual(self.restore_capture(resume=True),result)
         self.assertFalse(any('--command' in call for call in self.native.calls[before:]))
 
+    def test_restore_capture_preserves_pending_session_floor_above_database_and_api(self):
+        self.prepare_restore_capture()
+        _, _, configuration = SessionCutoffJournal._environment(self.backend.api_environment.read_bytes())
+        path = self.backend.directory/'session-cutoff.json'
+        pending = {'schema': 1, 'installation_id': INSTALLATION, 'operation': 'd'*64,
+                   'realm_id': 'realm', 'floor': 1800000900, 'phase': 'intent',
+                   'api_path': str(self.backend.api_environment),
+                   'api_configuration_sha256': configuration}
+        atomic_json(path, pending)
+        result = self.restore_capture()
+        self.assertEqual(result['floor'], 1800000900)
+        self.assertEqual(json.loads(path.read_text()), pending)
+        self.assertEqual(self.restore_capture(resume=True), result)
+        self.assertFalse(any(call[:2] in (['podman', 'create'], ['podman', 'rm'])
+                             for call in self.native.calls))
+
     def test_restore_capture_rejects_orphan_writer_or_recovery_command(self):
         self.prepare_restore_capture()
         self.native.server_running=True

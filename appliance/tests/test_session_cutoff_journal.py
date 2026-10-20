@@ -279,6 +279,109 @@ class SessionCutoffJournalTests(unittest.TestCase):
         self.realm['notBefore'] = 0
         self.assertEqual(self.capture(operation='c'*64)['floor'], self.cutoff + 1000)
 
+    def test_capture_retains_intent_after_logout_lowered_realm_and_lost_response(self):
+        def lost(path, method='GET', body=None):
+            result = self.call(path, method, body)
+            if path == 'logout-all':
+                raise OSError('logout lowered the realm floor before response loss')
+            return result
+        with self.assertRaises(OSError):
+            self.reconcile(lost, minimum=self.cutoff + 900)
+        retained = self.journal.path.read_bytes()
+        self.assertEqual(json.loads(retained)['phase'], 'intent')
+        self.assertEqual(self.realm['notBefore'], self.cutoff + 10)
+        self.assertEqual(self.api.read_bytes(), self.original)
+        calls = list(self.calls)
+        result = self.capture(operation='d' * 64)
+        self.assertEqual(result['floor'], self.cutoff + 900)
+        self.assertEqual(self.journal.path.read_bytes(), retained)
+        self.assertEqual(self.calls, calls)
+        # Capture is not permission to take over the interrupted operation.
+        with self.assertRaisesRegex(Refused, 'unfinished operation'):
+            self.reconcile(operation='d' * 64, fence=lambda op: True)
+
+    def test_capture_retains_realm_phase_when_api_write_failed(self):
+        with patch.object(sessions, '_atomic_private_bytes', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError):
+                self.reconcile(minimum=self.cutoff + 900)
+        self.assertEqual(json.loads(self.journal.path.read_text())['phase'], 'realm')
+        self.realm['notBefore'] = 0
+        self.assertEqual(self.capture(operation='d' * 64)['floor'], self.cutoff + 900)
+
+    def test_capture_retains_completed_journal_after_old_database_and_api_restore(self):
+        self.reconcile(minimum=self.cutoff + 900)
+        self.realm['notBefore'] = 0
+        self.api.write_bytes(self.original)
+        self.assertEqual(self.capture(operation='d' * 64)['floor'], self.cutoff + 900)
+
+    def test_resume_requires_capture_to_cover_retained_intent_without_live_api_or_db(self):
+        self.reconcile(minimum=self.cutoff + 900)
+        captured = self.capture(operation='d' * 64)
+        self.api.unlink()
+        def unavailable(): raise AssertionError('resume must not observe partially restored DB')
+        self.assertEqual(self.capture(resume=True, operation='d' * 64, observe=unavailable), captured)
+        record = json.loads(self.journal.path.read_text())
+        for key, value in (('floor', self.cutoff + 901), ('realm_id', 'foreign')):
+            self.journal.path.write_text(json.dumps({**record, key: value}))
+            with self.subTest(key=key), self.assertRaisesRegex(Refused, 'does not cover'):
+                self.capture(resume=True, operation='d' * 64, observe=unavailable)
+            self.assertEqual(json.loads((self.state/'restore-cutoff.json').read_text()), captured)
+
+    def test_capture_validates_session_record_before_database_observation(self):
+        self.reconcile()
+        record = json.loads(self.journal.path.read_text())
+        def unavailable(): raise AssertionError('invalid record must fail before DB observation')
+        for key, value in (('schema', True), ('installation_id', 'f' * 32),
+                           ('api_path', '/tmp/foreign'), ('floor', True),
+                           ('operation', 'foreign'), ('phase', 'removed'),
+                           ('api_configuration_sha256', 'invalid')):
+            self.journal.path.write_text(json.dumps({**record, key: value}))
+            with self.subTest(key=key), self.assertRaises(Refused):
+                self.capture(observe=unavailable)
+        self.assertFalse((self.state/'restore-cutoff.json').exists())
+
+    def test_capture_refuses_foreign_session_realm(self):
+        self.reconcile()
+        record = json.loads(self.journal.path.read_text())
+        self.journal.path.write_text(json.dumps({**record, 'realm_id': 'foreign'}))
+        with self.assertRaisesRegex(Refused, 'another realm'):
+            self.capture(operation='d' * 64)
+        self.assertFalse((self.state/'restore-cutoff.json').exists())
+
+    def test_capture_refuses_changed_configuration_for_unfinished_session(self):
+        with patch.object(sessions, '_atomic_private_bytes', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError):
+                self.reconcile()
+        self.api.write_bytes(self.original.replace(b'unchanged', b'changed'))
+        with self.assertRaisesRegex(Refused, 'preserved configuration'):
+            self.capture(operation='d' * 64)
+        self.assertFalse((self.state/'restore-cutoff.json').exists())
+
+    def test_capture_allows_new_configuration_after_completed_operation(self):
+        self.reconcile(minimum=self.cutoff + 900)
+        self.api.write_bytes(self.original.replace(b'unchanged', b'changed'))
+        self.realm['notBefore'] = 0
+        self.assertEqual(self.capture(operation='d' * 64)['floor'], self.cutoff + 900)
+
+    def test_capture_refuses_session_journal_changed_during_observation(self):
+        self.reconcile()
+        def changing():
+            record = json.loads(self.journal.path.read_text())
+            self.journal.path.write_text(json.dumps({**record, 'floor': self.cutoff + 900}))
+            return {'realm_id': self.realm['id'], 'installation_id': self.installation, 'floor': 0}
+        with self.assertRaisesRegex(Refused, 'changed during'):
+            self.capture(operation='d' * 64, observe=changing)
+        self.assertFalse((self.state/'restore-cutoff.json').exists())
+
+    def test_capture_refuses_linked_or_public_session_journal(self):
+        self.reconcile()
+        self.journal.path.chmod(0o644)
+        with self.assertRaises(Refused): self.capture()
+        self.journal.path.chmod(0o600)
+        os.link(self.journal.path, self.state/'journal-copy')
+        with self.assertRaises(Refused): self.capture()
+        self.assertFalse((self.state/'restore-cutoff.json').exists())
+
     def test_capture_write_failure_cannot_authorize_replacement(self):
         with patch('nebulalog_manager.common.atomic_json', side_effect=OSError('disk full')):
             with self.assertRaises(OSError): self.capture()
