@@ -92,6 +92,51 @@ bootstrap identity. The separate interruption-recovery evidence remains required
 
 ## Acceptance boundary
 
+### Pre-restore cutoff capture
+
+Failed-activation rollback now calls `capture_before_database_restore()` after
+stopping application/identity writers and before publishing destructive database
+restore intent. It repeats the capture immediately before replacement. The
+capture binds the verified backup/restore context and installation, and records
+the greatest current clock, API cutoff, live identity-database cutoff and
+previously captured cutoff in encrypted manager state outside the recovery set.
+
+The boundary requires matching private/public maintenance markers, a delivery
+hold, inactive units, absent or stopped writer containers, no retained recovery
+command and no Keycloak database-writer connections. An orphan recovery command
+must be reconciled before database replacement; this boundary never deletes it.
+Interrupted restore requires the exact retained capture and does not query a
+possibly absent or already replaced identity database. Missing or foreign
+capture evidence stops recovery.
+
+`SessionCutoffJournal.reconcile()` consumes that retained floor and verifies
+the realm identity before mutation. Capture is not session invalidation: the
+complete post-restore authority/session workflow must still be connected before
+this can qualify a full appliance rollback. Historical image-only rollback
+does not replace the database and does not use this capture boundary.
+
+The final source passed **308 focused tests** on Rocky Python **3.14.8**,
+Linux/amd64, with no skips. These include capture persistence/failure, exact
+restore-resume ownership, parent-directory durability, rollback ordering and
+stale-completion rejection. The host-resource fixture uses injected native
+identity admission; it does not establish an actual host restore.
+
+The real PostgreSQL **17.11** / Keycloak **26.8.1** HTTPS fixture passed
+**20 identity checks** and **11 additional restore checks**. It took a real
+database dump, raised the live realm cutoff, captured that newer floor, removed
+the database, and exercised retry with the database absent. Removing the retained
+capture caused refusal. Restoring the dump demonstrably restored the older
+database cutoff; subsequent HTTPS session reconciliation retained the higher
+captured floor in both the realm and API environment, preserving other API
+configuration bytes. A recreated fixture administration account was removed and
+its credentials/token were refused.
+
+The fixture stopped its actual Keycloak container before replacement, but injects
+the production systemd/Podman inventory and encrypted-storage admission. It
+invokes capture and reconciliation explicitly across the restore; it does not
+run complete production lifecycle activation/rollback. This evidence does not
+close that integration gate or native FIPS/hypervisor acceptance.
+
 The native-boundary tests inject systemd, Podman, SQL and encrypted-storage
 responses. They exercise command journaling and interruption recovery but cannot
 establish actual Podman behavior, SELinux labeling, encrypted mount admission or

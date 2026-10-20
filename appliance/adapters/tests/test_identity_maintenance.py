@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from nebulalog_adapters.identity_maintenance import IdentityMaintenanceBackend, LABEL
+from nebulalog_adapters.identity_maintenance import IdentityMaintenanceBackend, LABEL, capture_before_database_restore
 from nebulalog_manager.common import Refused, atomic_json
 from nebulalog_manager.identity_sessions import SessionCutoffJournal
 
@@ -334,6 +334,13 @@ class MaintenanceBackendTests(unittest.TestCase):
             "api_path": str(api), "api_configuration_sha256": configuration})
         self.assertEqual(self.backend.record_work(receipt), receipt)
         self.assertTrue(self.backend.settled(receipt))
+        capture_path = self.backend.directory / "restore-cutoff.json"
+        atomic_json(capture_path, {"schema": 1, "installation_id": INSTALLATION, "operation": "f" * 64,
+                    "floor": 1800000001, "api_path": str(api), "realm_id": "realm"})
+        self.assertFalse(self.backend.settled(receipt))
+        with self.assertRaises(Refused):
+            self.backend.record_work(receipt)
+        capture_path.unlink()
         self.native.scope["roles"].append({"id": "changed"})
         self.assertFalse(self.backend.settled(receipt))
         self.native.scope["roles"].clear()
@@ -366,6 +373,72 @@ class MaintenanceBackendTests(unittest.TestCase):
         self.native.container = retained
         with self.assertRaises(Refused):
             self.backend._command_settled()
+
+
+    def restore_capture(self, *, resume=False):
+        return capture_before_database_restore(self.life, self.backend.stage, self.restore_context, resume=resume)
+
+    def prepare_restore_capture(self):
+        self.native.service('stop', ('keycloak',))
+        self.restore_context = {'schema':1, 'stage':str(self.backend.stage), 'backup_sha256':'a'*64}
+        self.life.checked_backup = Mock(return_value={'verified':True})
+        self.life.database_restore_context = Mock(return_value=self.restore_context)
+        self.backend.api_environment.write_text('OIDC_CLIENT_ID=nebulalog\nOIDC_ISSUER=https://logs.example.test/realms/nebulalog\n')
+        self.backend.api_environment.chmod(0o600)
+
+    def test_restore_capture_uses_real_files_and_bound_sql_observation(self):
+        self.prepare_restore_capture()
+        result = self.restore_capture()
+        self.assertEqual(result['floor'], 1800000000)
+        self.assertEqual(result['realm_id'], 'realm')
+        self.assertEqual(json.loads((self.backend.directory/'restore-cutoff.json').read_text()), result)
+        self.assertFalse(any(call[:2] in (['podman','create'],['podman','rm']) for call in self.native.calls))
+        before=len(self.native.calls)
+        self.assertEqual(self.restore_capture(resume=True),result)
+        self.assertFalse(any('--command' in call for call in self.native.calls[before:]))
+
+    def test_restore_capture_rejects_orphan_writer_or_recovery_command(self):
+        self.prepare_restore_capture()
+        self.native.server_running=True
+        with self.assertRaises(Refused): self.restore_capture()
+        self.native.server_running=False;self.native.extra=True
+        with self.assertRaises(Refused): self.restore_capture()
+        self.native.extra=False;self.native.writers='1'
+        with self.assertRaises(Refused): self.restore_capture()
+        self.assertFalse((self.backend.directory/'restore-cutoff.json').exists())
+
+    def test_restore_capture_refuses_foreign_context_or_missing_resume(self):
+        self.prepare_restore_capture()
+        with self.assertRaises(Refused): self.restore_capture(resume=True)
+        self.life.database_restore_context.return_value={'foreign':True}
+        with self.assertRaises(Refused): self.restore_capture()
+        self.assertFalse((self.backend.directory/'restore-cutoff.json').exists())
+
+    def test_restore_capture_requires_admission_and_continuous_maintenance(self):
+        self.prepare_restore_capture()
+        self.transaction['activation_started']=False
+        with self.assertRaises(Refused): self.restore_capture()
+        self.transaction['activation_started']=True
+        marker=self.root/'public/maintenance.json';atomic_json(marker,{'active':False})
+        with self.assertRaises(Refused): self.restore_capture()
+        self.assertFalse((self.backend.directory/'restore-cutoff.json').exists())
+
+    def test_restore_capture_refuses_storage_loss_and_live_api(self):
+        self.prepare_restore_capture()
+        self.life.encrypted.side_effect=Refused('mount lost')
+        with self.assertRaises(Refused): self.restore_capture()
+        self.life.encrypted.side_effect=None;self.native.units['api']='active'
+        with self.assertRaises(Refused): self.restore_capture()
+        self.assertFalse((self.backend.directory/'restore-cutoff.json').exists())
+
+    def test_restore_capture_requires_durable_state_directory_before_observation(self):
+        self.prepare_restore_capture()
+        before = len(self.native.calls)
+        with patch("nebulalog_adapters.identity_maintenance.os.fsync", side_effect=OSError("parent sync failed")):
+            with self.assertRaises(OSError):
+                self.restore_capture()
+        self.assertFalse((self.backend.directory/'restore-cutoff.json').exists())
+        self.assertFalse(any("--command" in call for call in self.native.calls[before:]))
 
 
 if __name__ == "__main__":

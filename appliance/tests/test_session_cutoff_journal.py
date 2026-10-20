@@ -174,4 +174,80 @@ class SessionCutoffJournalTests(unittest.TestCase):
         with self.assertRaises(Refused): self.reconcile()
 
 
+    def capture(self, *, resume=False, operation=None, observe=None, fence=None):
+        return self.journal.capture_restore(observe or (lambda: {
+            'realm_id': self.realm['id'], 'installation_id': self.installation,
+            'floor': self.realm['notBefore']}), operation or self.operation, self.api,
+            self.cutoff, fence or (lambda op: True), resume=resume)
+
+    def test_pre_restore_capture_survives_database_and_api_rollback(self):
+        self.realm['notBefore'] = self.cutoff + 600
+        captured = self.capture()
+        self.assertEqual(captured['floor'], self.cutoff + 600)
+        self.assertEqual(self.api.read_bytes(), self.original)
+        self.assertFalse(self.journal.path.exists())
+        self.realm['notBefore'] = 0
+        result = self.reconcile()
+        self.assertEqual(result['token_not_before'], self.cutoff + 600)
+        self.assertEqual(self.realm['notBefore'], self.cutoff + 600)
+        self.assertFalse(result['maintenance_release_authorized'])
+
+    def test_restore_resume_never_queries_a_partially_replaced_database(self):
+        captured = self.capture()
+        self.api.unlink()
+        def unavailable(): raise AssertionError('Partial restore must not observe the DB')
+        self.assertEqual(self.capture(resume=True, observe=unavailable), captured)
+        with self.assertRaises(Refused): self.capture(resume=True, operation='f'*64)
+        (self.state/'restore-cutoff.json').unlink()
+        with self.assertRaises(Refused): self.capture(resume=True, observe=unavailable)
+
+    def test_new_restore_retains_greatest_observed_floor(self):
+        self.realm['notBefore'] = self.cutoff + 1000
+        self.capture()
+        self.realm['notBefore'] = 0
+        self.assertEqual(self.capture(operation='c'*64)['floor'], self.cutoff + 1000)
+
+    def test_capture_write_failure_cannot_authorize_replacement(self):
+        with patch('nebulalog_manager.common.atomic_json', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError): self.capture()
+        self.assertFalse((self.state/'restore-cutoff.json').exists())
+        with self.assertRaises(Refused): self.capture(resume=True)
+
+    def test_capture_lost_write_acknowledgement_reuses_durable_floor(self):
+        from nebulalog_manager.common import atomic_json
+        def lost(path, value):
+            atomic_json(path, value)
+            raise OSError('lost persisted capture acknowledgement')
+        self.realm['notBefore'] = self.cutoff + 900
+        with patch('nebulalog_manager.common.atomic_json', side_effect=lost):
+            with self.assertRaises(OSError): self.capture()
+        self.realm['notBefore'] = 0
+        self.assertEqual(self.capture()['floor'], self.cutoff + 900)
+
+    def test_capture_foreign_identity_and_malformed_state_are_refused(self):
+        self.capture()
+        path = self.state/'restore-cutoff.json'; original = path.read_bytes()
+        for key, value in [('installation_id','f'*32), ('operation','foreign'),
+                           ('floor',True), ('realm_id','x\' OR true'), ('api_path','/tmp/foreign')]:
+            record=json.loads(original); record[key]=value; path.write_text(json.dumps(record))
+            with self.subTest(key=key), self.assertRaises(Refused): self.capture(resume=True)
+        path.write_bytes(original);self.realm['id']='foreign'
+        with self.assertRaises(Refused): self.reconcile()
+        self.assertFalse(any(method != 'GET' for _,method,_ in self.calls))
+
+    def test_capture_requires_fence_before_observation_and_after_persistence(self):
+        with self.assertRaises(Refused): self.capture(fence=lambda op: False)
+        self.assertFalse((self.state/'restore-cutoff.json').exists())
+        with self.assertRaises(Refused):
+            self.capture(fence=lambda op: not (self.state/'restore-cutoff.json').exists())
+        self.assertTrue((self.state/'restore-cutoff.json').exists())
+
+    def test_capture_permissions_and_links_are_not_accepted(self):
+        self.capture();path=self.state/'restore-cutoff.json'
+        path.chmod(0o644)
+        with self.assertRaises(Refused): self.capture(resume=True)
+        path.chmod(0o600);os.link(path,self.state/'duplicate')
+        with self.assertRaises(Refused): self.capture(resume=True)
+
+
 if __name__ == '__main__': unittest.main()

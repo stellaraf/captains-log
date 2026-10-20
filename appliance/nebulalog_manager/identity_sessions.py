@@ -129,6 +129,83 @@ class SessionCutoffJournal:
         body = b"".join(retained)
         return floor, body, hashlib.sha256(body).hexdigest()
 
+    def _restore_record(self, api):
+        """Read the monotonic floor captured before identity database replacement."""
+        import os
+        import re
+        from .host_payload import strict_json
+        path = self.directory / "restore-cutoff.json"
+        if not os.path.lexists(path):
+            return None
+        value = strict_json(self._read(path))
+        if (not isinstance(value, dict)
+                or set(value) != {"schema", "installation_id", "operation", "floor", "api_path", "realm_id"}
+                or type(value["schema"]) is not int or value["schema"] != 1
+                or value["installation_id"] != self.installation_id
+                or not isinstance(value["operation"], str) or not re.fullmatch(r"[a-f0-9]{64}", value["operation"])
+                or type(value["floor"]) is not int or not 1577836800 <= value["floor"] < 2**31
+                or value["api_path"] != str(api)
+                or not isinstance(value["realm_id"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value["realm_id"])):
+            raise Refused("Pre-restore identity cutoff has invalid ownership or shape")
+        return value
+
+    def capture_restore(self, observe, operation, api_environment, minimum, fence, *, resume=False):
+        """Persist the live issuance floor before a destructive database intent.
+
+        The caller proves stopped identity/API writers and continuous maintenance.
+        Once database replacement has been admitted, resume requires the exact
+        retained capture; it must never learn a lower floor from a restored DB.
+        Capture alone does not revoke tokens or authorize service startup.
+        """
+        from pathlib import Path
+        import os
+        import re
+        from .common import atomic_json, locked
+        if (not isinstance(operation, str) or not re.fullmatch(r"[a-f0-9]{64}", operation)
+                or type(resume) is not bool or type(minimum) is not int
+                or not 1577836800 <= minimum < 2**31):
+            raise Refused("Identity restore capture requires a bound operation and canonical minimum")
+        api = Path(api_environment)
+        if not api.is_absolute() or api.resolve() != api:
+            raise Refused("Identity restore capture requires a canonical API environment")
+        self._directory(self.directory)
+
+        def held():
+            if fence(operation) is not True:
+                raise Refused("Identity restore capture lost its writer fence")
+
+        held()
+        lock = self.directory / "session-cutoff.lock"
+        if os.path.lexists(lock):
+            self._read(lock)
+        with locked(lock):
+            self._read(lock)
+            held()
+            previous = self._restore_record(api)
+            if resume:
+                if previous is None or previous["operation"] != operation:
+                    raise Refused("Interrupted database replacement lost its pre-restore identity cutoff")
+                return previous
+            self._directory(api.parent)
+            api_floor, _, _ = self._environment(self._read(api))
+            realm = observe()
+            if (not isinstance(realm, dict) or set(realm) != {"realm_id", "installation_id", "floor"}
+                    or realm["installation_id"] != self.installation_id
+                    or not isinstance(realm["realm_id"], str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", realm["realm_id"])
+                    or type(realm["floor"]) is not int or not 0 <= realm["floor"] < 2**31
+                    or previous is not None and previous["realm_id"] != realm["realm_id"]):
+                raise Refused("Pre-restore identity observation belongs to another realm")
+            value = {"schema": 1, "installation_id": self.installation_id, "operation": operation,
+                     "floor": max(minimum, api_floor, realm["floor"], previous["floor"] if previous else 0),
+                     "api_path": str(api), "realm_id": realm["realm_id"]}
+            held()
+            atomic_json(self.directory / "restore-cutoff.json", value)
+            if self._restore_record(api) != value:
+                raise Refused("Pre-restore identity cutoff did not persist")
+            held()
+            return value
+
     def reconcile(self, call, operation, api_environment, minimum, fence, *, initialize=False):
         """Persist intent, invalidate sessions and repair the API's durable floor.
 
@@ -199,7 +276,11 @@ class SessionCutoffJournal:
             realm_floor = realm.get("notBefore")
             if type(realm_floor) is not int or not 0 <= realm_floor < 2**31:
                 raise Refused("Session journal cannot adopt a malformed realm floor")
-            floor = max(minimum, api_floor, realm_floor, previous["floor"] if previous else 0)
+            captured = self._restore_record(api)
+            if captured is not None and captured["realm_id"] != realm["id"]:
+                raise Refused("Session reconciliation differs from the pre-restore realm")
+            floor = max(minimum, api_floor, realm_floor, previous["floor"] if previous else 0,
+                        captured["floor"] if captured else 0)
             record = {"schema": 1, "installation_id": self.installation_id,
                       "operation": operation, "floor": floor, "phase": "intent",
                       "api_path": str(api), "api_configuration_sha256": configuration_hash, "realm_id": realm["id"]}

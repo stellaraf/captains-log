@@ -91,6 +91,8 @@ class LifecycleTests(unittest.TestCase):
         # Native holds/catalog execution have separate real PostgreSQL suites;
         # these coordinator tests inject those boundaries and test phase order.
         self.manager.storage_maintenance = Mock()
+        self.manager.identity_restore_capture = Mock(side_effect=lambda stage, context, **kw:
+            self.commands.calls.append(["identity-capture", kw["resume"]]))
         self.manager.application_schema_catalog = Mock(return_value={"schema_revision": "1"})
         self.manager.api_ready = Mock()
         self.trusted = patch("nebulalog_adapters.lifecycle.trusted_file", side_effect=lambda path: path)
@@ -189,6 +191,21 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaises(Refused):
             self.manager.rollback(self.stage)
         self.assertEqual(len(self.commands.calls), prior)
+
+    def test_identity_capture_precedes_restore_and_failure_prevents_drop(self):
+        self.manager.backup(self.stage);self.manager.prepare(self.stage)
+        self.manager.activate(self.stage)
+        self.manager.identity_restore_capture.side_effect=Refused('capture unavailable')
+        before=len(self.commands.calls)
+        with self.assertRaises(Refused): self.manager.rollback(self.stage)
+        self.assertFalse(any('dropdb' in call or 'createdb' in call for call in self.commands.calls[before:]))
+        self.assertFalse((self.stage/'adapter-database-restore-intent.json').exists())
+        self.manager.identity_restore_capture.side_effect=lambda stage, context, **kw: self.commands.calls.append(['identity-capture',kw['resume']])
+        self.manager.rollback(self.stage)
+        first_drop=next(i for i,call in enumerate(self.commands.calls) if 'dropdb' in call)
+        captures=[i for i,call in enumerate(self.commands.calls) if call==['identity-capture',False]]
+        self.assertEqual(len(captures),2)
+        self.assertTrue(all(i<first_drop for i in captures))
 
     def test_finalize_requires_durable_completion_and_all_checks(self):
         with self.assertRaises(Refused):

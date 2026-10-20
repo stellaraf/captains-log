@@ -49,6 +49,99 @@ def _environment(raw):
     return result
 
 
+def capture_before_database_restore(lifecycle, stage, context, *, resume):
+    """Retain identity cutoff before the lifecycle can destroy its current DB.
+
+    This is a read-only database boundary, separate from temporary authority.
+    An orphaned recovery command must be reconciled before this boundary; it
+    cannot be discarded merely because the main Keycloak unit is inactive.
+    """
+    life, stage = lifecycle, Path(stage)
+    life.guard()
+    if not stage.is_absolute() or stage.resolve() != stage or type(resume) is not bool:
+        raise Refused("Identity restore capture requires a canonical stage and explicit retry state")
+    _, transaction = life.release(stage)
+    if transaction.get("activation_started") is not True:
+        raise Refused("Identity restore capture requires durable activation admission")
+    if type(life.cmd) is Commands and not getattr(life, "_component_ticket", None):
+        raise Refused("Identity restore capture requires the active lifecycle hook lease")
+    if context != life.database_restore_context(stage, life.checked_backup(stage)):
+        raise Refused("Identity restore capture differs from the verified database recovery context")
+    operation = _digest(json.dumps(context, sort_keys=True, separators=(",", ":")).encode())
+    setup = life.configuration / "bootstrap/setup.json"
+    setup_raw = SessionCutoffJournal._read(setup)
+    installation = strict_json(setup_raw)["installation_id"]
+    if str(uuid.UUID(installation)) != installation:
+        raise Refused("Identity restore capture requires a canonical installation UUID")
+    directory = life.data / "manager/identity-maintenance"
+
+    def held(selected):
+        life.guard()
+        if selected != operation or SessionCutoffJournal._read(setup) != setup_raw:
+            raise Refused("Identity restore capture binding changed")
+        _, current = life.release(stage)
+        if current.get("activation_started") is not True:
+            raise Refused("Identity restore admission disappeared")
+        marker = strict_json(SessionCutoffJournal._read(life.data / "manager/maintenance.json"))
+        public = strict_json(trusted_file(PUBLIC_MAINTENANCE).read_bytes())
+        gate = strict_json(SessionCutoffJournal._read(life.data / "manager/storage-maintenance/gate.json"))
+        if (marker != public or marker.get("active") is not True or marker.get("release") != str(stage)
+                or gate != {"schema": 1, "held": True, "delivery_held": True,
+                            "operation": _digest(str(stage).encode())}):
+            raise Refused("Identity restore requires continuous transaction-owned maintenance")
+        for name in ("api", "ingest", "keycloak"):
+            unit = "nebulalog-" + name
+            if life.cmd(["systemctl", "show", "--property=ActiveState", "--value", unit + ".service"]) != "inactive":
+                raise Refused("Identity restore requires stopped external and identity writers")
+            ids = life.cmd(["podman", "ps", "--all", "--no-trunc", "--filter",
+                            "name=^" + unit + "$", "--format", "{{.ID}}"]).splitlines()
+            if len(ids) > 1 or any(not SHA.fullmatch(cid) for cid in ids):
+                raise Refused("Identity restore writer inventory is ambiguous")
+            if ids:
+                observed = strict_json(life.cmd(["podman", "container", "inspect", ids[0]]).encode())
+                if (not isinstance(observed, list) or len(observed) != 1
+                        or observed[0].get("Id") != ids[0] or observed[0].get("Name") != unit
+                        or observed[0].get("State", {}).get("Running") is not False):
+                    raise Refused("Identity restore has an orphaned writer container")
+        if life.cmd(["podman", "ps", "--all", "--no-trunc", "--filter",
+                     "label=" + LABEL + "=" + installation, "--format", "{{.ID}}"]):
+            raise Refused("Reconcile the retained identity recovery command before database replacement")
+        life.encrypted()
+        _encrypted_staging(directory, life.cmd)
+        return True
+
+    held(operation)
+    if directory.resolve() != directory:
+        raise Refused("Identity restore state cannot traverse links")
+    directory.mkdir(mode=0o700, exist_ok=True)
+    # Persist the new directory entry before recording a floor and allowing a
+    # destructive restore intent. Fsync of the record's directory alone does
+    # not establish durability of that directory's entry in its parent.
+    parent = os.open(directory.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+    journal = SessionCutoffJournal(directory, installation)
+
+    def observe():
+        held(operation)
+        query = """SELECT json_build_object('realm_id',r.id,'floor',r.not_before,
+'installation_id',(SELECT value FROM realm_attribute
+ WHERE realm_id=r.id AND name='nebulalog.installation-id'))
+ FROM realm r WHERE r.name='nebulalog'"""
+        def sql(value):
+            return life.pg(["psql", "-X", "--quiet", "--username=postgres", "--dbname=keycloak",
+                            "--tuples-only", "--no-align", "--set=ON_ERROR_STOP=1", "--command",
+                            "SET statement_timeout='30s'; " + value], timeout=45)
+        if sql("SELECT count(*) FROM pg_stat_activity WHERE datname='keycloak' AND usename='keycloak'") != "0":
+            raise Refused("Identity database still has a writer before restore capture")
+        return strict_json(sql(query).encode())
+
+    return journal.capture_restore(observe, operation, life.configuration / "runtime/api.env",
+                                   int(time.time()), held, resume=resume)
+
+
 class IdentityMaintenanceBackend:
     """Compose with TemporaryIdentityAuthority while the lifecycle lease is held.
 
@@ -463,6 +556,10 @@ class IdentityMaintenanceBackend:
             "SELECT json_build_object('realm_id',r.id,'floor',r.not_before,'installation_id',"
             "(SELECT value FROM realm_attribute WHERE realm_id=r.id AND name='nebulalog.installation-id')) "
             "FROM realm r WHERE r.name='nebulalog'").encode())
+        captured = SessionCutoffJournal(self.directory, self.installation_id)._restore_record(self.api_environment)
+        if captured is not None and (captured["realm_id"] != journal["realm_id"]
+                                     or captured["floor"] > receipt["token_not_before"]):
+            return False
         return (journal.get("installation_id") == self.installation_id and journal.get("operation") == self.operation
                 and journal.get("phase") == "api" and journal.get("floor") == receipt["token_not_before"] == floor
                 and journal.get("api_path") == str(self.api_environment)

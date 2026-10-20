@@ -1624,6 +1624,15 @@ END $fence$; SELECT 'fenced';"""
                             schema_revision=self.application_schema_current()["revision"],
                             **({"host": host.runtime_evidence("update-activate")} if host else {}))
 
+    def identity_restore_capture(self, stage, context, *, resume):
+        from .identity_maintenance import capture_before_database_restore
+        result = capture_before_database_restore(self, stage, context, resume=resume)
+        receipt = stage / "adapter-identity-restore-capture.json"
+        atomic_json(receipt, result)
+        if strict_json(trusted_file(receipt).read_bytes()) != result:
+            raise Refused("Identity restore capture receipt did not persist")
+        return result
+
     def rollback(self, stage):
         release, transaction = self.release(stage)
         if transaction.get("activation_started") is False:
@@ -1637,6 +1646,11 @@ END $fence$; SELECT 'fenced';"""
         self.service("stop", tuple(name for name in reversed(self.services) if name != "postgresql"))
         self.service("start", ("postgresql",))
         self.pg_ready()
+        if not historical:
+            # This retained floor lives outside the configuration/database
+            # recovery set. A partial restore must require the old observation,
+            # never initialize from a database that may already be replaced.
+            self.identity_restore_capture(stage, restore_context, resume=restoring)
         migration_intent = stage / "adapter-application-schema-intent.json"
         if os.path.lexists(migration_intent) and not (restoring and not restored):
             # Remove the exact retained execution client before waiting on a
@@ -1707,6 +1721,7 @@ END $fence$; SELECT 'fenced';"""
             # The durable intent follows the verified empty-action/INSERT
             # barrier and executor fence. On restart either DB may be absent;
             # only this exact intent plus a continuous host hold permits retry.
+            self.identity_restore_capture(stage, restore_context, resume=restoring)
             self._schema_record(stage / "adapter-database-restore-intent.json", restore_context)
             for database in ("nebulalog", "keycloak"):
                 self.pg(["dropdb", "--username=postgres", "--force", "--if-exists", database])

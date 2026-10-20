@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from nebulalog_adapters import host_runtime as runtime
 from nebulalog_adapters.lifecycle import Lifecycle
@@ -48,6 +48,7 @@ class RuntimeFixture(HostFixture):
         self.inactive_service = False
         config = {"issuer": "https://fixture.example/realms/nebulalog", "edge_service": "nebulalog-edge.service"}
         self.lifecycle = Lifecycle(config, self.command, state=self.state, data=self.root, configuration=configuration, quadlets=quadlets, guard=lambda: None)
+        self.lifecycle.identity_restore_capture = Mock()  # Native identity boundary is qualified separately.
         self.manifest["components"]["nebulalog"] = {"version": "0.1.1", "artifact": "app.tar", "image": NEW_IMAGE, "rollback_safe": True}
         self.bind_manifest(); self.save_transaction("preflight")
         self.host = runtime.HostRuntime(self.lifecycle, self.stage)
