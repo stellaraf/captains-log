@@ -194,14 +194,63 @@ private Buildx configuration, source copy and extracted binary were removed.
 Independent readback confirmed absence and preserved all four current release
 archives.
 
-A read-only check of the official npm registry's stable dist-tags also found
-pending upgrades: React/React DOM 19.3.1, Playwright 1.64.1, Lucide 1.60.0,
-TypeScript 7.0.2, Vite 8.3.4, its React plugin 6.1.2 and Vitest 5.0.5.
-The corresponding React type packages also have newer versions. This
-observation is dated 2026-10-20 UTC; availability does not establish migration
-compatibility. These updates, the older development database/identity images,
-and transitive/OS dependency review remain open. The development build's
-`npm ci` reported zero known vulnerabilities at execution time.
+## Stable frontend upgrade and real-service browser checks
+
+The direct frontend dependencies now match the official npm registry's stable
+dist-tags observed on 2026-10-20 UTC: React/React DOM 19.3.1, React type packages
+19.3.0, Playwright 1.64.1, Lucide 1.60.0, TypeScript 7.0.2, Vite 8.3.4,
+its React plugin 6.1.2 and Vitest 5.0.5. Keycloak JS remains at the observed
+stable 26.2.4 and both font packages at 5.3.0. The lockfile records the resolved
+dependency graph and integrity hashes.
+
+The migration follows the vendor notes for
+[Vite 8](https://vite.dev/guide/migration),
+[Vitest 5](https://vitest.dev/guide/migration/) and
+[TypeScript 7](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/).
+TypeScript's stricter side-effect import checks exposed a missing CSS
+declaration. `src/vite-env.d.ts` now loads Vite's asset types; type checking
+remains enabled.
+
+- **92 frontend tests passed**, zero failures or skips, under Node 24.22.0
+  on macOS/arm64. The TypeScript/Vite production build passed.
+- `npm audit` reported **zero known vulnerabilities**, including development
+  dependencies, at execution time. This is not an OS/container vulnerability
+  audit.
+- The normal appliance application image built on **Linux/amd64** using its
+  pinned Node 24 and Go 1.27.2 inputs. Its OCI archive/configuration/source
+  binding was independently verified.
+- All eight restored-token HTTP boundary cases passed against this exact
+  image's normal API entrypoint, including cutoff, missing claim, expired,
+  wrong issuer/audience and invalid signature cases. That separate probe uses
+  a synthetic issuer and does not establish a complete restored appliance.
+- **All six existing Playwright tests passed**, zero skips or flaky results,
+  in Chrome 155.0.8059.85 against that exact application image and actual
+  PostgreSQL 17.11, ClickHouse 25.3.8.30001.altinityfips and PostgreSQL-backed
+  Keycloak 26.7.3. No UI/API responses or authentication were fabricated.
+  The refresh race test controls delivery timing of real API responses.
+- A disposable operator completed password plus SHA-256 TOTP browser sign-in.
+  A synthetic PAN-OS event traversed the application's TCP collector, was
+  parsed and persisted in ClickHouse, and appeared in the upgraded log UI.
+  The tests exercised unauthenticated redirection, saved-filter persistence
+  and deletion, graphical filters, layout persistence, refresh interval,
+  pause/manual refresh/resume, in-flight cancellation, 390-pixel viewport
+  width, and diagnostics/storage/security pages. Temporary saved filters
+  were independently counted at zero afterward.
+
+This fixture used loopback HTTP, vendor test database images and a uniquely
+owned storage gate. It does not qualify native encrypted storage, strict FIPS,
+production TLS, upstream Okta/Entra authentication or restore/update/rollback.
+Its fresh databases used the normal `migrate` command; schema-4 factory
+initialization remains a separate gate.
+The exact image retained its normal entrypoint and UID; no running development
+deployment was changed.
+
+Five fixture containers, two labelled volumes, newly pulled vendor test images,
+private credentials and browser session state were removed. Build ownership
+receipts separately cover the builder/cache lifecycle. The initial harness
+attempt failed before resource creation; its cleanup record is retained.
+The older development database/identity images and complete transitive/OS
+dependency review remain open.
 
 ## Remaining acceptance
 
