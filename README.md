@@ -24,6 +24,8 @@ See [validation evidence](docs/ACCEPTANCE.md) and the
 
 Requirements: Docker Compose, Python 3, OpenSSL. The development stack publishes
 only loopback ports unless a Syslog bind address is explicitly configured.
+Existing installations must follow the [upgrade and rollback
+procedure](docs/DEVELOPMENT_UPGRADES.md) before updating dependency images.
 
 ```sh
 python3 scripts/dev-init.py

@@ -5,6 +5,13 @@ the system interpreter. Captain's Log host launchers, fixed dispatch, console,
 provisioning, sealing and lifecycle hooks explicitly invoke Python 3.14. The
 qualification fixture used Rocky `python3.14-3.14.8-1.el9_8.x86_64`.
 
+Python 3.15.0 is the newer upstream major release. The public Rocky 9 AppStream
+x86-64 package index checked on 2026-10-20 still offers 3.14.8 as its newest
+Python branch/patch, with no `python3.15` package. The appliance uses the vendor
+package alongside the system interpreter; it does not substitute a custom
+Python build for that vendor input. [Python 3.15 release](https://www.python.org/downloads/release/python-3150/),
+[Rocky package index](https://download.rockylinux.org/pub/rocky/9/AppStream/x86_64/os/Packages/p/).
+
 The operating system's Python remains unchanged. The kernel dependency solver
 continues to invoke `/usr/bin/python3` because Rocky's DNF bindings belong to that
 interpreter. Versioned Python packages are classified as migration-required OS
@@ -249,8 +256,60 @@ Five fixture containers, two labelled volumes, newly pulled vendor test images,
 private credentials and browser session state were removed. Build ownership
 receipts separately cover the builder/cache lifecycle. The initial harness
 attempt failed before resource creation; its cleanup record is retained.
-The older development database/identity images and complete transitive/OS
-dependency review remain open.
+The development database/identity images were subsequently refreshed and tested
+as recorded below. Complete transitive/OS dependency review remains open.
+
+## Existing-data development database and identity upgrade
+
+The development Compose defaults now pin PostgreSQL **17.11** and Keycloak
+**26.8.1** to their exact Linux/amd64 vendor manifests. On 2026-10-20 an isolated
+real-service fixture completed this sequence:
+
+1. Initialize PostgreSQL 17.6 and Keycloak 26.3.3 with the product realm and
+   old theme; authenticate with password and SHA-256 TOTP; run all six existing
+   Playwright browser tests.
+2. Stop application and identity writers and take custom-format `pg_dump`
+   backups of both application and identity databases.
+3. Start PostgreSQL 17.11 on the same volume, verify its original database-system
+   identifier, then start Keycloak 26.8.1 against the existing identity database.
+   Run all six browser tests again after the actual migration.
+4. Enroll a new authenticator through the rebased theme, reject an invalid
+   enrollment code, and complete a fresh browser login with the next TOTP
+   interval. Label associations, keyboard focus and the 390-pixel layout passed;
+   redacted enrollment/error screenshots were inspected.
+5. Stop the upgraded services, restore both checksum-verified backups onto a
+   separate fresh PostgreSQL 17.6 volume, and start Keycloak 26.3.3 with its old
+   theme. Run the same six browser tests again.
+
+All **18 browser cases passed**, with zero skips, failures or flaky retries.
+Selected saved-filter, layout, retention, audit, existing OTP credential, role
+binding and realm signing-key hashes remained identical. Keycloak's recorded
+changelog grew from 157 to 237 entries; rollback restored the original 157-entry
+digest. The synthetic traffic event ingested through the TCP collector remained
+queryable in ClickHouse throughout. Temporary browser-created filters were
+absent after each stage.
+
+The OTP override was compared with the actual 26.8.1 installed theme JAR and
+the official versioned source. Its only differences are the two corrected
+label associations. The vendor's newer QR, button and error-handling templates
+remain intact. The first attempt's immediate post-enrollment login reused its
+TOTP interval and was rejected; the fixture was corrected to wait for a fresh
+interval, then the entire upgrade/rollback sequence was rerun successfully.
+Authentication protections were unchanged.
+
+This tests development-mode Keycloak, loopback HTTP, vendor PostgreSQL and
+ClickHouse images, and the exact previously built application image. It does
+not test the appliance's automatic updater, a PostgreSQL major-version or
+architecture migration, strict FIPS, production TLS, external federation, or
+full encrypted appliance restore. PostgreSQL remains on major version 17.
+The retained production Keycloak 26.7.3 image predates the theme change and must
+be refreshed and its bundle reverified before packaging. Keycloak also reports
+that the client's full-scope setting is deprecated; explicit role-scope
+migration remains part of the identity review.
+
+Both fixture attempts removed their owned containers, volumes, newly pulled
+images and private credentials. The live development deployment was unchanged.
+See [upgrade and rollback instructions](../DEVELOPMENT_UPGRADES.md).
 
 ## Remaining acceptance
 

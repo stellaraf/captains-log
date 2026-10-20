@@ -10,6 +10,15 @@ that platform explicitly, including on Apple Silicon development hosts where
 Docker uses emulation. Its Go 1.27.2 and Node 24 build inputs use the same
 immutable manifests as the appliance application build.
 
+PostgreSQL 17.11 and Keycloak 26.8.1 are also pinned to immutable Linux x86-64
+manifests. PostgreSQL remains on major version 17; upgrading to major version 18
+requires separate migration qualification. The production strict-FIPS identity
+image has its own version lock and acceptance checks.
+
+For an existing deployment, follow [development upgrades and
+rollback](DEVELOPMENT_UPGRADES.md) before replacing the database or identity
+images. Preserve existing credentials, MFA factors and volumes.
+
 1. Install Docker with Compose, Python 3 and OpenSSL.
 2. Run `python3 scripts/dev-init.py`. Unique secrets are stored in `.local/dev.env`
    with mode 0600. Back this file up privately; do not regenerate credentials
