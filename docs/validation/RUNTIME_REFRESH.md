@@ -14,8 +14,8 @@ authorize an automatic runtime replacement on an existing appliance.
 The application compiler is Go 1.27.2, pinned to official Linux/amd64 manifest
 `sha256:55395706e9703db746cc507abfc4eb2aea75918f8a8024e4848e2cb81004f5ad`.
 The frozen Go cryptographic module remains `GOFIPS140=v1.0.0`. Node 24 remains
-the LTS web-build input. The PostgreSQL image's Python wrapper still uses the
-system interpreter and requires a separate image dependency refresh.
+the LTS web-build input. The PostgreSQL image's Python wrapper has subsequently been rebuilt with the
+same public Python 3.14.8 runtime; see [its image validation](../../appliance/images/postgresql-fips/VALIDATION.md). Positive native database qualification remains open.
 
 ## Executed validation
 
@@ -52,7 +52,7 @@ qualification. Go integration skips are not passing integration evidence.
 ## Remaining acceptance
 
 Existing-appliance interpreter installation and fixed-host migration,
-PostgreSQL image refresh, complete dependency review, real host-authority and
+native PostgreSQL initialization, complete dependency review, real host-authority and
 browser recovery, final factory packaging, VMware/Nutanix boot, OS/application/
 log-system automatic updates and rollback, and the complete release acceptance
 inventory remain separate gates. The last native public Rocky kernel check

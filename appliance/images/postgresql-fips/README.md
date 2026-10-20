@@ -8,6 +8,8 @@ PostgreSQL 17.11 is the August 13, 2026 maintenance/security release. Its native
 
 `BOM.json` pins the amd64 RESF base manifest, every additional/upgraded RPM URL and SHA-256, the PGDG signing-key bytes/fingerprints and the Rocky key inherited from the pinned base. The image downloads the exact inputs, checks each checksum, verifies all RPM signatures with the two keys and installs with repositories disabled and local-package signature checks enabled. Dependency resolution happened before those pins were generated; the released recipe cannot resolve a newer package silently. Mirror removal causes a failed build instead of an unreviewed substitute.
 
+The initializer runs explicitly under public Rocky Python **3.14.8-1.el9_8**, installed alongside the OS interpreter. Its Python libraries, pip wheel, mpdecimal and SQLite dependency are checksum-pinned and signature-verified with the other inputs. The image contains 25 additional/upgraded RPM inputs.
+
 The input list includes the three PostgreSQL packages, the matched OpenSSL library/provider triplet, ICU, locale/glibc and required package dependencies. DNF weak dependencies are disabled. The base manifest fixes other inherited packages; pinning does not mean their vulnerability review is complete. `/opt/nebulalog/rpm-bom.tsv` retains every installed RPM's version, architecture and declared license, and `/opt/nebulalog/rpm-signatures.txt` retains signature-verification results.
 
 PGDG's current RHEL key fingerprint is `D4BF08AE67A0B4C7A1DBCCD240BCA2B408B40D20`, with signing subkey `190043FB30BA8636FCB021BEC07038AF3576435C`. [Official key](https://download.postgresql.org/pub/repos/yum/keys/PGDG-RPM-GPG-KEY-RHEL), [key-selection README](https://download.postgresql.org/pub/repos/yum/keys/README.txt).
@@ -21,9 +23,9 @@ From the repository root:
 ```sh
 docker build --platform linux/amd64 \
   -f appliance/images/postgresql-fips/Containerfile \
-  -t nebulalog/postgresql-fips:17.11-1 .
+  -t nebulalog/postgresql-fips:17.11-2 .
 python3 appliance/images/postgresql-fips/verify_image.py \
-  --image nebulalog/postgresql-fips:17.11-1 \
+  --image nebulalog/postgresql-fips:17.11-2 \
   --output .local/postgresql-fips/verification.json
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
   -s appliance/images/postgresql-fips -p test_entrypoint.py -v

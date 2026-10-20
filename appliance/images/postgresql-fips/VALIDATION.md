@@ -1,4 +1,34 @@
-# Local candidate verification
+# Python 3.14 candidate verification — 2026-10-20 UTC
+
+The current candidate uses public Rocky Python **3.14.8-1.el9_8** for its
+initializer. PostgreSQL remains **17.11-1PGDG.rhel9.8** and the matched system
+OpenSSL libraries/provider remain **3.5.5-6.el9_8**.
+
+- Linux/amd64 manifest: `sha256:d4d8725dbb4e3a4fc0790f9d94369ef9b2a2569413f004c7251d129768b82ed7`.
+- All **25** additional/upgraded RPM inputs passed checksum and signature
+  checks. Installation ran with repositories disabled and local RPM signature
+  verification enabled. The runtime inventory and packaged input BOM were read
+  back from this exact image.
+- The normal entrypoint is `/usr/bin/python3.14 /opt/nebulalog/entrypoint.py`,
+  running as UID/GID **999:999**. Actual interpreter/package readback confirmed
+  Python **3.14.8**. PostgreSQL, libpq and Python's SSL extension resolve the
+  expected system `libssl.so.3` and `libcrypto.so.3`.
+- The data directory remained empty, the socket directory remained private,
+  and the image's generated machine identity remained cleared.
+- Normal startup on the non-FIPS LinuxKit host returned **78** before any
+  database or socket writes. No host flag or provider was substituted.
+- All **7 initializer control-flow tests passed** under the image's actual
+  Python 3.14 interpreter and installed initializer. Those tests use explicit
+  fixtures and do not invoke real `initdb` or qualify a positive FIPS run.
+
+The new image and verified OCI archive are local candidates. Positive native
+provider selection, initialization, SCRAM authentication, TLS, persistence,
+backup/restore and update/rollback remain required on the actual Rocky guest.
+This checkpoint does not establish a deployable or certified appliance.
+
+## Previous candidate evidence
+
+### September 2026 candidate
 
 Recorded 2026-09-08T05:16:45.499314+00:00. This is isolated Docker Desktop build evidence, not positive FIPS guest qualification.
 

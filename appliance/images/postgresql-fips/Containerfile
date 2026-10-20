@@ -21,6 +21,11 @@ ADD --checksum=sha256:4ef530fdbff21ce6b666c59d1fba8f7a59b0f233345bc073f73c2e6a58
 ADD --checksum=sha256:48386f4809508b1985afd88d889a692bb796bb37b694190f7b27486e0d8075c2 https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/s/systemd-252-67.el9.rocky.0.1.x86_64.rpm /opt/nebulalog/inputs/systemd-252-67.el9.rocky.0.1.x86_64.rpm
 ADD --checksum=sha256:b26660321bfec14de20c886f3d39eda8145cbebb11b709fadeef274ab5a89bf4 https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/s/systemd-pam-252-67.el9.rocky.0.1.x86_64.rpm /opt/nebulalog/inputs/systemd-pam-252-67.el9.rocky.0.1.x86_64.rpm
 ADD --checksum=sha256:46a4220ee7f29c3190952ce6155a3e6cefe28ac139cf8df3a35b7bf9e4aa2db5 https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/s/systemd-rpm-macros-252-67.el9.rocky.0.1.noarch.rpm /opt/nebulalog/inputs/systemd-rpm-macros-252-67.el9.rocky.0.1.noarch.rpm
+ADD --checksum=sha256:099922b588d75efa7133334bcaad5e41ed02fdd7bcb194c6bdfa63ef7e32f9e3 https://dl.rockylinux.org/pub/rocky/9.8/AppStream/x86_64/os/Packages/p/python3.14-3.14.8-1.el9_8.x86_64.rpm /opt/nebulalog/inputs/python3.14-3.14.8-1.el9_8.x86_64.rpm
+ADD --checksum=sha256:9a893bf817f258f8b3fa1c3c589003adcb910b0811e98e46f94d58008d81e339 https://dl.rockylinux.org/pub/rocky/9.8/AppStream/x86_64/os/Packages/p/python3.14-libs-3.14.8-1.el9_8.x86_64.rpm /opt/nebulalog/inputs/python3.14-libs-3.14.8-1.el9_8.x86_64.rpm
+ADD --checksum=sha256:e35b38d039b7758de955dafa5443dffe732445354fec4f10a8c601b9e2e041a4 https://dl.rockylinux.org/pub/rocky/9.8/AppStream/x86_64/os/Packages/p/python3.14-pip-wheel-25.2-3.el9_8.5.noarch.rpm /opt/nebulalog/inputs/python3.14-pip-wheel-25.2-3.el9_8.5.noarch.rpm
+ADD --checksum=sha256:708d6d283020a54e3766cec65767b063d01d0d4500f32ba1f12fabc2eb7ecb36 https://dl.rockylinux.org/pub/rocky/9.8/AppStream/x86_64/os/Packages/m/mpdecimal-2.5.1-3.el9.x86_64.rpm /opt/nebulalog/inputs/mpdecimal-2.5.1-3.el9.x86_64.rpm
+ADD --checksum=sha256:7150f09994a94181f9c6d3fce29abf922c20ae3d90683d2f0e535fa72ec04876 https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os/Packages/s/sqlite-libs-3.34.1-11.el9_8.x86_64.rpm /opt/nebulalog/inputs/sqlite-libs-3.34.1-11.el9_8.x86_64.rpm
 FROM docker.io/rockylinux/rockylinux:9.8@sha256:ed654c694190a670bb5c33f68995b862214fc96ffbdca95e07a8935ba0a3717d
 USER 0:0
 COPY --from=packages /opt/nebulalog/inputs /opt/nebulalog/inputs
@@ -42,9 +47,9 @@ COPY appliance/images/postgresql-fips/postgresql.conf appliance/images/postgresq
 ENV PATH=/usr/pgsql-17/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin PGDATA=/var/lib/postgresql/data PG_MAJOR=17 LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 PYTHONDONTWRITEBYTECODE=1 OPENSSL_CONF=/etc/pki/tls/openssl.cnf
 USER 999:999
 LABEL org.opencontainers.image.title="Captain’s Log PostgreSQL FIPS candidate" \
-      org.opencontainers.image.version="17.11-nebulalog.1" \
+      org.opencontainers.image.version="17.11-nebulalog.2" \
       org.opencontainers.image.licenses="AGPL-3.0-only AND PostgreSQL AND LicenseRef-Rocky-Component-Licenses"
 EXPOSE 5432
 STOPSIGNAL SIGINT
-ENTRYPOINT ["/usr/bin/python3", "/opt/nebulalog/entrypoint.py"]
+ENTRYPOINT ["/usr/bin/python3.14", "/opt/nebulalog/entrypoint.py"]
 CMD ["postgres"]

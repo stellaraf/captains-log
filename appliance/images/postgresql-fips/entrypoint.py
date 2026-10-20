@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3.14
 """Minimal appliance-only initialization; no arbitrary init scripts or SQL."""
 import json
 import os
