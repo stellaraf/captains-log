@@ -1,8 +1,9 @@
 # Existing-realm scope migration
 
-`appliance/nebulalog_manager/browser_scopes.py` is a maintenance helper under
-qualification. It is not invoked automatically by bootstrap or the updater,
-and is not yet included in the installed host catalog.
+`appliance/nebulalog_manager/browser_scopes.py` is a maintenance helper with
+isolated configuration qualification. It and the session-invalidation helper
+are included in the host source catalog. Neither is invoked automatically by
+bootstrap or the updater; catalog inclusion is not installation or activation.
 
 The caller must supply authenticated administration, the trusted realm template
 and the expected installation ID. The helper checks the realm's installation
@@ -102,6 +103,9 @@ Automatic activation requires all of the following:
   maintenance.
 - Exercise interruption and rollback at each durable boundary, including
   uncertain REST writes and interrupted temporary-account removal.
+
+The [session cutoff and temporary-authority validation](IDENTITY_SESSION_CUTOFF.md)
+tracks the additional token and administration boundaries.
 
 Existing-realm configuration reconciliation, automatic updater integration,
 native TLS/FIPS operation and release acceptance are separate evidence scopes.
