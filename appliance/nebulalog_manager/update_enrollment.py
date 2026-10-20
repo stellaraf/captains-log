@@ -210,23 +210,26 @@ class UpdateEnrollment:
         _tree(self.temp)
         return identity
 
-    def _descriptor(self, *, _initialization=False):
+    def _descriptor(self, *, _initialization=False, _qualification=False):
         raw = _read(self.share / "initial-release.json")
         value = strict_json(raw)
         fields = {"schema", "product", "sequence", "schema_revision", "source_commit", "source_dirty",
                   "source_snapshot_sha256", "bundle_manifest_sha256", "qualification_status", "publisher"}
-        if (not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"restore_auth"} or type(value.get("schema")) is not int or value["schema"] != 1
+        if (not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"restore_auth", "private_qualification"} or type(value.get("schema")) is not int or value["schema"] != 1
                 or value.get("product") != "nebulalog" or type(value.get("sequence")) is not int or not 0 <= value["sequence"] < 2**63
                 or not isinstance(value.get("schema_revision"), str) or not re.fullmatch(r"[1-9][0-9]{0,8}", value["schema_revision"])
                 or not re.fullmatch(r"[a-f0-9]{40}", str(value.get("source_commit", "")))
                 or type(value.get("source_dirty")) is not bool or value.get("qualification_status") != "pending"
                 or any(not SHA256.fullmatch(str(value.get(key, ""))) for key in ("source_snapshot_sha256", "bundle_manifest_sha256"))):
             raise Refused("Initial release provenance is missing explicit build identity or has unsupported claims")
-        if value["schema_revision"] == application_schema.HOST_CHALLENGE_REVISION and not _initialization:
+        private_qualification = value.get("private_qualification") is True
+        if "private_qualification" in value and (not private_qualification or value["schema_revision"] != "4" or "restore_auth" not in value):
+            raise Refused("Private qualification requires explicit schema 4 authentication evidence")
+        if value["schema_revision"] == application_schema.HOST_CHALLENGE_REVISION and not (_initialization or _qualification and private_qualification):
             raise Refused("Schema 4 activation awaits fresh initialization, restored authentication, and image qualification")
         if "restore_auth" in value:
             RestoredAuthContract.factory_descriptor(value["restore_auth"])
-            if value["schema_revision"] not in (("3", "4") if _initialization else ("3",)):
+            if value["schema_revision"] not in (("3", "4") if _initialization or _qualification and private_qualification else ("3",)):
                 raise Refused("Factory restored authentication requires an explicitly supported fresh schema")
         source = _read(self.share / "source-manifest.json", 8 * 1024**2)
         manifest = strict_json(source)
@@ -314,7 +317,7 @@ class UpdateEnrollment:
         Shared by the installer and sealer, before any runtime image load. This
         verifies source/image binding only; it never claims guest qualification.
         """
-        descriptor, descriptor_sha, application_source = self._descriptor()
+        descriptor, descriptor_sha, application_source = self._descriptor(_qualification=not require_factory)
         if descriptor["bundle_manifest_sha256"] != _hash(_read(self.share / "images/manifest.json")):
             raise Refused("Initial release provenance does not match the installed offline bundle")
         verified = verify_bundle(self.share / "images", _json(self.etc / "images.json"), root_owned=True)

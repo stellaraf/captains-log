@@ -99,8 +99,12 @@ def publisher_provenance(root, files, *, private_unsealed=False):
 
 
 def capture(root: Path, bundle: Path, output: Path, *, sequence: int, schema_revision: str, private_unsealed=False,
-            restore_auth_evidence: Path | None = None):
-    if schema_revision == application_schema.HOST_CHALLENGE_REVISION:
+            restore_auth_evidence: Path | None = None, private_qualification=False):
+    if type(private_qualification) is not bool:
+        raise ValueError("Private qualification must be an explicit boolean")
+    if private_qualification and (schema_revision != application_schema.HOST_CHALLENGE_REVISION or restore_auth_evidence is None):
+        raise ValueError("Private schema 4 qualification requires exact-image restored authentication evidence")
+    if schema_revision == application_schema.HOST_CHALLENGE_REVISION and not private_qualification:
         raise ValueError("Schema 4 packaging awaits fresh initialization, restored authentication, and image qualification")
     root, bundle = root.resolve(), bundle.resolve()
     if type(sequence) is not int or not 0 <= sequence < 2**63 or not re.fullmatch(r"[1-9][0-9]{0,8}", schema_revision):
@@ -119,9 +123,13 @@ def capture(root: Path, bundle: Path, output: Path, *, sequence: int, schema_rev
                   "source_dirty": dirty, "source_snapshot_sha256": sha(source),
                   "bundle_manifest_sha256": sha(bundle_manifest.read_bytes()),
                   "qualification_status": "pending", "publisher": publisher}
+    if private_qualification:
+        # Bind the non-distributable status into the factory descriptor. This
+        # permits building a guest to test; it cannot authorize sealing/release.
+        descriptor["private_qualification"] = True
     auth_raw = {}
     if restore_auth_evidence is not None:
-        if schema_revision != "3":
+        if schema_revision != "3" and not private_qualification:
             raise ValueError("Restored authentication evidence requires the supported fresh schema 3 baseline")
         restore_auth_evidence = Path(restore_auth_evidence).absolute()
         for name in sorted(restored_auth.EVIDENCE):
@@ -129,7 +137,7 @@ def capture(root: Path, bundle: Path, output: Path, *, sequence: int, schema_rev
         pins = host_payload.strict_json(host_payload.read_regular(bundle / "images.json", 1024**2))
         image = verify_bundle(bundle, pins)["images"]["NEBULALOG_IMAGE"]
         descriptor["restore_auth"] = restored_auth.factory_capture(manifest["files"], image,
-            auth_raw[restored_auth.BUILD], auth_raw[restored_auth.BEHAVIOR])
+            auth_raw[restored_auth.BUILD], auth_raw[restored_auth.BEHAVIOR], schema_revision=schema_revision)
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".nebulalog-provenance-", dir=output.parent))
     try:
@@ -169,6 +177,7 @@ if __name__ == "__main__":
     parser.add_argument("--sequence", type=int)
     parser.add_argument("--schema-revision")
     parser.add_argument("--private-unsealed", action="store_true", help="Explicit non-distributable candidate without factory publisher trust; sealing is refused")
+    parser.add_argument("--private-qualification", action="store_true", help="Build a non-distributable schema 4 test guest with measured authentication evidence; sealing remains refused")
     parser.add_argument("--restore-auth-evidence", type=Path, help="Reviewed exact-image build and normal-API behavior receipts; does not claim native acceptance")
     args = parser.parse_args()
     if args.application_hash_only:
@@ -178,4 +187,5 @@ if __name__ == "__main__":
             parser.error("Capture requires --bundle, --output, --sequence and --schema-revision")
         print(json.dumps(capture(args.source, args.bundle, args.output, sequence=args.sequence,
                                  schema_revision=args.schema_revision, private_unsealed=args.private_unsealed,
-                                 restore_auth_evidence=args.restore_auth_evidence), indent=2, sort_keys=True))
+                                 restore_auth_evidence=args.restore_auth_evidence,
+                                 private_qualification=args.private_qualification), indent=2, sort_keys=True))

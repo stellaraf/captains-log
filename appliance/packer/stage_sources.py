@@ -63,7 +63,7 @@ def captured(provenance):
     manifest, descriptor = strict_json(source), strict_json(release)
     fields = {"schema", "product", "sequence", "schema_revision", "source_commit", "source_dirty",
               "source_snapshot_sha256", "bundle_manifest_sha256", "qualification_status", "publisher"}
-    if (not isinstance(descriptor, dict) or not fields <= set(descriptor) or set(descriptor) - fields - {"restore_auth"} or type(descriptor.get("schema")) is not int
+    if (not isinstance(descriptor, dict) or not fields <= set(descriptor) or set(descriptor) - fields - {"restore_auth", "private_qualification"} or type(descriptor.get("schema")) is not int
             or descriptor["schema"] != 1 or descriptor["product"] != "nebulalog"
             or type(descriptor["sequence"]) is not int or not 0 <= descriptor["sequence"] < 2**63
             or not isinstance(descriptor["schema_revision"], str) or not re.fullmatch(r"[1-9][0-9]{0,8}", descriptor["schema_revision"])
@@ -73,11 +73,14 @@ def captured(provenance):
                    for name in ("source_snapshot_sha256", "bundle_manifest_sha256"))
             or descriptor["source_snapshot_sha256"] != sha(source)):
         raise ValueError("Source manifest must match the existing pending initial-release provenance")
-    if descriptor["schema_revision"] == ApplicationSchema.HOST_CHALLENGE_REVISION:
+    private_qualification = descriptor.get("private_qualification") is True
+    if "private_qualification" in descriptor and (not private_qualification or descriptor["schema_revision"] != "4" or "restore_auth" not in descriptor):
+        raise ValueError("Private qualification requires explicit schema 4 authentication evidence")
+    if descriptor["schema_revision"] == ApplicationSchema.HOST_CHALLENGE_REVISION and not private_qualification:
         raise ValueError("Schema 4 packaging awaits fresh initialization, restored authentication, and image qualification")
     if "restore_auth" in descriptor:
         RestoredAuthContract.factory_descriptor(descriptor["restore_auth"])
-        if descriptor["schema_revision"] != "3":
+        if descriptor["schema_revision"] != "3" and not private_qualification:
             raise ValueError("Restored authentication factory inputs require fresh schema 3")
     if (not isinstance(manifest, dict) or set(manifest) != {"schema", "files"}
             or type(manifest["schema"]) is not int or manifest["schema"] != 1

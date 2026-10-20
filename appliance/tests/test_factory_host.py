@@ -166,7 +166,7 @@ class FactoryHostTests(unittest.TestCase):
     def enroll(self):
         return factory.enroll(self.source / "appliance", self.source / "deploy/keycloak/realm.json", self.manager)
 
-    def test_fixed_boot_verifier_binds_optional_factory_auth_receipts(self):
+    def check_fixed_boot_auth(self, *, private_qualification=False):
         from nebulalog_manager.image_bundle import RestoredAuthContract
         (self.share / "restore-auth").mkdir(mode=0o700)
         artifacts = {}
@@ -177,6 +177,8 @@ class FactoryHostTests(unittest.TestCase):
             artifacts[name] = {"bytes": len(raw), "sha256": payload.digest(raw)}
         self.descriptor.update(schema_revision="3", restore_auth={"schema": 1, "contract": RestoredAuthContract.CONTRACT,
             "version": "1.0.0", "artifacts": artifacts})
+        if private_qualification:
+            self.descriptor.update(schema_revision="4", private_qualification=True)
         atomic_json(self.share / "initial-release.json", self.descriptor)
         self.manager.verify_build_inputs.return_value = {"descriptor": self.descriptor,
             "descriptor_sha256": payload.digest((self.share / "initial-release.json").read_bytes())}
@@ -186,6 +188,12 @@ class FactoryHostTests(unittest.TestCase):
         path.write_bytes(raw + b" ")
         with self.assertRaisesRegex(boot.Refused, "authentication evidence changed"):
             boot.factory()
+
+    def test_fixed_boot_verifier_binds_optional_factory_auth_receipts(self):
+        self.check_fixed_boot_auth()
+
+    def test_fixed_boot_verifier_binds_private_qualification_and_still_checks_evidence(self):
+        self.check_fixed_boot_auth(private_qualification=True)
 
     def accepted(self, host):
         current = {"sequence": 0, "version": "0.1.0", "components": {"host": host}}

@@ -241,3 +241,29 @@ class Schema4FactoryContractTests(unittest.TestCase):
         with self.assertRaises(Refused):
             Contract.verify_factory({**self.descriptor, "schema_revision": "3"},
                                     self.share, self.factory_host, self.image, root_owned=False)
+
+    def capture_private(self):
+        environment = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+        if not (self.source / ".git").exists():
+            for argv in (("init", "--quiet"), ("add", "."), ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                         "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture")):
+                subprocess.run(["git", "-C", str(self.source), *argv], env=environment, check=True, capture_output=True)
+        return capture(self.source, self.bundle, self.root / "private-provenance",
+                       sequence=1, schema_revision="4", private_unsealed=True,
+                       restore_auth_evidence=self.bundle, private_qualification=True)
+
+    def test_private_schema4_capture_measures_archives_and_authentication_receipts(self):
+        result = self.capture_private()
+        descriptor = payload.strict_json((self.root / "private-provenance/initial-release.json").read_bytes())
+        self.assertIs(descriptor["private_qualification"], True)
+        self.assertEqual(descriptor["schema_revision"], "4")
+        self.assertEqual(result["restore_auth"], descriptor["restore_auth"])
+        self.assertEqual(descriptor["qualification_status"], "pending")
+        self.assertFalse(result["signature_created"])
+
+    def test_private_capture_rejects_wrong_image_authentication_evidence(self):
+        self.behavior["application_config_digest"] = "sha256:" + "0" * 64
+        self.rewrite()
+        with self.assertRaises(Refused):
+            self.capture_private()
+        self.assertFalse((self.root / "private-provenance").exists())
