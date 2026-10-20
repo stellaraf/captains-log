@@ -284,30 +284,43 @@ func TestLocalKeycloakDisabledProviderRoundTrip(t *testing.T) {
 	if os.Getenv("NEBULALOG_IDENTITY_LIVE_TEST") != "1" {
 		t.Skip("opt-in local integration")
 	}
-	b, err := os.ReadFile(filepath.Join("..", "..", ".local", "dev.env"))
-	if err != nil {
-		t.Fatal("local environment unavailable")
-	}
-	env := map[string]string{}
-	for _, line := range strings.Split(string(b), "\n") {
-		if k, v, ok := strings.Cut(line, "="); ok {
-			env[k] = v
+	config := Config{BaseURL: "http://127.0.0.1:18089", PublicBaseURL: "http://127.0.0.1:18089", Realm: "nebulalog", ClientID: "nebulalog-identity-manager", AllowHTTP: true, EnableWrites: true}
+	if path, selected := os.LookupEnv("NEBULALOG_IDENTITY_FIXTURE_CONFIG"); selected {
+		// An invalid explicit fixture must never fall back to the live service.
+		config = pinnedIdentityFixture(t, path)
+	} else {
+		b, err := os.ReadFile(filepath.Join("..", "..", ".local", "dev.env"))
+		if err != nil {
+			t.Fatal("local environment unavailable")
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			if k, v, ok := strings.Cut(line, "="); ok && k == "KC_IDENTITY_CLIENT_SECRET" {
+				config.ClientSecret = v
+			}
 		}
 	}
-	m, err := New(Config{BaseURL: "http://127.0.0.1:18089", PublicBaseURL: "http://127.0.0.1:18089", Realm: "nebulalog", ClientID: "nebulalog-identity-manager", ClientSecret: env["KC_IDENTITY_CLIENT_SECRET"], AllowHTTP: true, EnableWrites: true})
+	m, err := New(config)
 	if err != nil {
 		t.Fatal(err)
 	}
+	for _, alias := range []string{"okta", "entra"} {
+		t.Run(alias, func(t *testing.T) { disabledProviderRoundTrip(t, m, alias) })
+	}
+}
+
+func disabledProviderRoundTrip(t *testing.T, m *Manager, alias string) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	before, err := m.Inspect(ctx, "okta")
+	before, err := m.Inspect(ctx, alias)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if before.Configured {
-		t.Skip("okta alias already exists; no modification")
+		t.Skip("provider alias already exists; no modification")
 	}
 	s := setup(t)
+	s.Alias = alias
 	s.Groups = GroupMappings{"synthetic-live-viewer", "synthetic-live-analyst", "synthetic-live-admin"}
 	uniqueIssuer := fmt.Sprintf("urn:nebulalog:synthetic-idp:%d", time.Now().UnixNano())
 	s.MetadataXML = strings.ReplaceAll(s.MetadataXML, "urn:nebulalog:synthetic-idp", uniqueIssuer)

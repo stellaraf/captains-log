@@ -133,6 +133,42 @@ qualify production TLS, native FIPS operation or large-estate performance.
 No temporary PostgreSQL schemas remained afterward. Both containers, the
 volume, credentials and host compile caches were independently confirmed absent.
 
+## Subsequent identity-provider qualification
+
+The full `internal/identity` package passed with its live fixture enabled:
+**16 top-level tests, 54 passes including subtests, zero failures and zero
+skips**. Go 1.27.2 on macOS/arm64 exercised pinned Keycloak 26.7.3 on Linux/amd64.
+Both Okta and Entra defaults completed disabled-provider creation, configuration
+and mapper readback, validation, group-mapping update and independent removal.
+The service account had exactly `manage-identity-providers`,
+`view-identity-providers` and `view-realm`; the broker flow had one required OTP
+execution. Both aliases were absent after testing.
+
+An explicit private fixture descriptor now binds the test to a running,
+labelled container, immutable image ID and loopback port. An invalid selected
+fixture cannot fall back to the development login service. Descriptor admission
+rejects the development port, mutable image/name references, missing ownership,
+short/missing secrets, readable credential files, symlinks and oversized input.
+The test-only Docker inspection deadline is bounded at 30 seconds to accommodate
+host load; identity checks remain mandatory.
+
+This used disposable Keycloak development-mode storage and HTTP on loopback.
+Neither provider was enabled, and no upstream authentication was attempted.
+Actual tenant sign-in, production PostgreSQL-backed Keycloak, TLS and strict
+FIPS operation remain separate acceptance gates. Both fixture attempts,
+temporary credentials, downloaded fixture image and compile caches were removed.
+
+## Integration skip reconciliation
+
+Of the 37 skipped test/subtest entries in the earlier Linux Go run, **34 now
+have passing execution evidence** in the separate fixtures above. One entry is
+the Linux child helper exercised by its two parent tests. Two entries remain:
+`TestEmergencyObservationControllerIsolated/pre-dispatch=false` and
+`TestEmergencyObservationControllerIsolated/pre-dispatch=true`. All 59 Go
+production-source/module files in the earlier source manifest still match.
+This reconciliation does not claim one combined full-environment run or native
+appliance acceptance.
+
 ## Remaining acceptance
 
 Existing-appliance interpreter installation and fixed-host migration,
