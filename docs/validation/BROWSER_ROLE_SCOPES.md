@@ -107,3 +107,5 @@ previously issued tokens. Do not delete or re-import a live realm as a shortcut.
 
 Native TLS/FIPS operation, external Okta/Entra/AD authentication and the complete
 appliance update/rollback and recovery matrix remain separate acceptance gates.
+The [existing-realm maintenance helper](IDENTITY_SCOPE_MIGRATION.md) is under
+separate qualification and is not automatically invoked on installed appliances.
