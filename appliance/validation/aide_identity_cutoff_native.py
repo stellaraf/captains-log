@@ -17,11 +17,25 @@ assert sys.version_info[:3]==(3,14,8)
 REAL_POPEN=subprocess.Popen
 from test_aide_identity_cutoff import IdentityCutoffAideTests
 from nebulalog_manager import aide,aide_updates
+from nebulalog_manager.identity_sessions import _atomic_private_bytes
 REAL_METADATA=aide_updates._metadata
+PROCESS_CONTEXT=subprocess.check_output(['id','-Z'],text=True).strip()
 out=pathlib.Path(os.environ['CAPTAINS_LOG_TEST_RECEIPTS']).resolve()
 assert out.is_absolute() and not out.exists()
 out.mkdir(mode=0o700)
 class RealScanner(IdentityCutoffAideTests):
+ def write_private(self,path,content):
+  fresh=not path.exists()
+  super().write_private(path,content)
+  if fresh and path.name=='api.env' and self._testMethodName=='test_actual_api_replacement_preserves_acl_xattrs_and_selinux':
+   import struct
+   entries=[(1,6,0xffffffff),(2,4,12345),(4,0,0xffffffff),(16,0,0xffffffff),(32,0,0xffffffff)]
+   acl=struct.pack('<I',2)+b''.join(struct.pack('<HHI',*e)for e in entries)
+   os.setxattr(path,'system.posix_acl_access',acl)
+   os.setxattr(path,'user.captainslog-fixture',b'preserved\0binary')
+   with patch('subprocess.Popen',REAL_POPEN):
+    subprocess.run(['/usr/bin/chcon','-t','etc_t',str(path)],check=True,capture_output=True,text=True)
+   assert b':etc_t:' in os.getxattr(path,'security.selinux')
  def setUp(self):
   super().setUp();self.scan_number=0;self.case_out=out/self._testMethodName;self.case_out.mkdir(mode=0o700)
   policy='NEBULA = ftype+p+i+l+n+u+g+s+m+c+acl+selinux+xattrs+sha512\nNEBULADIR = ftype+p+i+u+g+acl+selinux+xattrs\n'
@@ -50,6 +64,24 @@ class RealScanner(IdentityCutoffAideTests):
   return aide.Result(p.returncode,p.stdout,p.stderr)
  def tearDown(self):
   if self.state.exists():shutil.copytree(self.state,self.case_out/'retained-evidence')
+ def restore(self):
+  self.runtime.write_bytes(b'old managed\n')
+  self.selection.write_bytes(b'restored selection highwater\n')
+  _atomic_private_bytes(self.api,self.after_api,preserve_metadata=True)
+ def test_actual_api_replacement_preserves_acl_xattrs_and_selinux(self):
+  self.cutoff_fixture()
+  before={key:os.getxattr(self.api,key)for key in os.listxattr(self.api)}
+  assert {'security.selinux','system.posix_acl_access','user.captainslog-fixture'}<=before.keys()
+  inode=self.api.stat().st_ino
+  self.restore()
+  self.assertNotEqual(self.api.stat().st_ino,inode)
+  self.assertEqual({key:os.getxattr(self.api,key)for key in os.listxattr(self.api)},before)
+  self.assertTrue(self.accept_update('rollback')['ok'])
+  self.assertEqual(self.manager.check()['state'],'clean')
+  (self.case_out/'metadata-result.json').write_text(json.dumps({
+   'actual_atomic_writer':True,'new_inode':True,'acl_preserved':True,'xattrs_preserved':True,
+   'selinux_label':os.getxattr(self.api,'security.selinux').decode().rstrip('\0'),
+   'process_context':PROCESS_CONTEXT,'aide_accepted':True,'full_appliance_qualified':False}))
  def test_real_xattr_change_is_refused(self):
   self.cutoff_fixture();self.restore()
   os.setxattr(self.api,'user.captainslog-fixture',b'changed',follow_symlinks=False)
@@ -58,7 +90,7 @@ class RealScanner(IdentityCutoffAideTests):
 
 names=[name for name in unittest.defaultTestLoader.getTestCaseNames(RealScanner)if name!='test_retained_output_metadata_change_is_rejected_even_if_scan_claims_clean']
 result=unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(RealScanner(name)for name in names))
-paths=['appliance/nebulalog_manager/aide_updates.py','appliance/nebulalog_manager/ordinary_boot_metadata.py','appliance/adapters/nebulalog_adapters/identity_maintenance.py','appliance/tests/test_aide_identity_cutoff.py','appliance/tests/test_aide_updates.py']
-receipt={'passed':result.wasSuccessful(),'tests_run':result.testsRun,'failures':len(result.failures),'errors':len(result.errors),'skipped':len(result.skipped),'python':sys.version,'aide_package':subprocess.check_output(['rpm','-q','aide'],text=True).strip(),'guest_fips_flag_required':True,'selinux_enforcing_required':True,'full_appliance_qualified':False,'restore_admission_and_storage_injected':True,'actual_scanner':True,'actual_database_parser':True,'source':{p:hashlib.sha256((ROOT/p).read_bytes()).hexdigest()for p in paths}}
+paths=['appliance/nebulalog_manager/aide_updates.py','appliance/nebulalog_manager/ordinary_boot_metadata.py','appliance/adapters/nebulalog_adapters/identity_maintenance.py','appliance/nebulalog_manager/identity_sessions.py','appliance/validation/aide_identity_cutoff_native.py','appliance/tests/test_aide_identity_cutoff.py','appliance/tests/test_aide_updates.py']
+receipt={'passed':result.wasSuccessful(),'tests_run':result.testsRun,'failures':len(result.failures),'errors':len(result.errors),'skipped':len(result.skipped),'python':sys.version,'aide_package':subprocess.check_output(['rpm','-q','aide'],text=True).strip(),'guest_fips_flag_required':True,'kernel_crypto_selftests_qualified':False,'selinux_enforcing_required':True,'process_context':PROCESS_CONTEXT,'full_appliance_qualified':False,'restore_admission_and_storage_injected':True,'actual_scanner':True,'actual_database_parser':True,'actual_api_atomic_writer':True,'source':{p:hashlib.sha256((ROOT/p).read_bytes()).hexdigest()for p in paths}}
 (out/'scanner-result.json').write_text(json.dumps(receipt,indent=2)+'\n')
 print(json.dumps(receipt));sys.exit(not result.wasSuccessful())

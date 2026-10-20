@@ -338,5 +338,53 @@ and a concurrent metadata change. All six fail against the preceding
 implementation (four assertion failures and two missing-attribute errors).
 Both isolated test containers and volumes were removed after terminal results.
 
-Linux ACL/xattr tests are not evidence of native SELinux policy permission,
-FIPS acceptance, or a complete appliance restore. Those gates remain open.
+Those container results alone do not establish native SELinux policy
+permission, FIPS acceptance, or a complete appliance restore. The subsequent
+native metadata/scanner result below has a separate, bounded scope.
+
+## Native Rocky ACL, SELinux and AIDE validation
+
+Ten tests passed without failures or skips on the retained Nutanix AHV
+diagnostic guest using public Rocky Python **3.14.8** and
+`aide-0.19.2-5.el9_8.1.x86_64`. SELinux stayed **Enforcing**. The tests ran
+through a transient systemd service in
+`system_u:system_r:unconfined_service_t:s0`, using the actual atomic API writer,
+vendor AIDE scanner, database parser and retained-history validator.
+
+The positive metadata case created a named-user POSIX ACL, a binary user xattr
+and a custom `system_u:object_r:etc_t:s0` label before preparing the baseline.
+After atomic replacement, all attributes were identical and the inode was new.
+AIDE accepted the intended cutoff change and subsequently reported a clean
+state. Other cases exercised interrupted database replacement, retained
+authorization, forward/rollback lineage, altered proofs, unrelated changes,
+and rejection of changed xattrs or API bytes. The synthetic database-row
+mutation case remains in the container regression suite; it is excluded from
+the native runner because its fake-scanner injection does not apply to real
+AIDE output.
+
+The first transient service failed at standard-output setup before Python
+executed: systemd could not open a file under the fixture's private temporary
+directory. The second service used journal output and completed successfully.
+No SELinux policy, enforcement setting or appliance enrollment gate was changed.
+
+The older diagnostic guest needed four additional vendor packages:
+`python3.14`, `python3.14-libs`, `python3.14-pip-wheel` and `mpdecimal`.
+DNF used the public BaseOS/AppStream repositories with package signature
+checking enabled. No installed package was replaced, including the kernel and
+system Python. Vendor non-configuration files verified without differences;
+the sole full-package verification difference, `/etc/aide.conf`, exactly
+matched the repository's managed configuration. Tests used their own explicit
+temporary AIDE policies.
+
+All 226 transferred source inputs were hash-verified before and after testing.
+Receipts, scanner databases and journals were collected before removing test
+scratch and the dedicated DNF cache, reclaiming **122,925,056 allocated bytes**
+on the guest. The four new runtime packages remain for later qualification.
+The guest was shut down gracefully and its NIC disconnected; the final VM
+specification matched the pre-test specification on independent API readback.
+
+This closes the bounded native metadata/scanner test, not appliance acceptance.
+Restore admission, storage identity and source/plan admission are still fixture
+boundaries. The guest still reports the known kernel HKDF self-test failure
+despite its enabled FIPS flag. Complete native restore/update integration,
+strict cryptographic acceptance, VMware parity and the final OVA remain open.
