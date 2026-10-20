@@ -177,8 +177,8 @@ class FactoryKernelTests(unittest.TestCase):
 
     def test_build_and_integrity_wiring_is_mandatory(self):
         installer = (APPLIANCE / 'install-host.sh').read_text()
-        self.assertIn('python3 "$APPLIANCE_SOURCE/factory_kernel.py"', installer)
-        self.assertLess(installer.index('python3 "$APPLIANCE_SOURCE/factory_kernel.py"'), installer.index('python3 "$APPLIANCE_SOURCE/factory_host.py"'))
+        self.assertIn('python3.14 "$APPLIANCE_SOURCE/factory_kernel.py"', installer)
+        self.assertLess(installer.index('python3.14 "$APPLIANCE_SOURCE/factory_kernel.py"'), installer.index('python3.14 "$APPLIANCE_SOURCE/factory_host.py"'))
         for name in ('factory_host.py', 'host_boot.py', 'nebulalog_manager/update_enrollment.py', 'packer/stage_sources.py'):
             self.assertIn('appliance/factory_kernel.py', (APPLIANCE / name).read_text())
         self.assertIn("'/usr/libexec/nebulalog/factory-kernel', '--verify'", (APPLIANCE / 'provision_guard.py').read_text())

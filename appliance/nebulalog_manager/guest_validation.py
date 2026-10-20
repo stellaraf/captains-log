@@ -35,7 +35,7 @@ PACKAGES = ("rocky-release", "kernel-core", "kernel-modules-core", "kernel-modul
             "openssl", "openssl-libs", "openssl-fips-provider", "crypto-policies", "crypto-policies-scripts",
             "libgcrypt", "gnutls", "nss", "nss-softokn", "nss-softokn-freebl", "selinux-policy", "selinux-policy-targeted",
             "container-selinux", "systemd", "podman", "skopeo", "cryptsetup", "cryptsetup-libs", "lvm2", "xfsprogs",
-            "dracut", "dracut-fips", "audit", "firewalld", "httpd", "mod_ssl", "python3", "openscap-scanner", "scap-security-guide", "aide")
+            "dracut", "dracut-fips", "audit", "firewalld", "httpd", "mod_ssl", "python3", "python3.14", "python3.14-libs", "openscap-scanner", "scap-security-guide", "aide")
 CORE_UNITS = ("nebulalog-firstboot.service", "nebulalog-console.service", "nebulalog-edge.service",
               "nebulalog-maintenance-gate.service", "nebulalog-reboot-verify.service", "nebulalog-reboot-verify.timer",
               "nebulalog-status.service", "nebulalog-status.timer")

@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3.14
 """Build and enroll the initial host generation in a guarded disposable image.
 
 Never called during customer boot or updates. Fixed public trust stays outside

@@ -553,6 +553,7 @@ def plan_cached(stage, packages, *, runner=run):
         refuse('candidate_would_overwrite_existing_file')
     if any(os.path.lexists(path) for path in generated):
         refuse('candidate_generated_path_already_exists')
+    # DNF bindings belong to Rocky's system Python, not the product interpreter.
     solve = strict_json(runner(['/usr/bin/python3', '-c', SOLVE, str(stage), *(str(retained / p['rpm']) for p in proposed)], timeout=180))
     validate_solve(solve, proposed)
     if rpm.inventory(runner)[2] != before:

@@ -412,12 +412,12 @@ raise SystemExit(m.main([sys.argv[3]]))
 
     def test_wrappers_and_timer_units_enter_fixed_isolated_dispatch(self):
         for name in set(boot.COMMANDS) - {"github-updates", "os-updates"}:
-            self.assertIn('/usr/bin/python3 -I -B /usr/libexec/nebulalog/host-boot ' + name + ' "$@"', (APPLIANCE / "bin" / name).read_text())
+            self.assertIn('/usr/bin/python3.14 -I -B /usr/libexec/nebulalog/host-boot ' + name + ' "$@"', (APPLIANCE / "bin" / name).read_text())
         for name in boot.ADAPTERS:
-            self.assertIn('/usr/bin/python3 -I -B /usr/libexec/nebulalog/host-boot ' + name + ' "$@"', (APPLIANCE / "adapters/bin" / name).read_text())
+            self.assertIn('/usr/bin/python3.14 -I -B /usr/libexec/nebulalog/host-boot ' + name + ' "$@"', (APPLIANCE / "adapters/bin" / name).read_text())
         for unit, command in (("nebulalog-app-update.service", "github-updates"), ("nebulalog-os-update.service", "os-updates")):
             text = (APPLIANCE / "systemd" / unit).read_text()
-            self.assertIn("ExecStart=/usr/bin/python3 -I -B /usr/libexec/nebulalog/host-boot " + command, text)
+            self.assertIn("ExecStart=/usr/bin/python3.14 -I -B /usr/libexec/nebulalog/host-boot " + command, text)
             self.assertNotIn("PYTHONPATH", text)
 
 

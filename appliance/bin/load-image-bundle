@@ -1,3 +1,3 @@
 #!/bin/sh
 # Fixed boot ABI validates immutable code before importing an accepted coordinator.
-exec /usr/bin/python3 -I -B /usr/libexec/nebulalog/host-boot load-image-bundle "$@"
+exec /usr/bin/python3.14 -I -B /usr/libexec/nebulalog/host-boot load-image-bundle "$@"

@@ -41,6 +41,7 @@ podman
 skopeo
 container-selinux
 python3
+python3.14
 cryptsetup
 lvm2
 xfsprogs
@@ -77,7 +78,7 @@ useradd --create-home --groups wheel packer
 # Random inaccessible password exists only during build; SSH allows keys only.
 openssl rand -base64 48 | passwd --stdin packer >/dev/null
 mkdir -p /home/packer/.ssh
-python3 - <<'PY'
+python3.14 - <<'PY'
 import base64
 import struct
 from pathlib import Path

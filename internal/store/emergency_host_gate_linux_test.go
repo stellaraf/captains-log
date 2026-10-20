@@ -3,6 +3,7 @@
 package store
 
 import (
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,9 +28,34 @@ func TestEmergencyHostGateNativePermissions(t *testing.T) {
 	if e = os.Chmod(base, 0755); e != nil {
 		t.Fatal(e)
 	}
+	// Go's build directory can be private to root. Give the unprivileged
+	// child its own executable inside this root-owned, traversable fixture.
+	executable, e := os.Executable()
+	if e != nil {
+		t.Fatal(e)
+	}
+	source, e := os.Open(executable)
+	if e != nil {
+		t.Fatal(e)
+	}
+	child := filepath.Join(base, "gate-reader.test")
+	destination, e := os.OpenFile(child, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0755)
+	if e != nil {
+		source.Close()
+		t.Fatal(e)
+	}
+	_, copyErr := io.Copy(destination, source)
+	closeErr := destination.Close()
+	source.Close()
+	if copyErr != nil {
+		t.Fatal(copyErr)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
 	check := func(t *testing.T, path, want string) {
 		t.Helper()
-		cmd := exec.Command(os.Args[0], "-test.run=^TestEmergencyHostGateUnprivilegedChild$", "-test.v")
+		cmd := exec.Command(child, "-test.run=^TestEmergencyHostGateUnprivilegedChild$", "-test.v")
 		cmd.Env = append(os.Environ(), "CAPTAINSLOG_GATE_TEST_CHILD="+path, "CAPTAINSLOG_GATE_TEST_WANT="+want)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 65534, Gid: 65534}}
 		if out, e := cmd.CombinedOutput(); e != nil {

@@ -1,6 +1,6 @@
 # Captain’s Log appliance components
 
-Host management lives outside the application container. Python standard-library modules invoke fixed Linux tools through argv arrays (never a shell command supplied by a request). Imports and unit tests do not change the host. Privileged operations require Linux root and root-owned configuration; development commands should use the pure planners/tests.
+Host management lives outside the application container. New appliance builds install the public Rocky `python3.14` package alongside the OS Python and invoke `/usr/bin/python3.14` explicitly for Captain’s Log services, console, fixed dispatch, and update hooks. Rocky’s `/usr/bin/python3` stays unchanged for DNF bindings used by the kernel dependency solver. Guest validation inventories both interpreters; versioned Python packages require the same explicit OS migration path as the system interpreter. Existing appliances require runtime installation and fixed-host migration qualification before adopting these launchers. Python standard-library modules invoke fixed Linux tools through argv arrays (never a shell command supplied by a request). Imports and unit tests do not change the host. Privileged operations require Linux root and root-owned configuration; development commands should use the pure planners/tests.
 
 ```sh
 PYTHONPATH=appliance:appliance/adapters python3 -m unittest discover -s appliance/tests -v

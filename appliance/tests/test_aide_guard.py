@@ -48,7 +48,7 @@ class AideGuardTests(unittest.TestCase):
         self.runner = Mock(side_effect=self.command)
 
     def command(self, argv, **kwargs):
-        if argv == ['/usr/bin/python3', '-I', '-B', '/usr/libexec/nebulalog/factory-kernel', '--verify']:
+        if argv == ['/usr/bin/python3.14', '-I', '-B', '/usr/libexec/nebulalog/factory-kernel', '--verify']:
             return aide.Result(0, json.dumps({'schema': 1, 'verified': True, 'kernel': '5.14.0-687.57.1.el9_8.x86_64',
                                               'manifest_sha256': aide.sha(self.content), 'inventory_sha256': aide.sha(self.content)}))
         if argv[:2] == ["/usr/bin/rpm", "--query"]:

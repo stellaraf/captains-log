@@ -92,8 +92,8 @@ class NetworkSealingTests(unittest.TestCase):
         sealer = Path(__file__).resolve().parents[1] / "bin/nebulalog-seal"
         text = sealer.read_text()
         self.assertLess(text.index("systemctl stop sshd"), text.index("systemctl stop NetworkManager.service"))
-        self.assertLess(text.index("systemctl stop NetworkManager.service"), text.index("python3 -m nebulalog_manager.image_seal_network"))
-        self.assertLess(text.index("python3 -m nebulalog_manager.image_seal_network"), text.index("dracut --force --no-hostonly"))
+        self.assertLess(text.index("systemctl stop NetworkManager.service"), text.index("python3.14 -m nebulalog_manager.image_seal_network"))
+        self.assertLess(text.index("python3.14 -m nebulalog_manager.image_seal_network"), text.index("dracut --force --no-hostonly"))
         self.assertNotIn("disable NetworkManager", text)
         self.assertNotIn("mask NetworkManager", text)
         self.assertEqual(subprocess.run(["/bin/bash", "-n", str(sealer)], capture_output=True).returncode, 0)

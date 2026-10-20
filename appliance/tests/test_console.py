@@ -291,7 +291,7 @@ class SystemdContractTests(unittest.TestCase):
         self.assertIn("ConditionPathExists=!/etc/nebulalog/bootstrap/unsealed-build", text)
         self.assertIn("ConditionPathExists=!/etc/nebulalog/configured", text)
         launcher = (APPLIANCE / "bin/nebulalog-console").read_text()
-        self.assertIn("exec /usr/bin/python3 -I -B /usr/libexec/nebulalog/host-boot nebulalog-console", launcher)
+        self.assertIn("exec /usr/bin/python3.14 -I -B /usr/libexec/nebulalog/host-boot nebulalog-console", launcher)
         self.assertNotIn("/bin/bash", launcher)
         self.assertNotIn("--autologin", launcher + text)
 

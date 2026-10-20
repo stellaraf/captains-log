@@ -87,7 +87,7 @@ class RuntimeFixture(HostFixture):
 
     def command(self, argv, **kwargs):
         self.commands.append(argv)
-        if argv[:4] == ["/usr/bin/python3", "-I", "-B", str(runtime.SHIM)]:
+        if argv[:4] == ["/usr/bin/python3.14", "-I", "-B", str(runtime.SHIM)]:
             selection = activation.selection()
             identity = self.new if selection["generation"] == self.new["generation"] else self.old
             value = {"schema": 1, "abi": 1, **identity, "selection_sequence": selection["sequence"], "verified": not self.bad_probe}

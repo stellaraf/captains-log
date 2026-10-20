@@ -6,7 +6,7 @@ RUN npm ci
 COPY web/ ./
 RUN npm run build
 
-FROM docker.io/library/golang:1.27.1-bookworm@sha256:6860a573025fcd35aba4f1b23e858b1c1dcd425d53fa73562e169a6ab1c2339a AS go
+FROM docker.io/library/golang:1.27.2-bookworm@sha256:55395706e9703db746cc507abfc4eb2aea75918f8a8024e4848e2cb81004f5ad AS go
 ARG VERSION=0.2.0-appliance-candidate
 ENV GOFIPS140=v1.0.0 CGO_ENABLED=0
 WORKDIR /build

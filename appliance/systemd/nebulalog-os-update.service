@@ -7,6 +7,6 @@ ConditionPathExists=/usr/libexec/nebulalog/update-os-preflight
 ConditionPathExists=/usr/libexec/nebulalog/update-reboot-prepare
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 -I -B /usr/libexec/nebulalog/host-boot os-updates
+ExecStart=/usr/bin/python3.14 -I -B /usr/libexec/nebulalog/host-boot os-updates
 TimeoutStartSec=2h
 UMask=0077

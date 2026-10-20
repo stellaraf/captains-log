@@ -30,7 +30,7 @@ KEY_SHA256 = '3a66e521e7a4abac9768d889c7cd60a8250f59512b275cf576c8a10ff34624c1'
 KEY_ID = '350d275d'
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9+_.-]{0,127}')
 # These cannot use the inert-payload ABI even if a vendor header lacks scripts.
-MIGRATION = re.compile(r'^(?:kernel|aide|rpm|dnf|python3|glibc|openssl|crypto-policies|selinux-policy|grub2|shim|systemd|dracut|cryptsetup|openscap|scap-security-guide)(?:-|$)')
+MIGRATION = re.compile(r'^(?:kernel|aide|rpm|dnf|python3(?:\.\d+)?|glibc|openssl|crypto-policies|selinux-policy|grub2|shim|systemd|dracut|cryptsetup|openscap|scap-security-guide)(?:-|$)')
 SCRIPTS = ('Prein', 'Postin', 'Preun', 'Postun', 'Pretrans', 'Posttrans', 'Verifyscript',
            'Triggerscripts', 'Filetriggerscripts', 'Transfiletriggerscripts')
 

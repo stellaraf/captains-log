@@ -8,7 +8,7 @@ from urllib.parse import quote_plus
 
 
 KICKSTART = Path(__file__).resolve().parents[1] / "packer/http/nebulalog.ks"
-SCRIPT = KICKSTART.read_text().split("python3 - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+SCRIPT = KICKSTART.read_text().split("python3.14 - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
 
 
 def ssh_string(value):

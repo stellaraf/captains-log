@@ -104,7 +104,7 @@ def hook_command(pin, name, stage: Path):
     if (not isinstance(pin, dict) or type(pin.get("schema")) is not int or type(pin.get("abi")) is not int
             or type(pin.get("sequence")) is not int or pin != coordinator_pin(stage)):
         raise Refused("The transaction coordinator pin changed")
-    return ["/usr/bin/python3", "-I", "-B", "-c", DISPATCH_CODE,
+    return ["/usr/bin/python3.14", "-I", "-B", "-c", DISPATCH_CODE,
             str(payload.GENERATIONS / pin["generation"]), name, str(stage)]
 
 

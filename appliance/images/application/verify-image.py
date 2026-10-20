@@ -43,7 +43,7 @@ def verify(image):
     if invalid.returncode != 1 or "REQUIRE_FIPS must be a Boolean" not in invalid.stderr:
         raise ValueError("Application did not refuse malformed FIPS policy")
     build = command(isolated + ["--entrypoint", "/bin/cat", image, "/opt/nebulalog/go-build-info.txt"]).stdout
-    for required in ("go1.27.1", "GOFIPS140=v1.0.0-c2097c7c", "CGO_ENABLED=0", "GOARCH=amd64", "GOOS=linux"):
+    for required in ("go1.27.2", "GOFIPS140=v1.0.0-c2097c7c", "CGO_ENABLED=0", "GOARCH=amd64", "GOOS=linux"):
         if required not in build:
             raise ValueError("Application build metadata does not match the reviewed toolchain/module")
     return {"schema": 1, "status": "isolated_checks_passed", "image": image,

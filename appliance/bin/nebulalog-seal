@@ -7,11 +7,11 @@ set -euo pipefail
 [ "$(getenforce)" = Enforcing ]
 exec 9</etc
 flock -n 9 || { echo 'Another image provisioner or sealer is active' >&2; exit 78; }
-python3 /usr/libexec/nebulalog/provision-guard verify-seal
+python3.14 /usr/libexec/nebulalog/provision-guard verify-seal
 # This operation destroys the disposable build identity. It must never be used
 # to sanitize an installed customer appliance or a first-boot qualification VM.
 test -x /usr/local/bin/nebulalog
-python3 - <<'PYGUARD'
+python3.14 - <<'PYGUARD'
 from pathlib import Path
 import os, stat
 import json, sys
@@ -68,7 +68,7 @@ userdel --remove packer
 # choose static addressing even on a network that has no DHCP server.
 systemctl stop NetworkManager.service NetworkManager-wait-online.service
 [ "$(systemctl show --property=ActiveState --value NetworkManager.service)" = inactive ]
-PYTHONPATH=/usr/lib/nebulalog python3 -m nebulalog_manager.image_seal_network
+PYTHONPATH=/usr/lib/nebulalog python3.14 -m nebulalog_manager.image_seal_network
 restorecon -RF /etc/NetworkManager/system-connections /etc/hostname /etc/hosts /etc/resolv.conf /etc/sysconfig/network
 # Finish ExecStop's seed save before deleting it. Leaving this oneshot active
 # would recreate the seed at shutdown; keep the unit enabled for the next boot.

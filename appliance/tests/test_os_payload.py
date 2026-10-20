@@ -90,7 +90,7 @@ class RpmPolicyTests(unittest.TestCase):
                 rpm.payload({**header(),key:value})
 
     def test_boot_checker_and_package_manager_require_explicit_migration(self):
-        for name in ('kernel-core','aide','rpm','dnf','python3','openssl-libs','shim-x64','dracut','cryptsetup-libs'):
+        for name in ('kernel-core','aide','rpm','dnf','python3','python3.14','python3.14-libs','python3.15','openssl-libs','shim-x64','dracut','cryptsetup-libs'):
             with self.subTest(name=name), self.assertRaisesRegex(Refused,'migration_recipe'):
                 rpm.payload({**header(),'Name':[name]})
 

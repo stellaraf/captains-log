@@ -181,7 +181,7 @@ def factory_kernel_facts(source, runner, tmpdir):
     helper = Path('/usr/libexec/nebulalog/factory-kernel')
     if source['files'].get('appliance/factory_kernel.py') != sha(protected_bytes(helper, maximum=2 * 1024 * 1024)):
         raise Refused('aide_factory_kernel_helper_changed')
-    result = runner(['/usr/bin/python3', '-I', '-B', str(helper), '--verify'], tmpdir=tmpdir, timeout=600)
+    result = runner(['/usr/bin/python3.14', '-I', '-B', str(helper), '--verify'], tmpdir=tmpdir, timeout=600)
     if result.code != 0 or result.stderr.strip():
         raise Refused('aide_factory_kernel_provenance_not_verified')
     value = strict_json(result.stdout)

@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3.14
 """Retain the factory's exact signed vendor kernel RPMs during image creation.
 
 Capture runs only under the inherited private provisioner lock. Verification is

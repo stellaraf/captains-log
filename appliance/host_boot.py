@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3.14
 """Fixed host boot ABI 1. Standard library only until generation verification.
 
 This file is outside updatable generations. Changing its ABI requires a separately

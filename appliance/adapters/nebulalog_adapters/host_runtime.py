@@ -187,7 +187,7 @@ class HostRuntime:
 
     def probe(self, *, imports=False):
         checked_file(SHIM)
-        result = json.loads(self.lifecycle.cmd(["/usr/bin/python3", "-I", "-B", str(SHIM),
+        result = json.loads(self.lifecycle.cmd(["/usr/bin/python3.14", "-I", "-B", str(SHIM),
                                                "probe-selected" if imports else "verify-selected"], timeout=90))
         selected = host_activation.selection()
         identity = self.candidate if selected["generation"] == self.candidate["generation"] else self.previous

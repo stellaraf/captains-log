@@ -498,7 +498,7 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(timer[('Timer', 'OnBootSec')], ['2min'])
         self.assertEqual(timer[('Timer', 'OnCalendar')], ['*-*-* *:07/15:00'])
         service = unit(APPLIANCE / 'systemd/nebulalog-livepatch.service')
-        self.assertEqual(service[('Service', 'ExecStart')], ['/usr/bin/python3 -I -B /usr/libexec/nebulalog/host-boot nebulalog update livepatch-poll'])
+        self.assertEqual(service[('Service', 'ExecStart')], ['/usr/bin/python3.14 -I -B /usr/libexec/nebulalog/host-boot nebulalog update livepatch-poll'])
         self.assertIn('/etc/nebulalog/configured', words(service, 'Unit', 'ConditionPathExists'))
         self.assertIn('nebulalog-reboot-verify.service', words(service, 'Unit', 'After'))
 
