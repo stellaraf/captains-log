@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shutil
 import signal
 import stat
@@ -30,6 +31,8 @@ VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9][A-Za-z0-9.-]{0,1
 TAG = re.compile(r"nebulalog/[a-z0-9]+(?:[._-][a-z0-9]+)*:[a-z0-9][a-z0-9._-]{0,100}")
 BUILDKIT_IMAGE = re.compile(r"moby/buildkit@sha256:[a-f0-9]{64}")
 MINIMUM_FREE = 150 * 1024**3
+MAX_IMAGE_STREAM = 8 * 1024**3  # Same archive ceiling as image_bundle.
+MAX_IMAGE_JSON = 4 * 1024**2
 
 
 def storage_admission(path, storage_root):
@@ -79,6 +82,136 @@ def bounded_run(argv, *, timeout, check=True, reserve_path=None, **kwargs):
     if check:
         result.check_returncode()
     return result
+
+
+def save_identity(read, descriptor, source_sha):
+    """Inspect one OCI Docker-save stream without extracting or retaining layers."""
+    total, seen, configs, manifest = 0, set(), {}, None
+    expected = "blobs/sha256/" + descriptor["digest"].split(":")[1]
+
+    def take(size, *, eof=False):
+        nonlocal total
+        result = bytearray()
+        while len(result) < size:
+            chunk = read(min(size - len(result), 1024**2))
+            if not chunk:
+                if eof and not result:
+                    return b""
+                raise ValueError("Truncated image export")
+            total += len(chunk)
+            if total > MAX_IMAGE_STREAM:
+                raise ValueError("Image export exceeds its byte limit")
+            result.extend(chunk)
+        return bytes(result)
+
+    while True:
+        header = take(512)
+        if header == bytes(512):
+            if take(512) != bytes(512):
+                raise ValueError("Invalid image export terminator")
+            # Drain to real EOF so a successful tar prefix cannot hide CLI failure.
+            while True:
+                tail = read(1024**2)
+                if not tail:
+                    break
+                total += len(tail)
+                if total > MAX_IMAGE_STREAM or any(tail):
+                    raise ValueError("Invalid trailing image export data")
+            break
+        item = tarfile.TarInfo.frombuf(header, "utf-8", "strict")
+        name = item.name.rstrip("/") if item.isdir() else item.name
+        if (not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", name)
+                or any(p in (".", "..") for p in name.split("/")) or name in seen
+                or len(seen) >= 100000 or item.size < 0 or item.size > MAX_IMAGE_STREAM
+                or item.type not in (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE)
+                or (item.isdir() and item.size != 0)):
+            raise ValueError("Unsupported or ambiguous image export member")
+        seen.add(name)
+        blob = re.fullmatch(r"blobs/sha256/([a-f0-9]{64})", name)
+        if name == expected and item.size != descriptor["size"]:
+            raise ValueError("Exported manifest size differs")
+        if blob and item.size <= MAX_IMAGE_JSON:
+            raw = take(item.size)
+            digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+            if name == expected:
+                if digest != descriptor["digest"]:
+                    raise ValueError("Exported manifest hash differs")
+                manifest = strict_metadata(raw)
+            elif raw.lstrip().startswith(b"{"):
+                try:
+                    config = strict_metadata(raw)
+                except (ValueError, UnicodeError):
+                    config = None
+                if (isinstance(config, dict) and config.get("architecture") == "amd64" and config.get("os") == "linux"
+                        and isinstance(config.get("config"), dict) and isinstance(config["config"].get("Labels"), dict)
+                        and config["config"]["Labels"].get("io.nebulalog.application-source-sha256") == source_sha):
+                    if digest != "sha256:" + blob[1] or len(configs) >= 16:
+                        raise ValueError("Invalid or excessive image config candidates")
+                    configs[digest] = len(raw)
+        else:
+            remaining = item.size
+            while remaining:
+                size = min(remaining, 1024**2)
+                take(size)
+                remaining -= size
+        if item.size % 512:
+            take(512 - item.size % 512)
+    config = manifest.get("config") if isinstance(manifest, dict) else None
+    if (not isinstance(manifest, dict) or type(manifest.get("schemaVersion")) is not int or manifest["schemaVersion"] != 2
+            or manifest.get("mediaType") != descriptor["mediaType"] or not isinstance(config, dict)
+            or config.get("mediaType") not in ("application/vnd.oci.image.config.v1+json", "application/vnd.docker.container.image.v1+json")
+            or type(config.get("size")) is not int or not 0 < config["size"] <= MAX_IMAGE_JSON
+            or not isinstance(config.get("digest"), str) or configs.get(config["digest"]) != config["size"]):
+        raise ValueError("Export lacks the exact manifest and source-bound amd64 configuration")
+    return {"config_digest": config["digest"], "config_bytes": config["size"], "export_bytes": total,
+            "manifest_sha256": descriptor["digest"].split(":")[1], "export_members": len(seen)}
+
+
+def export_identity(owner, binding, source_sha, storage_root, *, popen=subprocess.Popen):
+    command = owner.prefix + ["image", "save", binding["docker_image_id"]]
+    process = popen(command, env=owner.env, stdout=subprocess.PIPE, stderr=sys.stderr, start_new_session=True)
+    deadline, next_admission = time.monotonic() + 300, 0
+    failure = None
+
+    def read(size):
+        nonlocal next_admission
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                raise subprocess.TimeoutExpired(command, 300)
+            if now >= next_admission:
+                storage_admission(owner.parent, storage_root)
+                next_admission = now + 5
+            if select.select([process.stdout.fileno()], [], [], min(1, deadline - now))[0]:
+                return os.read(process.stdout.fileno(), size)
+    try:
+        proof = save_identity(read, binding["descriptor"], source_sha)
+        code = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        if code:
+            raise subprocess.CalledProcessError(code, command)
+        return proof
+    except BaseException as primary:
+        failure = primary
+        try:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate(timeout=10)
+                if process.returncode is None:
+                    raise RuntimeError("Export CLI exit was not confirmed")
+        except BaseException as settlement:
+            primary.command_unsettled, primary.command_pid = True, process.pid
+            print("Export CLI settlement unconfirmed (" + type(settlement).__name__ + ")", file=sys.stderr)
+        raise
+    finally:
+        try:
+            process.stdout.close()
+        except BaseException:
+            if failure is None:
+                raise
+            print("Export stdout close failed; original failure preserved", file=sys.stderr)
 
 
 class OwnedBuilder:
@@ -348,6 +481,72 @@ def write_receipt(path, receipt):
         os.unlink(name)
 
 
+def strict_metadata(raw):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate build metadata key")
+            result[key] = value
+        return result
+
+    def finite(value):
+        raise ValueError("Non-finite build metadata number")
+
+    return json.loads(raw, object_pairs_hook=unique, parse_constant=finite)
+
+
+def image_binding(path, iid, image, *, evidence=None):
+    """Preserve the receipt's OCI config identity across Docker image stores."""
+    stream, before = open_source(path.parent, path.name)
+    with stream:
+        if before.st_size > 1024**2:
+            raise ValueError("Oversized build metadata")
+        raw = stream.read(1024**2 + 1)
+        after = os.fstat(stream.fileno())
+    if (len(raw) != before.st_size or any(getattr(before, key) != getattr(after, key)
+            for key in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns"))):
+        raise ValueError("Build metadata changed while reading")
+    if evidence is not None:
+        # Retain bounded failed metadata before private context cleanup removes it.
+        fd = os.open(evidence / "build-metadata.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as saved:
+            saved.write(raw)
+            saved.flush()
+            os.fsync(saved.fileno())
+        directory = os.open(evidence, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    value = strict_metadata(raw)
+    if not isinstance(value, dict):
+        raise ValueError("Build metadata must be an object")
+    config, manifest = value.get("containerimage.config.digest"), value.get("containerimage.digest")
+    descriptor = value.get("containerimage.descriptor")
+    media_types = ("application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json")
+    loaded_descriptor = image.get("Descriptor")
+    if (not isinstance(manifest, str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", manifest)
+            or not isinstance(descriptor, dict) or descriptor.get("digest") != manifest
+            or descriptor.get("mediaType") not in media_types
+            or type(descriptor.get("size")) is not int or not 0 < descriptor["size"] <= 1024**2
+            or not isinstance(descriptor.get("annotations", {}), dict)
+            or not isinstance(image.get("Id"), str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", image["Id"])
+            or (loaded_descriptor is not None and (not isinstance(loaded_descriptor, dict)
+                or loaded_descriptor.get("digest") != manifest or loaded_descriptor.get("mediaType") not in media_types
+                or loaded_descriptor.get("size") != descriptor["size"]))):
+        raise ValueError("Build metadata and loaded image do not identify one single-platform manifest")
+    annotation = descriptor.get("annotations", {}).get("config.digest")
+    for hint in (config, annotation):
+        if hint is not None and (not isinstance(hint, str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", hint)):
+            raise ValueError("Invalid optional image config hint")
+    if config is not None and annotation is not None and config != annotation:
+        raise ValueError("Image config hints disagree")
+    return {"schema": 1, "metadata_config_hint": config, "annotation_config_hint": annotation, "manifest_digest": manifest,
+            "iid": iid, "docker_image_id": image["Id"], "descriptor": descriptor,
+            "metadata_sha256": hashlib.sha256(raw).hexdigest(), "metadata_bytes": len(raw)}
+
+
 def build(source: Path, tag: str, receipt: Path, *, version="0.2.0-appliance-candidate",
           docker_context=None, buildkit_image=None, storage_root=None, runner=bounded_run):
     if not isinstance(tag, str) or len(tag) > 200 or not TAG.fullmatch(tag):
@@ -376,13 +575,15 @@ def build(source: Path, tag: str, receipt: Path, *, version="0.2.0-appliance-can
         with tempfile.TemporaryDirectory(prefix="nebulalog-application-build-", dir=receipt.parent) as temporary:
             stage = Path(temporary)
             context, iid = stage / "context.tar", stage / "image.id"
+            metadata = stage / "image-metadata.json"
             evidence = write_context(source, selected, context)
             storage_admission(receipt.parent, storage_root)
             owner = OwnedBuilder(receipt.parent, docker_context, buildkit_image, runner)
             owner.prepare(docker_context)
             owner.start()
             command = owner.prefix + ["buildx", "build", "--builder", owner.name, "--load", "--platform=linux/amd64", "--progress=plain", "--tag", tag,
-                       "--file", CONTAINERFILE, "--iidfile", str(iid), "--build-arg", "APPLICATION_SOURCE_SHA256=" + source_sha,
+                       "--file", CONTAINERFILE, "--iidfile", str(iid), "--metadata-file", str(metadata),
+                       "--build-arg", "APPLICATION_SOURCE_SHA256=" + source_sha,
                        "--build-arg", "VERSION=" + version, "-"]
             with context.open("rb") as stream:
                 runner(command, stdin=stream, stdout=sys.stderr, stderr=sys.stderr, check=True, timeout=3600,
@@ -397,11 +598,20 @@ def build(source: Path, tag: str, receipt: Path, *, version="0.2.0-appliance-can
                 raise ValueError("Oversized built image metadata")
             images = json.loads(result.stdout)
             if (not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict)
-                    or images[0].get("Id") != image_id or images[0].get("Architecture") != "amd64" or images[0].get("Os") != "linux"
+                    or images[0].get("Architecture") != "amd64" or images[0].get("Os") != "linux"
                     or not isinstance(images[0].get("Config"), dict) or not isinstance(images[0]["Config"].get("Labels"), dict)
                     or images[0].get("Config", {}).get("Labels", {}).get("io.nebulalog.application-source-sha256") != source_sha):
                 raise ValueError("Built image identity, platform or source label differs from the captured context")
-            result = {"schema": 1, "status": "built", "tag": tag, "local_image_id": image_id, "platform": "linux/amd64",
+            binding = image_binding(metadata, image_id, images[0], evidence=owner.evidence)
+            proof = export_identity(owner, binding, source_sha, storage_root)
+            config_digest = proof["config_digest"]
+            if (any(hint is not None and hint != config_digest for hint in (binding["metadata_config_hint"], binding["annotation_config_hint"]))
+                    or image_id not in (config_digest, binding["manifest_digest"])
+                    or images[0]["Id"] not in (config_digest, binding["manifest_digest"])):
+                raise ValueError("Exported config differs from metadata, IID or loaded image")
+            binding.update(proof)
+            write_receipt(owner.evidence / "image-binding.json", binding)
+            result = {"schema": 1, "status": "built", "tag": tag, "local_image_id": binding["config_digest"], "platform": "linux/amd64",
                       "requested_version": version, "application_source_sha256": source_sha, "source_commit": commit,
                       "source_dirty": dirty, "application_files": selected, **evidence,
                       "context_mode": "captured_source_tar_stdin", "runtime_executed": False, "signature_created": False}
@@ -411,8 +621,6 @@ def build(source: Path, tag: str, receipt: Path, *, version="0.2.0-appliance-can
     finally:
         if owner is not None:
             owner.finish(primary)
-    result["cleanup_evidence"] = str(owner.evidence / "outcome.json")
-    result["builder_cache_removed"] = True
     write_receipt(receipt, result)
     return result
 

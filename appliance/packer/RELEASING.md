@@ -25,6 +25,15 @@ deadline and periodically checks the 150 GiB free-space reserve on the selected
 volume. CLI process groups are reaped on failure or interruption; daemon work is
 separately stopped and inspected before cleanup.
 
+After loading, the helper streams one `docker image save` to verify the exact
+manifest and configuration bytes, without retaining a layer archive. This adds
+one full image read, capped at 8 GiB and five minutes; only bounded JSON metadata
+is retained. The supported export contains OCI blob paths for the single image
+manifest; legacy save formats without that manifest are refused. Buildx config
+digest hints are optional and must agree when present. The unchanged schema-1
+build receipt records the verified OCI config digest in `local_image_id`;
+the daemon's lookup ID and raw build metadata remain in private sidecars.
+
 On success, failure, timeout, Ctrl-C or CLI SIGTERM, cleanup verifies the exact
 BuildKit container/image/nonce/mount and recorded volume identity, stops and
 removes that container, removes its unreferenced cache volume, checks their

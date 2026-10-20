@@ -1,5 +1,6 @@
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import signal
@@ -8,6 +9,7 @@ from pathlib import Path
 import subprocess
 import tarfile
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -15,6 +17,8 @@ SCRIPT = Path(__file__).resolve().parents[1] / "packer/build_application.py"
 SPEC = importlib.util.spec_from_file_location("build_application", SCRIPT)
 builder = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(builder)
+sys.path.insert(0, str(SCRIPT.parents[1]))
+from nebulalog_manager.image_bundle import RestoredAuthContract
 
 
 class ContextTests(unittest.TestCase):
@@ -26,6 +30,7 @@ class ContextTests(unittest.TestCase):
         self.source.mkdir()
         contents = {name: (name + " fixture\n").encode() for name in builder.REQUIRED}
         contents.update({"internal/app.go": b"package app\n", "web/src/App.tsx": b"export const app = 'fixture'\n",
+                         "internal/auth/auth.go": b"package auth\n", "internal/auth/restore.go": b"package auth\n",
                          "migrations/001.sql": b"SELECT 1;\n", "docs/host-only.md": b"host-only input\n"})
         self.manifest = {"schema": 1, "files": {}}
         for name, content in contents.items():
@@ -39,7 +44,16 @@ class ContextTests(unittest.TestCase):
         self.snapshot.start()
         self.addCleanup(self.snapshot.stop)
         self.commands, self.context_members, self.stages = [], [], []
-        self.image_id = "sha256:" + "b" * 64
+        self.config_raw = json.dumps({"architecture": "amd64", "os": "linux", "config": {"Labels": {
+            "io.nebulalog.application-source-sha256": builder.application_hash(self.manifest)}}}).encode()
+        self.config_id = "sha256:" + hashlib.sha256(self.config_raw).hexdigest()
+        self.manifest_raw = json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": self.config_id, "size": len(self.config_raw)}, "layers": []}).encode()
+        self.image_id = "sha256:" + hashlib.sha256(self.manifest_raw).hexdigest()
+        self.export_patch_original = builder.export_identity
+        export = patch.object(builder, "export_identity", side_effect=self.export_identity)
+        export.start()
+        self.addCleanup(export.stop)
         self.buildkit_image = "moby/buildkit@sha256:" + "c" * 64
         self.buildkit_id = "sha256:" + "d" * 64
         self.cid = "e" * 64
@@ -59,6 +73,24 @@ class ContextTests(unittest.TestCase):
         paths = list(self.root.glob("application-build-evidence-*/outcome.json"))
         self.assertEqual(len(paths), 1)
         return json.loads(paths[0].read_text())
+
+    def image_tar(self, *, reverse=False):
+        stream = io.BytesIO()
+        members = [("blobs/sha256/" + self.config_id.split(":")[1], self.config_raw),
+                   ("blobs/sha256/" + self.image_id.split(":")[1], self.manifest_raw)]
+        if reverse:
+            members.reverse()
+        with tarfile.open(fileobj=stream, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+            for name, raw in members:
+                member = tarfile.TarInfo(name)
+                member.size = len(raw)
+                archive.addfile(member, io.BytesIO(raw))
+        return stream.getvalue()
+
+    def export_identity(self, owner, binding, source_sha, storage_root):
+        self.assertEqual(owner.parent, self.receipt.parent)
+        self.assertEqual(binding["docker_image_id"], self.image_id)
+        return builder.save_identity(io.BytesIO(self.image_tar()).read, binding["descriptor"], source_sha)
 
     def runner(self, argv, **kwargs):
         self.commands.append(argv)
@@ -152,6 +184,10 @@ class ContextTests(unittest.TestCase):
         if self.build_failure:
             raise self.build_failure
         Path(argv[argv.index("--iidfile") + 1]).write_text(self.image_id)
+        Path(argv[argv.index("--metadata-file") + 1]).write_text(json.dumps({
+            "containerimage.config.digest": self.config_id, "containerimage.digest": self.image_id,
+            "containerimage.descriptor": {"digest": self.image_id, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "size": len(self.manifest_raw), "annotations": {"config.digest": self.config_id}}}))
         return output()
 
     def test_exact_private_stdin_context_excludes_uncaptured_secrets_and_host_files(self):
@@ -160,7 +196,7 @@ class ContextTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("uncaptured fixture, must not reach Docker")
         result = self.build(self.source, "nebulalog/appliance-app:test", self.receipt, runner=self.runner)
-        self.assertEqual(result["local_image_id"], self.image_id)
+        self.assertEqual(result["local_image_id"], self.config_id)
         self.assertFalse(result["runtime_executed"])
         self.assertEqual(self.receipt.stat().st_mode & 0o777, 0o600)
         self.assertFalse(self.container_exists)
@@ -347,6 +383,120 @@ class ContextTests(unittest.TestCase):
             return actual(path, value)
         with patch.object(builder, "write_receipt", side_effect=observe):
             self.build(self.source, "nebulalog/appliance-app:test", self.receipt, runner=self.runner)
+
+    def test_success_receipt_preserves_existing_exact_provenance_schema(self):
+        result = self.build(self.source, "nebulalog/appliance-app:test", self.receipt, runner=self.runner)
+        RestoredAuthContract._build(result, self.manifest["files"], {"version": result["requested_version"]},
+            {"config_digest": self.config_id, "application_source_sha256": builder.application_hash(self.manifest)})
+        self.assertEqual(self.outcome()["cleanup"], "complete")
+
+    def test_metadata_disagreement_ambiguous_index_and_duplicates_refuse(self):
+        for damage in ("config", "descriptor", "index", "iid", "duplicate", "symlink", "oversized"):
+            def damaged(argv, **kwargs):
+                result = self.runner(argv, **kwargs)
+                if "--metadata-file" in argv:
+                    path = Path(argv[argv.index("--metadata-file") + 1])
+                    value = json.loads(path.read_text())
+                    if damage == "config":
+                        value["containerimage.config.digest"] = "sha256:" + "0" * 64
+                    elif damage == "descriptor":
+                        value["containerimage.descriptor"]["digest"] = "sha256:" + "0" * 64
+                    elif damage == "index":
+                        value["containerimage.descriptor"]["mediaType"] = "application/vnd.oci.image.index.v1+json"
+                    elif damage == "iid":
+                        value["containerimage.digest"] = value["containerimage.descriptor"]["digest"] = "sha256:" + "0" * 64
+                    path.write_text(json.dumps(value))
+                    if damage == "duplicate":
+                        path.write_text('{"containerimage.digest":"a","containerimage.digest":"b"}')
+                    elif damage == "symlink":
+                        path.unlink()
+                        path.symlink_to(self.source / "go.mod")
+                    elif damage == "oversized":
+                        path.write_bytes(b"x" * (1024**2 + 1))
+                return result
+            with self.subTest(damage=damage), self.assertRaises((ValueError, OSError)):
+                self.build(self.source, "nebulalog/appliance-app:test", self.receipt, runner=damaged)
+            self.assertFalse(self.receipt.exists())
+            self.assertFalse(self.volume_exists)
+            self.assertFalse(self.container_exists)
+        retained = list(self.root.glob("application-build-evidence-*/build-metadata.json"))
+        self.assertEqual(len(retained), 5)  # Symlink and oversized input never admitted.
+        self.assertTrue(all(p.stat().st_mode & 0o777 == 0o600 for p in retained))
+        self.assertTrue(any(p.read_text() == '{"containerimage.digest":"a","containerimage.digest":"b"}' for p in retained))
+
+    def test_actual_load_profile_without_config_hints_uses_hashed_export(self):
+        def no_hints(argv, **kwargs):
+            result = self.runner(argv, **kwargs)
+            if "--metadata-file" in argv:
+                path = Path(argv[argv.index("--metadata-file") + 1])
+                value = json.loads(path.read_text())
+                value.pop("containerimage.config.digest")
+                value["containerimage.descriptor"]["annotations"].pop("config.digest")
+                path.write_text(json.dumps(value))
+            return result
+        result = self.build(self.source, "nebulalog/appliance-app:test", self.receipt, runner=no_hints)
+        self.assertEqual(result["local_image_id"], self.config_id)
+        RestoredAuthContract._build(result, self.manifest["files"], {"version": result["requested_version"]},
+            {"config_digest": self.config_id, "application_source_sha256": builder.application_hash(self.manifest)})
+
+    def test_stream_identity_accepts_both_metadata_orders(self):
+        descriptor = {"digest": self.image_id, "size": len(self.manifest_raw), "mediaType": "application/vnd.oci.image.manifest.v1+json"}
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                proof = builder.save_identity(io.BytesIO(self.image_tar(reverse=reverse)).read, descriptor, builder.application_hash(self.manifest))
+                self.assertEqual(proof["config_digest"], self.config_id)
+
+    def test_stream_refuses_truncation_tail_hash_source_and_total_limit(self):
+        descriptor = {"digest": self.image_id, "size": len(self.manifest_raw), "mediaType": "application/vnd.oci.image.manifest.v1+json"}
+        raw = self.image_tar()
+        for damaged in (raw[:511], raw[:-1] + b"x", raw.replace(self.config_raw, self.config_raw.replace(b"amd64", b"arm64"))):
+            with self.subTest(bytes=len(damaged)), self.assertRaises(ValueError):
+                builder.save_identity(io.BytesIO(damaged).read, descriptor, builder.application_hash(self.manifest))
+        with self.assertRaises(ValueError):
+            builder.save_identity(io.BytesIO(raw).read, descriptor, "0" * 64)
+        with patch.object(builder, "MAX_IMAGE_STREAM", 511), self.assertRaises(ValueError):
+            builder.save_identity(io.BytesIO(raw).read, descriptor, builder.application_hash(self.manifest))
+
+    def test_stream_refuses_pax_link_and_duplicate_before_payload_read(self):
+        descriptor = {"digest": self.image_id, "size": len(self.manifest_raw), "mediaType": "application/vnd.oci.image.manifest.v1+json"}
+        for kind in (tarfile.XHDTYPE, tarfile.SYMTYPE):
+            member = tarfile.TarInfo("metadata")
+            member.type, member.size = kind, 1024**3
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                builder.save_identity(io.BytesIO(member.tobuf(format=tarfile.USTAR_FORMAT)).read, descriptor, builder.application_hash(self.manifest))
+        header = tarfile.TarInfo("duplicate").tobuf(format=tarfile.USTAR_FORMAT)
+        with self.assertRaises(ValueError):
+            builder.save_identity(io.BytesIO(header + header).read, descriptor, builder.application_hash(self.manifest))
+
+    def test_export_cli_failure_after_complete_tar_is_not_success(self):
+        import base64
+        raw = base64.b64encode(self.image_tar()).decode()
+        command = [sys.executable, "-c", "import base64,sys;sys.stdout.buffer.write(base64.b64decode(sys.argv[1]));sys.stdout.flush();sys.exit(7)", raw]
+        def child(argv, **kwargs):
+            return subprocess.Popen(command, **kwargs)
+        owner = SimpleNamespace(prefix=["fixture-docker"], env=dict(os.environ), parent=self.root)
+        binding = {"docker_image_id": self.image_id, "descriptor": {"digest": self.image_id, "size": len(self.manifest_raw), "mediaType": "application/vnd.oci.image.manifest.v1+json"}}
+        # Call the unpatched production export function, with only the child command adapted.
+        original = self.export_patch_original
+        with patch.object(builder.os, "killpg") as kill, self.assertRaises(subprocess.CalledProcessError) as raised:
+            original(owner, binding, builder.application_hash(self.manifest), self.root, popen=child)
+        self.assertEqual(raised.exception.returncode, 7)
+        kill.assert_not_called()
+
+    def test_unreaped_export_preserves_failure_and_marks_cleanup_unsafe(self):
+        process = Mock(pid=12345, returncode=None)
+        process.poll.return_value = None
+        process.communicate.side_effect = subprocess.TimeoutExpired(["fixture"], 10)
+        process.stdout.close.side_effect = OSError("fixture close failure")
+        original = ValueError("fixture parser refusal")
+        owner = SimpleNamespace(prefix=["fixture-docker"], env={}, parent=self.root)
+        with patch.object(builder, "save_identity", side_effect=original), patch.object(builder.os, "killpg"):
+            with self.assertRaises(ValueError) as raised:
+                self.export_patch_original(owner, {"docker_image_id": self.image_id, "descriptor": {}}, "0" * 64, self.root,
+                                           popen=Mock(return_value=process))
+        self.assertIs(raised.exception, original)
+        self.assertTrue(original.command_unsettled)
+        process.wait.assert_not_called()
 
     def test_bounded_runner_reaps_actual_timed_out_local_child(self):
         pid_file = self.root / "child.pid"
