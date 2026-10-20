@@ -1,12 +1,12 @@
 # Build from the repository root. Digests are the linux/amd64 manifests.
-FROM quay.io/keycloak/keycloak:26.7.3@sha256:88943b6ad06d6293a239f0dfca5acec64218c9b3ab327bf9c936acf408a6ae3b AS distribution
-FROM registry.access.redhat.com/ubi9/openjdk-21-runtime:1.24@sha256:5c5fed069071ceb9a65e280611b041483ed928158625f2e7c96b70477ab90c52 AS builder
+FROM quay.io/keycloak/keycloak:26.8.1@sha256:ed1cab21814c7d18ce8f0e11d5a1fa1c6923de12dd4c7625a18c5d34452a57a4 AS distribution
+FROM registry.access.redhat.com/ubi9/openjdk-21-runtime@sha256:744d1227e7fd75c3e68b39d2fc483a96fb1c05dd6a4d8ea246d026e4782c3d98 AS builder
 USER 0:0
 COPY --from=distribution --chown=1000:1000 /opt/keycloak /opt/keycloak
-ADD --checksum=sha256:044fcd8a29d236edea8a5b414406cdae63b475f9ad9f05fe2dc904a277941115 --chown=1000:1000 https://repo.maven.apache.org/maven2/org/bouncycastle/bc-fips/2.1.2/bc-fips-2.1.2.jar /opt/keycloak/providers/bc-fips-2.1.2.jar
-ADD --checksum=sha256:688410563445e1a65ff33cb67842499f0788994d752c3df8f7ea4a0d40ddbf50 --chown=1000:1000 https://repo.maven.apache.org/maven2/org/bouncycastle/bctls-fips/2.1.22/bctls-fips-2.1.22.jar /opt/keycloak/providers/bctls-fips-2.1.22.jar
-ADD --checksum=sha256:c4370064664d474d8681f55f302cfdade4cae0f3d798b10fd18b0ab8fbd6fed1 --chown=1000:1000 https://repo.maven.apache.org/maven2/org/bouncycastle/bcpkix-fips/2.1.10/bcpkix-fips-2.1.10.jar /opt/keycloak/providers/bcpkix-fips-2.1.10.jar
-ADD --checksum=sha256:503aaf5c2c5b7c729547462efe13699b5f6dacf9be150b7c48bba974b793dc92 --chown=1000:1000 https://repo.maven.apache.org/maven2/org/bouncycastle/bcutil-fips/2.1.5/bcutil-fips-2.1.5.jar /opt/keycloak/providers/bcutil-fips-2.1.5.jar
+ADD --checksum=sha256:f55fc476ede820d5c03fe87e6ced5bb0095e1dc30b387445846a3ff0274f8c0e --chown=1000:1000 https://repo.maven.apache.org/maven2/org/bouncycastle/bc-fips/2.1.3/bc-fips-2.1.3.jar /opt/keycloak/providers/bc-fips-2.1.3.jar
+ADD --checksum=sha256:af604aa5b337725872651067a819ebc03aa298685572b0b2ad5343c786faad0a --chown=1000:1000 https://repo.maven.apache.org/maven2/org/bouncycastle/bctls-fips/2.1.25/bctls-fips-2.1.25.jar /opt/keycloak/providers/bctls-fips-2.1.25.jar
+ADD --checksum=sha256:cf161ba2f6b4505816f4661663b3e0771184a50ee5b178a0018c817b336f0e5c --chown=1000:1000 https://repo.maven.apache.org/maven2/org/bouncycastle/bcpkix-fips/2.1.13/bcpkix-fips-2.1.13.jar /opt/keycloak/providers/bcpkix-fips-2.1.13.jar
+ADD --checksum=sha256:f44904f61552c823bcc3686a24052ee3135212d547754eaa2ff6532e210103cb --chown=1000:1000 https://repo.maven.apache.org/maven2/org/bouncycastle/bcutil-fips/2.1.8/bcutil-fips-2.1.8.jar /opt/keycloak/providers/bcutil-fips-2.1.8.jar
 COPY --chown=1000:1000 deploy/keycloak/themes/nebulalog /opt/keycloak/themes/nebulalog
 COPY appliance/images/keycloak-fips/bc-fips.sha256 /tmp/bc-fips.sha256
 RUN cd /opt/keycloak/providers && sha256sum -c /tmp/bc-fips.sha256 && \
@@ -19,7 +19,7 @@ ENV KC_DB=postgres KC_HEALTH_ENABLED=true KC_METRICS_ENABLED=true \
 # Build-time augmentation generates no appliance account, TLS key or realm secret.
 RUN JAVA_OPTS_KC_HEAP="-Xms64m -Xmx1024m" JAVA_OPTS_APPEND="-XX:ActiveProcessorCount=2" /opt/keycloak/bin/kc.sh build --features=fips,recovery-codes,passkeys --fips-mode=strict
 
-FROM registry.access.redhat.com/ubi9/openjdk-21-runtime:1.24@sha256:5c5fed069071ceb9a65e280611b041483ed928158625f2e7c96b70477ab90c52
+FROM registry.access.redhat.com/ubi9/openjdk-21-runtime@sha256:744d1227e7fd75c3e68b39d2fc483a96fb1c05dd6a4d8ea246d026e4782c3d98
 USER 0:0
 COPY --from=builder --chown=1000:1000 /opt/keycloak /opt/keycloak
 COPY --chmod=0555 appliance/images/keycloak-fips/entrypoint.sh /opt/nebulalog/keycloak-entrypoint
@@ -33,7 +33,7 @@ ENV HOME=/opt/keycloak KC_DB=postgres KC_HEALTH_ENABLED=true KC_METRICS_ENABLED=
     KC_FEATURES=fips,recovery-codes,passkeys KC_FIPS_MODE=strict \
     KC_HTTP_ENABLED=false KC_HTTPS_PORT=8443 KC_CACHE=local
 LABEL org.opencontainers.image.title="Captain’s Log Keycloak strict-FIPS candidate" \
-      org.opencontainers.image.version="26.7.3-nebulalog.1" \
+      org.opencontainers.image.version="26.8.1-nebulalog.1" \
       org.opencontainers.image.licenses="AGPL-3.0-only AND Apache-2.0 AND LicenseRef-Bouncy-Castle AND LicenseRef-UBI-Component-Licenses"
 EXPOSE 8443 9000
 ENTRYPOINT ["/opt/nebulalog/keycloak-entrypoint"]

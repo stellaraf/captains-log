@@ -39,7 +39,7 @@ Errors are stable exported sentinels suitable for `errors.Is`: `ErrAssurancePoli
 
 ## Pinned Keycloak meanings and review requirements
 
-The appliance's FIPS Keycloak [Containerfile](../appliance/images/keycloak-fips/Containerfile) and [BOM](../appliance/images/keycloak-fips/BOM.json) currently pin **26.7.3**. Older development notes about 26.3.3 are not evidence about the new image. The following conclusions use official versioned sources, not inferred vendor defaults:
+The appliance's FIPS Keycloak [Containerfile](../appliance/images/keycloak-fips/Containerfile) and [BOM](../appliance/images/keycloak-fips/BOM.json) now pin **26.8.1**. The version-specific analysis below was performed for **26.7.3** and must be re-reviewed against 26.8.1 before activating host authorization. Neither the newer image build nor development login tests qualify that flow. The following recorded conclusions use official versioned sources, not inferred vendor defaults:
 
 - OIDC `iat` records token issuance; `auth_time` records authentication. A refresh must preserve the original authentication time instead of replacing it with the new issuance time. ACR is a context identifier whose meaning the parties agree upon; AMR names methods rather than their individual execution times. [OpenID Connect Core, token claims and refresh semantics](https://openid.net/specs/openid-connect-core-1_0.html#IDToken), [AMR registry semantics](https://www.rfc-editor.org/rfc/rfc8176).
 - Keycloak's basic client scope maps `auth_time` from the `AUTH_TIME` user-session note. [26.7.3 OIDC scope/mappers](https://github.com/keycloak/keycloak/blob/26.7.3/services/src/main/java/org/keycloak/protocol/oidc/OIDCLoginProtocolFactory.java).

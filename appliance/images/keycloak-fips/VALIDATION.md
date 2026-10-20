@@ -1,4 +1,49 @@
-# Local candidate verification
+# Keycloak 26.8.1 candidate verification — 2026-10-20 UTC
+
+The Linux/amd64 candidate was built with Keycloak **26.8.1**, the current pinned
+Red Hat UBI9 Java 21 image, and the exact Bouncy Castle dependency versions in
+Keycloak's release POM: **bc-fips 2.1.3**, **bctls-fips 2.1.25**,
+**bcpkix-fips 2.1.13** and **bcutil-fips 2.1.8**.
+
+- Local tag: `nebulalog/keycloak-fips:26.8.1-20261020`.
+- Manifest: `sha256:1515f912b7d0dee9fb3bd0d0d7028839c35007e41c3df3d468fcd2ac85383d03`.
+- Configuration: `sha256:9e50faec14b7331a25b0da6fbcf965180ad234fe32e3950f1e218c1e0792bd7d`.
+- Verified OCI archive: **519,958,016 bytes**, SHA-256
+  `59232de0e2e209337a76858e38c4c3305dc199a81c1cf27ab1c423b9fa0bf84c`.
+- Actual runtime: **21.0.12.1+1-LTS**, RPM
+  `java-21-openjdk-headless-21.0.12.1.1-1.2.el9.x86_64`. The newly resolved base
+  image digest differs from the older recipe; the Java version is unchanged.
+- All four detached Maven signatures verified against the vendor-linked key,
+  fingerprint `7B121B76A7ED6CE6E60AD51784E913A8E3A748C0`. The provider SHA-256
+  also matched the vendor's checksum list. The image retained original JARs,
+  their internal signatures and license material; packaged checksums passed.
+- Optimized augmentation completed with PostgreSQL, health/metrics,
+  FIPS, recovery-codes and passkeys. The actual generated `initCrypto` method
+  invokes both `setCryptoProvider(STRICT)` and `configureTruststore(STRICT)`.
+- Six source verifier tests passed using the real generated class as a fixture:
+  the original passed; changed mode, provider method, truststore method,
+  invocation instructions with intact constants, and truncation were rejected.
+- Normal startup on the actual non-FIPS development host returned **78** before
+  service startup. UID/GID **1000:1000**, readonly root, network isolation,
+  dropped capabilities and no privilege escalation were used for diagnostics.
+
+The older verifier initially refused the renamed generated recorder. Reviewing
+26.8.1's processor/recorder source and actual class instructions established the
+new layout; the check now requires both strict operations. It was not replaced
+with a string-only or environment-only assertion. All temporary verification
+containers were removed, including the failed attempt. The owned build cache
+was removed after build/export, preserving this image and previous archives.
+
+This is build/artifact and negative-startup evidence. It does not establish
+positive native FIPS operation, production PostgreSQL/TLS integration, login,
+MFA/recovery/passkeys, external identity providers, native update/rollback or
+whole-appliance acceptance. NIST certificate 4943 still lists module 2.1.1;
+patched 2.1.3 and this operating environment have not been established as
+certified. Complete SBOM/vulnerability and module/environment review remain open.
+
+## Previous candidate evidence
+
+### September candidate verification
 
 Recorded **2026-09-08 04:47 UTC** (2026-09-07 in the development host's America/Phoenix timezone). These are container build and artifact checks on Docker Desktop; no FIPS guest, database or authentication service was started for this verification.
 

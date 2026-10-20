@@ -302,14 +302,30 @@ ClickHouse images, and the exact previously built application image. It does
 not test the appliance's automatic updater, a PostgreSQL major-version or
 architecture migration, strict FIPS, production TLS, external federation, or
 full encrypted appliance restore. PostgreSQL remains on major version 17.
-The retained production Keycloak 26.7.3 image predates the theme change and must
-be refreshed and its bundle reverified before packaging. Keycloak also reports
+At this checkpoint the retained production Keycloak 26.7.3 image predated the
+theme change. A subsequent 26.8.1 candidate is recorded below. Keycloak also reports
 that the client's full-scope setting is deprecated; explicit role-scope
 migration remains part of the identity review.
 
 Both fixture attempts removed their owned containers, volumes, newly pulled
 images and private credentials. The live development deployment was unchanged.
 See [upgrade and rollback instructions](../DEVELOPMENT_UPGRADES.md).
+
+## Production identity image refresh
+
+The production-oriented Keycloak recipe now pins **26.8.1**, the currently
+resolved Java 21 vendor image, and its four compatible signed Bouncy Castle
+artifacts. The new Linux/amd64 image built and exported successfully. Its real
+generated `initCrypto` method sets both the crypto provider and truststore to
+strict mode. The version-specific verifier was updated after reviewing the
+vendor source and exact class instructions; six tests using that real class
+passed, including five tamper/truncation controls.
+
+The normal image refused startup on the non-FIPS development host. That is
+negative-startup evidence, not positive native FIPS authentication. See the
+[image validation record](../../appliance/images/keycloak-fips/VALIDATION.md)
+for exact digest, Java/provider versions, signature checks and remaining guest,
+SBOM, cryptographic-module and host-authorization review requirements.
 
 ## Remaining acceptance
 

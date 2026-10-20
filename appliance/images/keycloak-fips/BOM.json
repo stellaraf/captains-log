@@ -1,36 +1,44 @@
 {
   "format": "nebulalog-component-lock-v1",
-  "reviewed_at": "2026-09-07",
+  "reviewed_at": "2026-10-20",
   "platform": "linux/amd64",
   "qualification": "strict-mode candidate; exact module and guest operating environment not yet accepted",
   "keycloak": {
-    "version": "26.7.3",
-    "source": "https://github.com/keycloak/keycloak/tree/26.7.3",
-    "image": "quay.io/keycloak/keycloak:26.7.3@sha256:88943b6ad06d6293a239f0dfca5acec64218c9b3ab327bf9c936acf408a6ae3b",
+    "version": "26.8.1",
+    "source": "https://github.com/keycloak/keycloak/tree/26.8.1",
+    "image": "quay.io/keycloak/keycloak:26.8.1@sha256:ed1cab21814c7d18ce8f0e11d5a1fa1c6923de12dd4c7625a18c5d34452a57a4",
     "license": "Apache-2.0; upstream third-party licenses retained in distribution"
   },
   "runtime": {
-    "image": "registry.access.redhat.com/ubi9/openjdk-21-runtime:1.24@sha256:5c5fed069071ceb9a65e280611b041483ed928158625f2e7c96b70477ab90c52",
+    "image": "registry.access.redhat.com/ubi9/openjdk-21-runtime@sha256:744d1227e7fd75c3e68b39d2fc483a96fb1c05dd6a4d8ea246d026e4782c3d98",
     "java": "Red Hat OpenJDK 21.0.12.1+1-LTS",
     "java_rpm": "java-21-openjdk-headless-21.0.12.1.1-1.2.el9.x86_64",
-    "license": "Red Hat UBI EULA plus individual RPM licenses; image records rpm-bom.tsv and retains package license files"
+    "license": "Red Hat UBI EULA plus individual RPM licenses; image records rpm-bom.tsv and retains package license files",
+    "vendor_image_version": "1.24",
+    "vendor_image_release": "3.1791779558"
   },
   "bouncycastle": {
-    "bc-fips": "2.1.2",
-    "bctls-fips": "2.1.22",
-    "bcpkix-fips": "2.1.10",
-    "bcutil-fips": "2.1.5",
+    "bc-fips": "2.1.3",
+    "bctls-fips": "2.1.25",
+    "bcpkix-fips": "2.1.13",
+    "bcutil-fips": "2.1.8",
     "checksum_file": "bc-fips.sha256",
     "license": "Bouncy Castle license (MIT-style); original signed JARs and bundled license text retained",
     "license_source": "https://www.bouncycastle.org/license.html",
-    "compatibility_source": "https://github.com/keycloak/keycloak/blob/26.7.3/pom.xml",
+    "compatibility_source": "https://github.com/keycloak/keycloak/blob/26.8.1/pom.xml",
     "upstream_provider_checksum_source": "https://downloads.bouncycastle.org/fips-java/docs/BC-FJA-Checksums-2.1.0.csv",
     "certificate": "https://csrc.nist.gov/projects/cryptographic-module-validation-program/certificate/4943",
-    "certificate_limit": "At review NIST lists software 2.1.1; do not assert that patched 2.1.2 or this container/OE is certified."
+    "certificate_limit": "Reviewed 2026-10-20: NIST lists software 2.1.1; vendor describes 2.1.3 as a patch entering submission. Patched 2.1.3 and this image/operating environment are not established as certified.",
+    "maven_signature_verification": {
+      "key_url": "https://downloads.bouncycastle.org/java/bc_maven_public_key.asc",
+      "key_sha256": "83f4a7e72c153de0bc37c151ab4e0437190a33ad73e7bbccdac6026d330704a0",
+      "signer_fingerprint": "7B121B76A7ED6CE6E60AD51784E913A8E3A748C0",
+      "all_four_artifacts_verified": true
+    }
   },
   "captains_log_wrapper": {
     "license": "AGPL-3.0-only",
     "license_file_in_image": "/opt/nebulalog/LICENSE-NEBULALOG",
-    "scope": "Original Captain’s Log entrypoint and theme code; inherited Keycloak template and third-party assets retain their own licenses"
+    "scope": "Original Captain\u2019s Log entrypoint and theme code; inherited Keycloak template and third-party assets retain their own licenses"
   }
 }
