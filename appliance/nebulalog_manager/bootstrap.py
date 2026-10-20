@@ -26,6 +26,7 @@ from urllib.request import HTTPSHandler, HTTPRedirectHandler, Request, build_ope
 
 from .common import CommandFailed, Refused, atomic_json, audit, locked, run, trusted_file
 from .firstboot import FirstBoot, Locations, FINAL_CHECKS, RUNTIME_CHECKS, _private_dir, _private_file, _write_bytes
+from .identity_scopes import configure_service_roles
 
 IMAGES = {"NEBULALOG_IMAGE", "POSTGRESQL_IMAGE", "CLICKHOUSE_IMAGE", "KEYCLOAK_FIPS_IMAGE"}
 IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]+@sha256:[0-9a-f]{64}")
@@ -798,20 +799,22 @@ SELECT 'fresh-policy-bound';
 
     def _service_identity(self, token, name, secret, allowed):
         clients = self._kc("clients?clientId=" + name, token)
+        if len(clients) > 1:
+            raise Refused("Service identity is ambiguous")
         if clients and clients[0].get("attributes", {}).get("nebulalog-installation") != self.setup["installation_id"]:
             raise Refused("Existing service client is not owned by this installation")
+        configuration = {"clientId": name, "enabled": False, "protocol": "openid-connect", "publicClient": False, "secret": secret, "serviceAccountsEnabled": True, "standardFlowEnabled": False, "implicitFlowEnabled": False, "directAccessGrantsEnabled": False, "defaultClientScopes": ["roles"], "optionalClientScopes": [], "fullScopeAllowed": False, "attributes": {"nebulalog-installation": self.setup["installation_id"], "nebulalog-managed": "true"}}
         if not clients:
-            self._kc("clients", token, "POST", {"clientId": name, "enabled": True, "protocol": "openid-connect", "publicClient": False, "secret": secret, "serviceAccountsEnabled": True, "standardFlowEnabled": False, "directAccessGrantsEnabled": False, "defaultClientScopes": ["roles"], "fullScopeAllowed": True, "attributes": {"nebulalog-installation": self.setup["installation_id"], "nebulalog-managed": "true"}})
+            self._kc("clients", token, "POST", configuration)
             clients = self._kc("clients?clientId=" + name, token)
         if len(clients) != 1:
             raise Refused("Service identity is ambiguous")
-        user = self._kc("clients/" + clients[0]["id"] + "/service-account-user", token)
-        management = self._kc("clients?clientId=realm-management", token)[0]
-        path = "users/" + user["id"] + "/role-mappings/clients/" + management["id"]
-        existing = self._kc(path, token)
-        if {role["name"] for role in existing} - allowed:
-            raise Refused("Service identity has unexpected administration privileges")
-        self._kc(path, token, "POST", [self._kc("clients/" + management["id"] + "/roles/" + name, token) for name in sorted(allowed)])
+        path = "clients/" + clients[0]["id"]
+        self._kc(path, token, "PUT", configuration)
+        configure_service_roles(lambda path, method="GET", body=None: self._kc(path, token, method, body), clients[0]["id"], allowed)
+        self._kc(path, token, "PUT", {"enabled": True})
+        if self._kc(path, token).get("enabled") is not True:
+            raise Refused("Service identity was not enabled")
 
     def _identity(self):
         self.runner(["systemctl", "start", "nebulalog-keycloak.service"], timeout=900)

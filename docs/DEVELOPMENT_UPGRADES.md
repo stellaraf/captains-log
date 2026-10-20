@@ -88,6 +88,27 @@ Re-importing `realm.json` is not a database migration or a restoration of
 existing users. Keep the realm/client identifiers, issuer, credentials and
 existing MFA factors intact.
 
+### Reconcile the development identity-manager scope
+
+After the upgraded Keycloak is ready, the standard local deployment can
+reconcile its owned service client using the existing private environment:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/dev-auth.py
+```
+
+The script connects to Keycloak on `127.0.0.1:18089`. It briefly disables the
+identity-manager client, restricts token scopes, verifies the grants and required
+broker OTP flow, and enables the client after successful configuration. It
+preserves an existing administrator's password and MFA enrollment. A failure
+during scope configuration leaves the service client disabled; review the
+reported unexpected grants or scopes before retrying. Do not work around a
+refusal by granting `realm-admin`.
+
+Previously issued tokens are not proven revoked by this operation. This is
+development reprovisioning, not an existing-appliance realm migration. See
+[service-scope validation and migration limits](validation/IDENTITY_SERVICE_SCOPES.md).
+
 ## Roll back by restoring the pre-upgrade databases
 
 Stop the upgraded application and Keycloak, then PostgreSQL. Preserve the

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Create the unique local Keycloak user with mandatory MFA enrollment."""
-import argparse, json, os, pathlib, re, secrets, stat, urllib.request, urllib.parse
+import argparse, json, os, pathlib, re, secrets, stat, sys, urllib.request, urllib.parse
 arguments = argparse.ArgumentParser(description=__doc__)
 arguments.add_argument('--create-operator', metavar='USERNAME', help='Create a separate human administrator requiring initial MFA enrollment')
 options = arguments.parse_args()
@@ -9,6 +9,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 opener = urllib.request.build_opener(NoRedirect())
 root = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root / 'appliance'))
+from nebulalog_manager.identity_scopes import configure_service_roles
 local = root / '.local'
 info = local.lstat()
 if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
@@ -37,22 +39,19 @@ call('users/'+users[0]['id']+'/role-mappings/clients/'+client['id'],'POST',[role
 # Never give the application the bootstrap administrator password or realm-admin.
 manager_name = 'nebulalog-identity-manager'
 managers = call('clients?clientId='+manager_name)
+if len(managers) > 1:
+    raise SystemExit('Identity-manager client is ambiguous.')
 if managers and managers[0].get('attributes', {}).get('nebulalog-managed') != 'true':
     raise SystemExit('Refusing to replace an unrelated identity-manager client.')
-manager_config = {'clientId':manager_name, 'enabled':False, 'protocol':'openid-connect', 'publicClient':False, 'secret':values['KC_IDENTITY_CLIENT_SECRET'], 'serviceAccountsEnabled':True, 'standardFlowEnabled':False, 'directAccessGrantsEnabled':False, 'fullScopeAllowed':True, 'defaultClientScopes':['roles'], 'attributes':{'nebulalog-managed':'true'}}
+manager_config = {'clientId':manager_name, 'enabled':False, 'protocol':'openid-connect', 'publicClient':False, 'secret':values['KC_IDENTITY_CLIENT_SECRET'], 'serviceAccountsEnabled':True, 'standardFlowEnabled':False, 'implicitFlowEnabled':False, 'directAccessGrantsEnabled':False, 'fullScopeAllowed':False, 'defaultClientScopes':['roles'], 'optionalClientScopes':[], 'attributes':{'nebulalog-managed':'true'}}
 if not managers:
     call('clients', 'POST', manager_config)
     managers = call('clients?clientId='+manager_name)
-service_user = call('clients/'+managers[0]['id']+'/service-account-user')
-realm_management = call('clients?clientId=realm-management')[0]
+if len(managers) != 1:
+    raise SystemExit('Identity-manager client is ambiguous.')
+call('clients/'+managers[0]['id'], 'PUT', manager_config)
 allowed_roles = {'manage-identity-providers','view-identity-providers','view-realm'}
-existing_roles = call('users/'+service_user['id']+'/role-mappings/clients/'+realm_management['id']+'/composite')
-if {role['name'] for role in existing_roles} - allowed_roles:
-    raise SystemExit('Identity-manager account has unexpected administration privileges; review and remove them before provisioning.')
-if call('users/'+service_user['id']+'/role-mappings/clients/'+client['id']+'/composite'):
-    raise SystemExit('Identity-manager account must not hold interactive Captain’s Log application roles.')
-scoped_roles = [call('clients/'+realm_management['id']+'/roles/'+name) for name in sorted(allowed_roles)]
-call('users/'+service_user['id']+'/role-mappings/clients/'+realm_management['id'], 'POST', scoped_roles)
+configure_service_roles(call, managers[0]['id'], allowed_roles)
 
 broker_flow = 'nebulalog-broker-mfa'
 flows = call('authentication/flows')
@@ -65,8 +64,9 @@ if len(executions) != 1 or executions[0].get('providerId') != 'auth-otp-form':
 execution = executions[0]
 execution['requirement'] = 'REQUIRED'
 call('authentication/flows/'+broker_flow+'/executions','PUT',execution)
-manager_config['enabled'] = True
-call('clients/'+managers[0]['id'], 'PUT', manager_config)
+call('clients/'+managers[0]['id'], 'PUT', {'enabled':True})
+if call('clients/'+managers[0]['id']).get('enabled') is not True:
+    raise SystemExit('Identity-manager client was not enabled.')
 
 # Browser acceptance may have already enrolled the development test account.
 # A human operator receives a separate unique credential and enrolls their own MFA.
