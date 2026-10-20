@@ -56,7 +56,7 @@ The wizard and guards are implemented and unit-tested. Complete behavior in the 
 | Platform | Packaging route | Current evidence |
 |---|---|---|
 | VMware vSphere | OVF/OVA import; paravirtual SCSI VMDK | Packager implementation; final import/boot/growth unverified |
-| Nutanix AHV | Supported image format through Image Service | Unverified; do not assume direct OVA support |
+| Nutanix AHV | QCOW2 through Image Service | [Private diagnostic import/boot verified](validation/AHV_KERNEL_20261020.md); kernel crypto gate failed. Final appliance deployment/growth and direct OVA import remain unqualified. |
 | Proxmox / KVM | QCOW2 import, preserving both disks | Recipe and limited installer-kernel probe; final deployment/growth unverified |
 | Hyper-V | Appropriate VHDX and supported generation | Unvalidated; not advertised as supported |
 

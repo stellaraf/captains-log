@@ -2,6 +2,20 @@
 
 This is the release contract for the full request in [SPECIFICATION.md](SPECIFICATION.md), including the later Stellar branding/UI standards, Okta/Entra defaults with in-app instructions, and adjustable/pauseable refresh. It does not replace or narrow that request. Snapshot: **2026-09-07 local date, source checkpoint `44e2eb1`**. Concurrent Rocky image and first-boot implementation work is not accepted here until its actual results are recorded. **Version 1 is not complete; user sign-off has not occurred.**
 
+## Native AHV diagnostic update — October 20, 2026
+
+A separately prepared private Rocky 9.8 x86_64 guest imported and booted on
+AHV 11.2.0.2 with Secure Boot and FIPS enabled. Pinned SSH identity, guest/VM
+UUID binding, networking, vendor kernel integrity and independent disk
+identities were verified. The public `5.14.0-687.58.1.el9_8` kernel failed its
+HKDF self-test, reproducing the VMware result; firstboot refused enrollment.
+The VM is retained powered off with its NIC disconnected.
+
+The [diagnostic report](validation/AHV_KERNEL_20261020.md) records the actual
+scope and the two resolved API request failures. This does not qualify the
+latest application bundle, sealed OVA, full platform lifecycle or final
+sign-off. The complete acceptance matrix below remains in force.
+
 ## Query qualification update — October 16, 2026
 
 The isolated database contains 100,000,000 synthetic full-payload Traffic
